@@ -29,6 +29,10 @@ const openrouter_url = "https://openrouter.ai/api/v1/chat/completions";
 const openrouter_key_url = "https://openrouter.ai/api/v1/key";
 const key_validation_request: u64 = 1 << 61;
 const models_request: u64 = (1 << 61) + 1;
+const codex_status_key: u64 = (1 << 61) + 2;
+const claude_status_key: u64 = (1 << 61) + 3;
+const codex_login_key: u64 = (1 << 61) + 4;
+const claude_login_key: u64 = (1 << 61) + 5;
 const model_search_timer: u64 = (1 << 52) + 1;
 const openrouter_models_url = "https://openrouter.ai/api/v1/models";
 const credential_service = "dev.sscode.superchat.credentials.v1";
@@ -103,10 +107,13 @@ pub const ModelChoice = enum {
     gemini,
     deepseek,
     custom,
+    codex_subscription,
+    claude_subscription,
 };
 
 pub const CredentialAction = enum { none, save, delete, complete_onboarding };
 pub const RenameKind = enum { project, thread };
+pub const ConnectionState = enum { disabled, checking, connected, disconnected, connecting, unavailable, failed };
 
 pub const ModelOption = struct {
     choice: ModelChoice,
@@ -383,6 +390,8 @@ pub const cmd_next_project = "workspace.next-project";
 pub const cmd_focus_composer = "workspace.focus-composer";
 pub const cmd_model_picker = "workspace.model-picker";
 pub const cmd_auto_model = "workspace.model-auto";
+pub const cmd_codex_subscription = "workspace.model-codex-subscription";
+pub const cmd_claude_subscription = "workspace.model-claude-subscription";
 pub const cmd_settings = "workspace.settings";
 pub const cmd_fork_latest = "workspace.fork-latest";
 pub const cmd_copy_latest = "workspace.copy-latest";
@@ -442,8 +451,8 @@ fn clipboardKey(message_id: u32) u64 {
     return clipboard_key_base + message_id;
 }
 
-fn forkChoiceBit(choice: ModelChoice) u8 {
-    return @as(u8, 1) << @intCast(@intFromEnum(choice));
+fn forkChoiceBit(choice: ModelChoice) u16 {
+    return @as(u16, 1) << @intCast(@intFromEnum(choice));
 }
 
 fn appendUniqueId(ids: []u32, count: *usize, id: u32) void {
@@ -500,6 +509,33 @@ const ApiStreamChunk = struct {
     @"error": ?ApiError = null,
 };
 
+const CodexItem = struct {
+    type: []const u8 = "",
+    text: []const u8 = "",
+};
+
+const CodexStreamEvent = struct {
+    type: []const u8 = "",
+    item: ?CodexItem = null,
+};
+
+const ClaudeDelta = struct {
+    type: []const u8 = "",
+    text: []const u8 = "",
+};
+
+const ClaudeEvent = struct {
+    type: []const u8 = "",
+    delta: ?ClaudeDelta = null,
+};
+
+const ClaudeStreamEvent = struct {
+    type: []const u8 = "",
+    event: ?ClaudeEvent = null,
+    is_error: bool = false,
+    result: []const u8 = "",
+};
+
 const RemoteModel = struct { id: []const u8, name: []const u8 = "" };
 const RemoteModels = struct { data: []const RemoteModel = &.{} };
 
@@ -515,6 +551,8 @@ pub const Msg = union(enum) {
     select_model: ModelChoice,
     select_quick_model: u8,
     select_auto_model,
+    select_codex_subscription,
+    select_claude_subscription,
     select_custom_model,
     select_catalog_model: u32,
     toggle_model_favorite: u32,
@@ -523,6 +561,8 @@ pub const Msg = union(enum) {
     close_settings,
     save_settings,
     remove_api_key,
+    connect_codex,
+    connect_claude,
     finish_onboarding,
     skip_onboarding,
     copy_message: u32,
@@ -568,6 +608,9 @@ pub const Msg = union(enum) {
     load_older,
     history_poll: native_sdk.EffectTimer,
     stream_line: native_sdk.EffectLine,
+    harness_line: native_sdk.EffectLine,
+    harness_exit: native_sdk.EffectExit,
+    connection_exit: native_sdk.EffectExit,
     stream_flush: native_sdk.EffectTimer,
     persist_draft: native_sdk.EffectTimer,
     dismiss_toast: native_sdk.EffectTimer,
@@ -577,6 +620,9 @@ pub const Msg = union(enum) {
     pub const view_unbound = .{
         "response",
         "stream_line",
+        "harness_line",
+        "harness_exit",
+        "connection_exit",
         "stream_flush",
         "history_poll",
         "model_search",
@@ -638,7 +684,7 @@ pub const Model = struct {
     fork_open: bool = false,
     fork_source_thread_id: u32 = 0,
     fork_source_message_id: u32 = 0,
-    fork_model_mask: u8 = 0,
+    fork_model_mask: u16 = 0,
     fork_seed_buffer: canvas.TextBuffer(max_draft_bytes) = .{},
     rename_open: bool = false,
     rename_kind: RenameKind = .thread,
@@ -667,6 +713,8 @@ pub const Model = struct {
     persistence_clear_thread_count: usize = 0,
     history_request_thread_id: u32 = 0,
     stream_parse_storage: [max_stream_line_bytes * 2]u8 = undefined,
+    codex_connection: ConnectionState = .checking,
+    claude_connection: ConnectionState = .checking,
 
     // These are implementation state read by the derived bindings below
     // or by update/effects; they are intentionally not exposed directly
@@ -723,6 +771,8 @@ pub const Model = struct {
         "persistence_clear_thread_count",
         "history_request_thread_id",
         "stream_parse_storage",
+        "codex_connection",
+        "claude_connection",
         "delete_kind",
         "delete_id",
         "activeThread",
@@ -753,6 +803,8 @@ pub const Model = struct {
         .{ .choice = .gemini, .label = "Gemini 3.5 Flash", .slug = "google/gemini-3.5-flash" },
         .{ .choice = .deepseek, .label = "DeepSeek V4 Pro", .slug = "deepseek/deepseek-v4-pro" },
         .{ .choice = .custom, .label = "Custom model…", .slug = "" },
+        .{ .choice = .codex_subscription, .label = "Codex · ChatGPT plan", .slug = "codex/default" },
+        .{ .choice = .claude_subscription, .label = "Claude · Pro/Max · Experimental", .slug = "sonnet" },
     };
 
     pub const shortcutHints = [_]ShortcutHint{
@@ -780,6 +832,8 @@ pub const Model = struct {
         .{ .action = "Quick model: GLM 5.2", .keys = "Cmd + Shift + 7" },
         .{ .action = "Quick model: Kimi K2.6", .keys = "Cmd + Shift + 8" },
         .{ .action = "Quick model: Kimi K2.7 Code", .keys = "Cmd + Shift + 9" },
+        .{ .action = "Use Codex subscription", .keys = "Cmd + Option + Shift + 1" },
+        .{ .action = "Use Claude subscription", .keys = "Cmd + Option + Shift + 2" },
         .{ .action = "Open settings", .keys = "Cmd + ," },
         .{ .action = "Fork latest response", .keys = "Cmd + Shift + F" },
         .{ .action = "Copy latest response", .keys = "Cmd + Shift + C" },
@@ -1078,11 +1132,12 @@ pub const Model = struct {
     pub fn forkModelRows(model: *const Model, arena: std.mem.Allocator) []const ForkModelRow {
         const source = model.threadByIdConst(model.fork_source_thread_id);
         const include_custom = source != null and source.?.model_choice == .custom;
-        const capacity = modelOptions.len - @intFromBool(!include_custom);
+        const capacity = modelOptions.len - @intFromBool(!include_custom) - @intFromBool(!model.dev_mode);
         const rows = arena.alloc(ForkModelRow, capacity) catch return &.{};
         var count: usize = 0;
         for (modelOptions) |option| {
             if (option.choice == .custom and !include_custom) continue;
+            if (option.choice == .claude_subscription and !model.dev_mode) continue;
             rows[count] = .{
                 .choice = option.choice,
                 .label = if (option.choice == .custom) source.?.modelName() else option.label,
@@ -1121,9 +1176,61 @@ pub const Model = struct {
         return model.key_validation_pending or (model.api_key_len == 0 and model.api_key_buffer.isEmpty());
     }
 
+    fn codexConnectionStatus(model: *const Model) []const u8 {
+        return switch (model.codex_connection) {
+            .disabled => "Codex connection disabled",
+            .checking => "Checking Codex sign-in…",
+            .connected => "Connected through your ChatGPT plan",
+            .disconnected => "Not signed in to Codex",
+            .connecting => "Waiting for Codex browser sign-in…",
+            .unavailable => "Codex CLI not found; install Codex or the ChatGPT app",
+            .failed => "Could not check the Codex connection",
+        };
+    }
+
+    fn claudeConnectionStatus(model: *const Model) []const u8 {
+        return switch (model.claude_connection) {
+            .disabled => "Experimental local adapter; disabled in public builds",
+            .checking => "Checking Claude sign-in…",
+            .connected => "Connected through your Claude Pro/Max plan",
+            .disconnected => "Not signed in to Claude",
+            .connecting => "Waiting for Claude browser sign-in…",
+            .unavailable => "Claude CLI not found; install it, then retry",
+            .failed => "Could not check the Claude connection",
+        };
+    }
+
+    pub fn codexConnectionButtonText(model: *const Model) []const u8 {
+        return switch (model.codex_connection) {
+            .disabled => unreachable,
+            .checking => "Codex · Checking sign-in…",
+            .connected => "Codex · Connected · Use",
+            .disconnected => "Codex · Connect ChatGPT plan",
+            .connecting => "Codex · Waiting for browser sign-in…",
+            .unavailable => "Codex CLI not installed",
+            .failed => "Codex · Retry connection",
+        };
+    }
+
+    pub fn claudeConnectionButtonText(model: *const Model) []const u8 {
+        return switch (model.claude_connection) {
+            .disabled => "Claude · Experimental · Development builds only",
+            .checking => "Claude · Checking sign-in…",
+            .connected => "Claude · Connected · Use",
+            .disconnected => "Claude · Connect Pro/Max",
+            .connecting => "Claude · Waiting for browser sign-in…",
+            .unavailable => "Claude CLI not installed",
+            .failed => "Claude · Retry connection",
+        };
+    }
+
     pub fn cannotSaveSettings(model: *const Model) bool {
         const thread = model.activeThreadConst() orelse return true;
         return thread.model_buffer.isEmpty() or model.key_validation_pending;
+    }
+
+    pub fn claudeSubscriptionDisabled(model: *const Model) bool {
+        return !model.dev_mode;
     }
 
     pub fn messageRows(model: *const Model) []const Message {
@@ -1151,7 +1258,12 @@ pub const Model = struct {
 
     pub fn canSend(model: *const Model) bool {
         const thread = model.activeThreadConst() orelse return false;
-        return !thread.sending and model.api_key_len > 0 and !thread.draft_buffer.isEmpty() and !thread.model_buffer.isEmpty();
+        const has_connection = switch (thread.model_choice) {
+            .codex_subscription => true,
+            .claude_subscription => model.dev_mode,
+            else => model.api_key_len > 0,
+        };
+        return !thread.sending and has_connection and !thread.draft_buffer.isEmpty() and !thread.model_buffer.isEmpty();
     }
 
     pub fn cannotSend(model: *const Model) bool {
@@ -1159,7 +1271,20 @@ pub const Model = struct {
     }
 
     pub fn missingKey(model: *const Model) bool {
-        return model.api_key_len == 0;
+        const thread = model.activeThreadConst() orelse return model.api_key_len == 0;
+        return switch (thread.model_choice) {
+            .codex_subscription, .claude_subscription => false,
+            else => model.api_key_len == 0,
+        };
+    }
+
+    pub fn forkNeedsOpenRouterKey(model: *const Model) bool {
+        if (model.api_key_len > 0) return false;
+        for (modelOptions) |option| {
+            if (option.choice == .codex_subscription or option.choice == .claude_subscription) continue;
+            if (model.fork_model_mask & forkChoiceBit(option.choice) != 0) return true;
+        }
+        return false;
     }
 
     pub fn sending(model: *const Model) bool {
@@ -1171,6 +1296,13 @@ pub const Model = struct {
         const thread = model.activeThreadConst();
         if (thread) |active| {
             if (active.status_len > 0) return active.status_storage[0..active.status_len];
+        }
+        if (thread) |active| {
+            switch (active.model_choice) {
+                .codex_subscription => return model.codexConnectionStatus(),
+                .claude_subscription => return model.claudeConnectionStatus(),
+                else => {},
+            }
         }
         if (model.api_key_len == 0) return "Add an OpenRouter API key in Settings";
         if (thread) |active| {
@@ -1697,6 +1829,77 @@ pub const Model = struct {
 pub const ChatApp = native_sdk.UiAppWithFeatures(Model, Msg, .{ .runtime_markup = builtin.mode == .Debug });
 pub const Effects = ChatApp.Effects;
 
+const codex_runner_script = "if [ -x /Applications/ChatGPT.app/Contents/Resources/codex ]; then exec /Applications/ChatGPT.app/Contents/Resources/codex \"$@\"; elif [ -x \"$HOME/.local/bin/codex\" ]; then exec \"$HOME/.local/bin/codex\" \"$@\"; else exec codex \"$@\"; fi";
+const claude_runner_script = "if [ -x \"$HOME/.local/bin/claude\" ]; then exec \"$HOME/.local/bin/claude\" \"$@\"; else exec claude \"$@\"; fi";
+const claude_chat_script = "if [ -x \"$HOME/.local/bin/claude\" ]; then CLAUDE=\"$HOME/.local/bin/claude\"; else CLAUDE=claude; fi; exec \"$CLAUDE\" -p --output-format stream-json --verbose --include-partial-messages --no-session-persistence --safe-mode --tools \"\" --max-turns 1 --model sonnet";
+
+fn checkConnections(model: *Model, fx: *Effects) void {
+    model.codex_connection = .checking;
+    fx.spawn(.{
+        .key = codex_status_key,
+        .argv = &.{ "/bin/zsh", "-lc", codex_runner_script, "superchat", "login", "status" },
+        .output = .collect,
+        .on_exit = Effects.exitMsg(.connection_exit),
+    });
+    if (model.dev_mode) {
+        model.claude_connection = .checking;
+        fx.spawn(.{
+            .key = claude_status_key,
+            .argv = &.{ "/bin/zsh", "-lc", claude_runner_script, "superchat", "auth", "status" },
+            .output = .collect,
+            .on_exit = Effects.exitMsg(.connection_exit),
+        });
+    } else {
+        model.claude_connection = .disabled;
+    }
+}
+
+pub fn initEffects(model: *Model, fx: *Effects) void {
+    checkConnections(model, fx);
+}
+
+fn connectCodex(model: *Model, fx: *Effects) void {
+    if (model.codex_connection == .connected) {
+        model.selectModel(.codex_subscription);
+        if (model.activeThreadConst()) |thread| model.markThreadDirty(thread.id);
+        if (model.onboarding_open) {
+            model.onboarding_open = false;
+            model.credential_action = .complete_onboarding;
+        }
+        return;
+    }
+    model.codex_connection = .connecting;
+    fx.spawn(.{
+        .key = codex_login_key,
+        .argv = &.{ "/bin/zsh", "-lc", codex_runner_script, "superchat", "login" },
+        .output = .collect,
+        .on_exit = Effects.exitMsg(.connection_exit),
+    });
+}
+
+fn connectClaude(model: *Model, fx: *Effects) void {
+    if (!model.dev_mode) {
+        model.setStatus("Claude subscription routing is experimental and disabled in public builds");
+        return;
+    }
+    if (model.claude_connection == .connected) {
+        model.selectModel(.claude_subscription);
+        if (model.activeThreadConst()) |thread| model.markThreadDirty(thread.id);
+        if (model.onboarding_open) {
+            model.onboarding_open = false;
+            model.credential_action = .complete_onboarding;
+        }
+        return;
+    }
+    model.claude_connection = .connecting;
+    fx.spawn(.{
+        .key = claude_login_key,
+        .argv = &.{ "/bin/zsh", "-lc", claude_runner_script, "superchat", "auth", "login" },
+        .output = .collect,
+        .on_exit = Effects.exitMsg(.connection_exit),
+    });
+}
+
 pub fn initialModel(api_key: []const u8) Model {
     return initialModelWithOptionsAndClock(api_key, false, false, .system);
 }
@@ -1751,6 +1954,8 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, cmd_focus_composer)) return .focus_composer;
     if (std.mem.eql(u8, name, cmd_model_picker)) return .open_model_picker;
     if (std.mem.eql(u8, name, cmd_auto_model)) return .select_auto_model;
+    if (std.mem.eql(u8, name, cmd_codex_subscription)) return .{ .select_model = .codex_subscription };
+    if (std.mem.eql(u8, name, cmd_claude_subscription)) return .{ .select_model = .claude_subscription };
     if (std.mem.eql(u8, name, cmd_top_level_chats)) return .select_top_level_chats;
     if (std.mem.eql(u8, name, cmd_load_older)) return .load_older;
     if (std.mem.eql(u8, name, cmd_settings)) return .open_settings;
@@ -1810,11 +2015,30 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .close_model_picker => model.model_picker_open = false,
         .select_model => |choice| {
+            if (choice == .claude_subscription and !model.dev_mode) {
+                model.setStatus("Claude subscription routing is experimental and disabled in public builds");
+                return;
+            }
             model.selectModel(choice);
             if (model.activeThreadConst()) |thread| model.markThreadDirty(thread.id);
         },
         .select_quick_model => |number| model.selectQuickModel(number),
-        .select_auto_model => model.selectModel(.auto),
+        .select_auto_model => {
+            model.selectModel(.auto);
+            if (model.activeThreadConst()) |thread| model.markThreadDirty(thread.id);
+        },
+        .select_codex_subscription => {
+            model.selectModel(.codex_subscription);
+            if (model.activeThreadConst()) |thread| model.markThreadDirty(thread.id);
+        },
+        .select_claude_subscription => {
+            if (!model.dev_mode) {
+                model.setStatus("Claude subscription routing is experimental and disabled in public builds");
+                return;
+            }
+            model.selectModel(.claude_subscription);
+            if (model.activeThreadConst()) |thread| model.markThreadDirty(thread.id);
+        },
         .select_custom_model => model.selectModel(.custom),
         .select_catalog_model => |index| model.selectCatalogModel(index),
         .toggle_model_favorite => |index| {
@@ -1851,6 +2075,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.credential_action = .delete;
             model.setStatus("API key removed");
         },
+        .connect_codex => connectCodex(model, fx),
+        .connect_claude => connectClaude(model, fx),
         .finish_onboarding => {
             if (model.cannotFinishOnboarding()) return;
             if (!model.api_key_buffer.isEmpty()) {
@@ -1886,7 +2112,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.fork_open = false;
             model.fork_seed_buffer.clear();
         },
-        .toggle_fork_model => |choice| model.fork_model_mask ^= forkChoiceBit(choice),
+        .toggle_fork_model => |choice| {
+            if (choice == .claude_subscription and !model.dev_mode) return;
+            model.fork_model_mask ^= forkChoiceBit(choice);
+        },
         .create_forks => {
             const first_new_thread = model.thread_count;
             createForks(model, fx);
@@ -2091,6 +2320,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .send => submitDraft(model, fx),
         .stream_line => |line| receiveStreamLine(model, line, fx),
+        .harness_line => |line| receiveHarnessLine(model, line, fx),
+        .harness_exit => |exit_event| {
+            const thread_id = requestThreadId(exit_event.key) orelse return;
+            receiveHarnessExit(model, exit_event, fx);
+            model.markMessagesDirty(thread_id);
+        },
+        .connection_exit => |exit_event| receiveConnectionExit(model, exit_event),
         .stream_flush => |timer| {
             const thread_id = streamFlushThreadId(timer.key) orelse return;
             const thread = model.threadById(thread_id) orelse return;
@@ -2230,6 +2466,38 @@ fn receiveKeyValidation(model: *Model, response: native_sdk.EffectResponse) void
     model.setStatus("OpenRouter connected · key verified");
 }
 
+fn receiveConnectionExit(model: *Model, exit_event: native_sdk.EffectExit) void {
+    const unavailable = exit_event.reason == .spawn_failed or exit_event.code == 127;
+    const connected = exit_event.reason == .exited and exit_event.code == 0;
+    switch (exit_event.key) {
+        codex_status_key => model.codex_connection = if (connected) .connected else if (unavailable) .unavailable else .disconnected,
+        claude_status_key => model.claude_connection = if (connected) .connected else if (unavailable) .unavailable else .disconnected,
+        codex_login_key => {
+            model.codex_connection = if (connected) .connected else if (unavailable) .unavailable else .failed;
+            if (connected) {
+                model.selectModel(.codex_subscription);
+                if (model.activeThreadConst()) |thread| model.markThreadDirty(thread.id);
+                if (model.onboarding_open) {
+                    model.onboarding_open = false;
+                    model.credential_action = .complete_onboarding;
+                }
+            }
+        },
+        claude_login_key => {
+            model.claude_connection = if (connected) .connected else if (unavailable) .unavailable else .failed;
+            if (connected) {
+                model.selectModel(.claude_subscription);
+                if (model.activeThreadConst()) |thread| model.markThreadDirty(thread.id);
+                if (model.onboarding_open) {
+                    model.onboarding_open = false;
+                    model.credential_action = .complete_onboarding;
+                }
+            }
+        },
+        else => {},
+    }
+}
+
 fn submitDraft(model: *Model, fx: *Effects) void {
     const thread_id = model.active_thread_id;
     const before = model.next_message_id;
@@ -2306,10 +2574,90 @@ fn send(model: *Model, fx: *Effects) void {
     sendThread(model, thread, fx);
 }
 
+fn isSubscriptionChoice(choice: ModelChoice) bool {
+    return choice == .codex_subscription or choice == .claude_subscription;
+}
+
+fn buildHarnessPrompt(model: *Model, thread: *const Thread) ?[]const u8 {
+    const header = "You are the assistant in Superchat. Answer the conversation directly. Do not inspect files or run tools.\n";
+    const footer = "\n\nAssistant:\n";
+    const limit = native_sdk.max_effect_stdin_bytes;
+    var first = thread.message_count;
+    var used = header.len + footer.len;
+    var index = thread.message_count;
+    while (index > 0) {
+        const candidate = index - 1;
+        const message = &thread.messages[candidate];
+        const prefix = if (message.role == .user) "\n\nUser:\n" else "\n\nAssistant:\n";
+        const needed = prefix.len + message.content().len;
+        if (used + needed > limit) {
+            if (first == thread.message_count) first = candidate;
+            break;
+        }
+        first = candidate;
+        used += needed;
+        index = candidate;
+        if (thread.message_count - first == provider_context_messages) break;
+    }
+
+    var writer: std.Io.Writer = .fixed(model.request_storage[0..limit]);
+    writer.writeAll(header) catch return null;
+    for (thread.messages[first..thread.message_count]) |*message| {
+        const prefix = if (message.role == .user) "\n\nUser:\n" else "\n\nAssistant:\n";
+        writer.writeAll(prefix) catch return null;
+        const remaining = limit - writer.buffered().len -| footer.len;
+        const content_len = utf8PrefixLen(message.content(), remaining);
+        writer.writeAll(message.content()[0..content_len]) catch return null;
+    }
+    writer.writeAll(footer) catch return null;
+    return writer.buffered();
+}
+
+fn startHarnessRequest(model: *Model, thread: *Thread, fx: *Effects) bool {
+    const prompt = buildHarnessPrompt(model, thread) orelse {
+        thread.setStatus("Conversation could not be prepared for the provider harness");
+        return false;
+    };
+    switch (thread.model_choice) {
+        .codex_subscription => fx.spawn(.{
+            .key = requestKey(thread.id),
+            .argv = &.{ "/bin/zsh", "-lc", codex_runner_script, "superchat", "exec", "--json", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--sandbox", "read-only", "--skip-git-repo-check", "-C", "/tmp", "-" },
+            .stdin = prompt,
+            .max_line_bytes = max_stream_line_bytes,
+            .on_line = Effects.lineMsg(.harness_line),
+            .on_exit = Effects.exitMsg(.harness_exit),
+        }),
+        .claude_subscription => fx.spawn(.{
+            .key = requestKey(thread.id),
+            .argv = &.{ "/bin/zsh", "-lc", claude_chat_script, "superchat" },
+            .stdin = prompt,
+            .max_line_bytes = max_stream_line_bytes,
+            .on_line = Effects.lineMsg(.harness_line),
+            .on_exit = Effects.exitMsg(.harness_exit),
+        }),
+        else => return false,
+    }
+    thread.sending = true;
+    thread.stream_message_index = null;
+    thread.stream_failed = false;
+    thread.setStatus("Thinking…");
+    return true;
+}
+
 fn sendThread(model: *Model, thread: *Thread, fx: *Effects) void {
-    if (thread.sending or model.api_key_len == 0 or thread.draft_buffer.isEmpty() or thread.model_buffer.isEmpty()) return;
+    if (thread.sending or thread.draft_buffer.isEmpty() or thread.model_buffer.isEmpty()) return;
+    if (thread.model_choice == .claude_subscription and !model.dev_mode) {
+        thread.setStatus("Claude subscription routing is experimental and disabled in public builds");
+        return;
+    }
+    if (!isSubscriptionChoice(thread.model_choice) and model.api_key_len == 0) return;
     if (!thread.appendMessage(model.allocator, &model.next_message_id, .user, thread.draft())) return;
     thread.draft_buffer.clear();
+
+    if (isSubscriptionChoice(thread.model_choice)) {
+        _ = startHarnessRequest(model, thread, fx);
+        return;
+    }
 
     const body = model.buildRequest(thread) orelse {
         // The user message remains visible so it can be copied/retried.
@@ -2396,6 +2744,104 @@ fn receiveStreamLine(model: *Model, line: native_sdk.EffectLine, fx: *Effects) v
             .interval_ms = stream_flush_interval_ms,
             .on_fire = Effects.timerMsg(.stream_flush),
         });
+    }
+    thread.clearStatus();
+}
+
+fn queueHarnessText(model: *Model, thread: *Thread, key: u64, content: []const u8, fx: *Effects) void {
+    if (!thread.queueStreamDelta(model.allocator, content)) {
+        thread.stream_failed = true;
+        thread.setStatus("Response exceeded the 64 KiB safety limit");
+        fx.cancel(key);
+        return;
+    }
+    if (!thread.stream_flush_scheduled) {
+        thread.stream_flush_scheduled = true;
+        fx.startTimer(.{
+            .key = streamFlushKey(thread.id),
+            .interval_ms = stream_flush_interval_ms,
+            .on_fire = Effects.timerMsg(.stream_flush),
+        });
+    }
+    thread.clearStatus();
+}
+
+fn receiveHarnessLine(model: *Model, line: native_sdk.EffectLine, fx: *Effects) void {
+    const thread_id = requestThreadId(line.key) orelse return;
+    const thread = model.threadById(thread_id) orelse return;
+    if (!thread.sending) return;
+    if (line.truncated or line.dropped_before > 0) {
+        thread.stream_failed = true;
+        thread.setStatus("Provider output was incomplete; request cancelled");
+        fx.cancel(line.key);
+        return;
+    }
+
+    var scratch = std.heap.FixedBufferAllocator.init(&model.stream_parse_storage);
+    switch (thread.model_choice) {
+        .codex_subscription => {
+            var parsed = std.json.parseFromSlice(CodexStreamEvent, scratch.allocator(), line.line, .{ .ignore_unknown_fields = true }) catch return;
+            defer parsed.deinit();
+            if (!std.mem.eql(u8, parsed.value.type, "item.completed")) return;
+            const item = parsed.value.item orelse return;
+            if (!std.mem.eql(u8, item.type, "agent_message") or item.text.len == 0) return;
+            thread.setActiveModel("Codex · ChatGPT plan");
+            queueHarnessText(model, thread, line.key, item.text, fx);
+        },
+        .claude_subscription => {
+            var parsed = std.json.parseFromSlice(ClaudeStreamEvent, scratch.allocator(), line.line, .{ .ignore_unknown_fields = true }) catch return;
+            defer parsed.deinit();
+            if (std.mem.eql(u8, parsed.value.type, "result") and parsed.value.is_error) {
+                thread.stream_failed = true;
+                thread.setStatus(if (parsed.value.result.len > 0) parsed.value.result else "Claude could not complete the request");
+                return;
+            }
+            if (!std.mem.eql(u8, parsed.value.type, "stream_event")) return;
+            const event = parsed.value.event orelse return;
+            if (!std.mem.eql(u8, event.type, "content_block_delta")) return;
+            const delta = event.delta orelse return;
+            if (!std.mem.eql(u8, delta.type, "text_delta") or delta.text.len == 0) return;
+            thread.setActiveModel("Claude · Sonnet");
+            queueHarnessText(model, thread, line.key, delta.text, fx);
+        },
+        else => {},
+    }
+}
+
+fn receiveHarnessExit(model: *Model, exit_event: native_sdk.EffectExit, fx: *Effects) void {
+    const thread_id = requestThreadId(exit_event.key) orelse return;
+    const thread = model.threadById(thread_id) orelse return;
+    if (thread.stream_flush_scheduled) fx.cancelTimer(streamFlushKey(thread.id));
+    if (thread.stream_pending_len > 0 and !thread.flushStreamDelta(model.allocator, &model.next_message_id)) {
+        thread.stream_failed = true;
+        thread.setStatus("Response exceeded the 64 KiB safety limit");
+    }
+    const received_content = thread.stream_message_index != null;
+    thread.sending = false;
+    thread.stream_message_index = null;
+    if (exit_event.reason == .cancelled) {
+        thread.setStatus("Request cancelled");
+        return;
+    }
+    if (exit_event.dropped_lines > 0) {
+        thread.stream_failed = true;
+        thread.setStatus("Provider output was incomplete");
+        return;
+    }
+    if (exit_event.reason != .exited or exit_event.code != 0) {
+        if (thread.stream_failed) return;
+        const unavailable = exit_event.reason == .spawn_failed or exit_event.code == 127;
+        thread.setStatus(switch (thread.model_choice) {
+            .codex_subscription => if (unavailable) "Codex CLI not found; install Codex or the ChatGPT app" else "Codex request failed; reconnect it in Settings",
+            .claude_subscription => if (unavailable) "Claude CLI not found; install it, then retry" else "Claude request failed; reconnect it in Settings",
+            else => "Provider request failed",
+        });
+        return;
+    }
+    if (thread.stream_failed) return;
+    if (!received_content) {
+        thread.setStatus("The provider returned no text");
+        return;
     }
     thread.clearStatus();
 }
@@ -2750,6 +3196,7 @@ pub fn main(init: std.process.Init) !void {
         .scene = shell_scene,
         .canvas_label = canvas_label,
         .update_fx = update,
+        .init_fx = initEffects,
         .on_chrome = onChrome,
         .on_command = onCommand,
         .view = CompiledAppView.build,

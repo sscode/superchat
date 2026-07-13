@@ -10,7 +10,7 @@ The current account dialog is intentionally a local-only placeholder. It does no
 
 - The app is a native Zig application using Native SDK, not a browser shell.
 - Projects, threads, messages, drafts, model choices, and archive timestamps persist in a local SQLite database.
-- The OpenRouter API key is stored in the operating system credential store.
+- The OpenRouter API key is stored in the operating system credential store. Codex authentication remains owned by the official CLI; Superchat only launches its status, login, and chat commands. The equivalent Claude CLI harness is development-only pending Anthropic approval for third-party subscription routing.
 - Network access is already permitted for OpenRouter, but external navigation is denied.
 - There is no backend or deep-link handler yet; SQLite is strictly device-local.
 
@@ -62,7 +62,7 @@ POST /v1/sync/changes
 DELETE /v1/account
 ```
 
-The service owns provider secrets, session rotation, revocation, rate limiting, and the canonical sync cursor. The app owns local data, the device identifier, and its OpenRouter credential.
+The service owns Superchat account secrets, session rotation, revocation, rate limiting, and the canonical sync cursor. The app owns local data and the device identifier. OpenRouter credentials and official CLI subscription sessions remain device-local and are not uploaded.
 
 For the first implementation, choose a managed identity provider that supports PKCE, Apple, GitHub, email codes, refresh-token rotation, and account deletion. Hosting and database choices can remain separate. A serverless API plus managed SQL database is sufficient; Cloudflare Workers/D1, Supabase, or a similar stack can all fit this boundary. Make the vendor decision only after the callback spike and sync data model are settled.
 
@@ -81,6 +81,7 @@ Suggested ownership:
 | Data | Default location | Sync later? |
 | --- | --- | --- |
 | OpenRouter API key | Keychain | No |
+| Codex / experimental Claude session | Provider CLI credential store | No |
 | Account refresh token | Keychain | No |
 | Account access token | Memory | No |
 | Projects and threads | Local database | Yes, when signed in |

@@ -192,6 +192,82 @@ test "missing credentials disable send" {
     try testing.expect(fx.pendingFetchAt(0) == null);
 }
 
+test "Codex subscription threads run through the signed-in CLI without an API key" {
+    var model = main.initialModel("");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .{ .select_model = .codex_subscription }, &fx);
+    activeThread(&model).draft_buffer.set("Answer from my ChatGPT plan");
+    try testing.expect(model.canSend());
+    main.update(&model, .send, &fx);
+
+    const request = fx.pendingSpawnAt(0) orelse return error.TestExpectedSpawn;
+    try testing.expectEqualStrings("/bin/zsh", request.argv[0]);
+    try testing.expect(std.mem.indexOf(u8, request.argv[2], "ChatGPT.app") != null);
+    try testing.expectEqualStrings("exec", request.argv[4]);
+    try testing.expect(std.mem.indexOf(u8, request.stdin, "Answer from my ChatGPT plan") != null);
+    try testing.expect(std.mem.indexOf(u8, request.stdin, "API key") == null);
+
+    main.update(&model, .{ .harness_line = .{
+        .key = request.key,
+        .line = "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Codex answer\"}}",
+    } }, &fx);
+    main.update(&model, .{ .harness_exit = .{ .key = request.key, .code = 0 } }, &fx);
+    try testing.expectEqual(@as(usize, 2), activeThread(&model).message_count);
+    try testing.expectEqualStrings("Codex answer", activeThread(&model).messages[1].content());
+    try testing.expect(!activeThread(&model).sending);
+}
+
+test "Claude subscription threads stream text deltas through Claude Code" {
+    var model = main.initialModelWithMode("", true);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .{ .select_model = .claude_subscription }, &fx);
+    activeThread(&model).draft_buffer.set("Answer from Claude");
+    main.update(&model, .send, &fx);
+    const request = fx.pendingSpawnAt(0) orelse return error.TestExpectedSpawn;
+    try testing.expect(std.mem.indexOf(u8, request.argv[2], "--output-format stream-json") != null);
+    try testing.expect(std.mem.indexOf(u8, request.argv[2], "--tools \"\"") != null);
+
+    main.update(&model, .{ .harness_line = .{
+        .key = request.key,
+        .line = "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Claude answer\"}}}",
+    } }, &fx);
+    main.update(&model, .{ .harness_exit = .{ .key = request.key, .code = 0 } }, &fx);
+    try testing.expectEqualStrings("Claude answer", activeThread(&model).messages[1].content());
+}
+
+test "Claude subscription routing stays disabled outside development builds" {
+    var model = main.initialModel("");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    main.update(&model, .select_claude_subscription, &fx);
+    try testing.expectEqual(main.ModelChoice.auto, activeThread(&model).model_choice);
+    try testing.expect(model.claudeSubscriptionDisabled());
+}
+
+test "subscription connection buttons use provider-owned browser login" {
+    var model = main.initialModel("");
+    model.onboarding_open = true;
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .connect_codex, &fx);
+    const request = fx.pendingSpawnAt(0) orelse return error.TestExpectedSpawn;
+    try testing.expectEqualStrings("login", request.argv[4]);
+    try testing.expectEqual(main.ConnectionState.connecting, model.codex_connection);
+    main.update(&model, .{ .connection_exit = .{ .key = request.key, .code = 0 } }, &fx);
+    try testing.expectEqual(main.ConnectionState.connected, model.codex_connection);
+    try testing.expect(!model.onboarding_open);
+    try testing.expectEqual(main.CredentialAction.complete_onboarding, model.credential_action);
+}
+
 test "API key can be entered and replaced inside settings without rendering the secret" {
     var model = main.initialModel("");
     var fx = main.Effects.init(testing.allocator);
@@ -1016,7 +1092,7 @@ test "first-run onboarding is bypassed by credentials completion or dev mode" {
     try testing.expect(dev_model.dev_mode);
 }
 
-test "onboarding verifies OpenRouter without exposing unavailable adapters" {
+test "onboarding offers subscriptions and still verifies OpenRouter keys" {
     var model = main.initialModel("");
     model.onboarding_open = true;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1025,6 +1101,9 @@ test "onboarding verifies OpenRouter without exposing unavailable adapters" {
     var nodes: [240]canvas.WidgetLayoutNode = undefined;
     const layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, main.window_min_width, main.window_min_height), &nodes);
     try testing.expect(layout.nodes.len > 0);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "on-press=\"connect_codex\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "on-press=\"connect_claude\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "roadmap items") == null);
 
     var fx = main.Effects.init(testing.allocator);
     defer fx.deinit();

@@ -2,13 +2,14 @@
 
 **A fast, local-first AI chat workspace for macOS.**
 
-Superchat keeps projects, conversations, drafts, and model choices on your Mac while using [OpenRouter](https://openrouter.ai/) to talk to the models you choose. It is built with the [Vercel Labs Native SDK](https://github.com/vercel-labs/native), Zig, and a GPU-rendered native interface—there is no web app or WebView hiding underneath.
+Superchat keeps projects, conversations, drafts, and model choices on your Mac. Talk through [OpenRouter](https://openrouter.ai/) or your signed-in [Codex CLI](https://developers.openai.com/codex/cli) session. An experimental development-only Claude CLI harness is included for local evaluation. It is built with the [Vercel Labs Native SDK](https://github.com/vercel-labs/native), Zig, and a GPU-rendered native interface—there is no web app or WebView hiding underneath.
 
-> Superchat is an early public beta. OpenRouter is ready to use; cloud sync, subscription-based providers, and automatic in-app updates are still planned.
+> Superchat is an early public beta. OpenRouter and Codex/ChatGPT-plan connections are available; cloud sync and automatic in-app updates are still planned.
 
 ## What you can do
 
 - Start chats immediately or organize related conversations into optional projects.
+- Use an existing ChatGPT plan through the official local Codex CLI, without giving Superchat its session token.
 - Search OpenRouter's live model catalog, favorite useful results, or enter a model slug directly.
 - Stream several responses at once and move between chats while they finish.
 - Fork an assistant response into one or several new chats, each with a different model.
@@ -23,7 +24,13 @@ Superchat keeps projects, conversations, drafts, and model choices on your Mac w
 
 Download the universal `.dmg` from [GitHub Releases](https://github.com/sscode/superchat/releases), open it, and drag Superchat to Applications. Release builds contain both Apple Silicon and Intel code; users do not need Node.js, npm, or Zig.
 
-On first launch, paste an [OpenRouter API key](https://openrouter.ai/keys). Superchat verifies it with OpenRouter before saving it to macOS Keychain.
+On first launch, choose one connection:
+
+- **Codex · ChatGPT plan:** install/sign in to Codex (or the ChatGPT macOS app), then choose **Connect Codex**.
+- **Claude (development builds only):** an experimental local CLI adapter is present for evaluation, but is disabled in public release builds pending Anthropic approval.
+- **OpenRouter:** paste an [OpenRouter API key](https://openrouter.ai/keys). Superchat verifies it before saving it to macOS Keychain.
+
+The subscription buttons launch the official CLI's browser sign-in. Superchat neither receives nor stores the resulting provider session token.
 
 ### Run from source
 
@@ -47,7 +54,7 @@ Development mode skips onboarding so you can get straight into the app. To exper
 npm run dev:onboarding
 ```
 
-Open **Settings** with `⌘,`, choose **Add API key**, and paste your OpenRouter key. Superchat validates it and stores it in macOS Keychain—not in the chat database or source tree.
+Open **Settings** with `⌘,` to connect Codex or OpenRouter. Development builds also expose the experimental Claude adapter. OpenRouter keys are validated and stored in macOS Keychain—not in the chat database or source tree. CLI credentials remain owned by their providers.
 
 Debug and locally packaged ad-hoc builds deliberately keep API keys in memory for the current session instead of reading or writing Keychain. This prevents rebuilt binaries from repeatedly asking for access to the release app's credential. Set `OPENROUTER_API_KEY` when launching a development build if you do not want to paste it again. Keychain persistence is enabled only in consistently Developer-ID-signed release builds.
 
@@ -56,7 +63,7 @@ Choose a model with `⌘K`, write a message, and press `↩` to send. Use `⌘�
 ## A typical workflow
 
 1. Create a top-level chat with `⌘N`. Projects are optional: create one with `⌘⇧N`, then add chats to it with `⌘⌥N`.
-2. Open the model picker with `⌘K`. Search OpenRouter's catalog, choose Auto, or enter a model slug.
+2. Open the model picker with `⌘K`. Choose Codex, search OpenRouter's catalog, choose Auto, or enter a model slug. Development builds also show the experimental Claude adapter.
 3. Send a message with `↩`.
 4. Move to another chat while the answer streams; the original request continues in the background.
 5. On an assistant response, choose **Copy** or **Fork**. Forking can create several model-specific chats at once and optionally start each with the same follow-up message.
@@ -81,6 +88,8 @@ Superchat is designed to be usable without reaching for the mouse. The same refe
 | Choose model | `⌘K` |
 | OpenRouter Auto | `⌘⇧0` |
 | Quick models 1–9 | `⌘⇧1` through `⌘⇧9` |
+| Use Codex subscription | `⌘⌥⇧1` |
+| Use Claude subscription | `⌘⌥⇧2` |
 | Fork latest response | `⌘⇧F` |
 | Copy latest response | `⌘⇧C` |
 | Rename chat | `⌘⇧R` |
@@ -100,8 +109,8 @@ For dynamic controls—model search results, archive items, fork model choices, 
 Superchat does not require an account or run a local database server.
 
 - Projects, chats, messages, drafts, model choices, and archive state are stored in SQLite at `~/Library/Application Support/superchat/superchat.sqlite3`.
-- Your OpenRouter API key is stored separately in macOS Keychain.
-- Requests and the conversation context needed to answer them are sent to OpenRouter and the selected model provider. Check their privacy policies before sending sensitive information.
+- Your OpenRouter API key is stored separately in macOS Keychain. Codex and the development-only Claude harness leave authentication in each provider's own CLI credential store.
+- Requests and a bounded recent conversation context are sent only through the selected connection. Check provider privacy policies before sending sensitive information.
 - There is currently no cloud sync, telemetry service, or remote Superchat backend.
 
 Archived items disappear from the main workspace immediately. You can restore them or choose **Delete forever** from the archive. Anything left archived is permanently removed after 30 days.
@@ -129,7 +138,7 @@ Avoid placing real credentials in `.env.example` or committing them to Git.
 
 | Path | What lives there |
 | --- | --- |
-| `src/main.zig` | Application state, actions, OpenRouter requests, and SSE streaming |
+| `src/main.zig` | Application state, actions, OpenRouter SSE, and CLI provider harnesses |
 | `src/storage.zig` | SQLite schema, migrations, loading, and persistence |
 | `src/persistence.zig` | Debounced, background SQLite command queue |
 | `src/app.native` | Native UI, layout, styling, and keyboard handling |
@@ -145,9 +154,10 @@ Avoid placing real credentials in `.env.example` or committing them to Git.
 The intentionally small first version has a few boundaries worth knowing:
 
 - macOS is the only supported platform.
-- OpenRouter API keys are the only working provider connection. Claude and ChatGPT subscription adapters are clearly marked as roadmap work.
+- Subscription connections require the corresponding official CLI to remain installed and signed in. Codex currently delivers its completed answer as one event; the experimental Claude harness and OpenRouter stream partial text.
+- Anthropic's current [authentication guidance](https://code.claude.com/docs/en/legal-and-compliance) does not allow unapproved third-party products to offer Claude.ai login or route Pro/Max credentials. The Claude harness is therefore disabled outside development builds; obtain approval or switch it to user-supplied API authentication before release.
 - Authentication and sync are not in the app's critical path. See [AUTH_PLAN.md](AUTH_PLAN.md) for the proposed optional architecture.
-- SQLite retains the complete transcript. The UI opens the latest 50 messages and loads earlier pages on demand; provider requests independently use the latest 12 messages.
+- SQLite retains the complete transcript. The UI opens the latest 50 messages and loads earlier pages on demand; provider requests independently use a bounded recent context. Native SDK currently caps CLI-harness prompt input at 4 KiB.
 - Projects and chats grow dynamically instead of stopping at prototype-era 8/24 limits. Individual responses have a 64 KiB safety ceiling.
 - Tagged GitHub releases build a clean universal app, sign it with Developer ID, submit it for Apple notarization, staple the result, and publish the `.dmg` to GitHub Releases.
 - Automatic in-app update checks are not implemented yet; GitHub Releases is the distribution source for the beta.
