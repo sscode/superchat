@@ -1,6 +1,7 @@
 {
   "name": "superchat",
   "private": true,
+  "license": "MIT",
   "version": "0.1.0",
   "scripts": {
     "dev": "SUPERCHAT_DEV_MODE=1 native dev",

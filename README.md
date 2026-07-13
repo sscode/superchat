@@ -4,14 +4,15 @@
 
 Superchat keeps projects, conversations, drafts, and model choices on your Mac. Talk through [OpenRouter](https://openrouter.ai/) or your signed-in [Codex CLI](https://developers.openai.com/codex/cli) session. An experimental development-only Claude CLI harness is included for local evaluation. It is built with the [Vercel Labs Native SDK](https://github.com/vercel-labs/native), Zig, and a GPU-rendered native interface—there is no web app or WebView hiding underneath.
 
-> Superchat is an early public beta. OpenRouter and Codex/ChatGPT-plan connections are available; cloud sync and automatic in-app updates are still planned.
+> Superchat is an early public beta. OpenRouter and Codex connections are available; cloud sync and automatic in-app updates are still planned.
 
 ## What you can do
 
 - Start chats immediately or organize related conversations into optional projects.
-- Use an existing ChatGPT plan through the official local Codex CLI, without giving Superchat its session token.
+- Use Codex through your signed-in ChatGPT account, without giving Superchat its session token.
 - Search OpenRouter's live model catalog, favorite useful results, or enter a model slug directly.
 - Stream several responses at once and move between chats while they finish.
+- Drop images, PDFs, and text/code files into a message, or attach them without leaving the keyboard.
 - Fork an assistant response into one or several new chats, each with a different model.
 - Copy complete responses or select and copy text from a rendered paragraph.
 - Rename, archive, restore, and permanently delete projects and chats.
@@ -26,11 +27,11 @@ Download the universal `.dmg` from [GitHub Releases](https://github.com/sscode/s
 
 On first launch, choose one connection:
 
-- **Codex · ChatGPT plan:** install/sign in to Codex (or the ChatGPT macOS app), then choose **Connect Codex**.
+- **Codex · ChatGPT:** install and sign in to Codex (or the ChatGPT macOS app), then choose **Connect Codex**.
 - **Claude (development builds only):** an experimental local CLI adapter is present for evaluation, but is disabled in public release builds pending Anthropic approval.
 - **OpenRouter:** paste an [OpenRouter API key](https://openrouter.ai/keys). Superchat verifies it before saving it to macOS Keychain.
 
-The subscription buttons launch the official CLI's browser sign-in. Superchat neither receives nor stores the resulting provider session token.
+The Codex connection launches the official CLI's browser sign-in. Superchat neither receives nor stores the resulting provider session token.
 
 ### Run from source
 
@@ -58,13 +59,13 @@ Open **Settings** with `⌘,` to connect Codex or OpenRouter. Development builds
 
 Debug and locally packaged ad-hoc builds deliberately keep API keys in memory for the current session instead of reading or writing Keychain. This prevents rebuilt binaries from repeatedly asking for access to the release app's credential. Set `OPENROUTER_API_KEY` when launching a development build if you do not want to paste it again. Keychain persistence is enabled only in consistently Developer-ID-signed release builds.
 
-Choose a model with `⌘K`, write a message, and press `↩` to send. Use `⌘↩` when you want a new line.
+Choose a model with `⌘K`, write a message, and press `↩` to send. Use `⌘↩` when you want a new line. Drop a supported file anywhere on the app or press `⌘U`; attachment buttons in the composer remove a file before it is sent.
 
 ## A typical workflow
 
 1. Create a top-level chat with `⌘N`. Projects are optional: create one with `⌘⇧N`, then add chats to it with `⌘⌥N`.
 2. Open the model picker with `⌘K`. Choose Codex, search OpenRouter's catalog, choose Auto, or enter a model slug. Development builds also show the experimental Claude adapter.
-3. Send a message with `↩`.
+3. Optionally drop up to four images, PDFs, or text/code files into the app. Send with `↩`.
 4. Move to another chat while the answer streams; the original request continues in the background.
 5. On an assistant response, choose **Copy** or **Fork**. Forking can create several model-specific chats at once and optionally start each with the same follow-up message.
 
@@ -83,13 +84,13 @@ Superchat is designed to be usable without reaching for the mouse. The same refe
 | Chats 1–9 in the current area | `⌥1` through `⌥9` |
 | Previous / next project | `⌘⌥↑` / `⌘⌥↓` |
 | Focus composer | `⌘L` |
+| Attach images or files | `⌘U` |
 | Send message | `↩` |
 | New line in message | `⌘↩` |
 | Choose model | `⌘K` |
 | OpenRouter Auto | `⌘⇧0` |
 | Quick models 1–9 | `⌘⇧1` through `⌘⇧9` |
-| Use Codex subscription | `⌘⌥⇧1` |
-| Use Claude subscription | `⌘⌥⇧2` |
+| Use Codex | `⌘⌥⇧1` |
 | Fork latest response | `⌘⇧F` |
 | Copy latest response | `⌘⇧C` |
 | Rename chat | `⌘⇧R` |
@@ -109,6 +110,7 @@ For dynamic controls—model search results, archive items, fork model choices, 
 Superchat does not require an account or run a local database server.
 
 - Projects, chats, messages, drafts, model choices, and archive state are stored in SQLite at `~/Library/Application Support/superchat/superchat.sqlite3`.
+- Attachment names, types, and user-selected paths are stored with the chat. File contents are not copied into SQLite. A private, randomly named temporary request file is created only when OpenRouter needs a larger multimodal payload and is removed when that request exits.
 - Your OpenRouter API key is stored separately in macOS Keychain. Codex and the development-only Claude harness leave authentication in each provider's own CLI credential store.
 - Requests and a bounded recent conversation context are sent only through the selected connection. Check provider privacy policies before sending sensitive information.
 - There is currently no cloud sync, telemetry service, or remote Superchat backend.
@@ -148,17 +150,20 @@ Avoid placing real credentials in `.env.example` or committing them to Git.
 | `scripts/package-macos.sh` | Reproducible universal macOS packaging |
 | `.github/workflows/` | ARM/Intel CI and signed, notarized tag releases |
 | `AUTH_PLAN.md` | Proposed optional authentication and sync architecture |
+| `CONTRIBUTING.md` | Development workflow and contribution expectations |
+| `SECURITY.md` | Private vulnerability-reporting process |
 
 ## Current status
 
 The intentionally small first version has a few boundaries worth knowing:
 
 - macOS is the only supported platform.
-- Subscription connections require the corresponding official CLI to remain installed and signed in. Codex currently delivers its completed answer as one event; the experimental Claude harness and OpenRouter stream partial text.
+- CLI connections require the corresponding official CLI to remain installed and signed in. Codex currently delivers its completed answer as one event; the experimental Claude harness and OpenRouter stream partial text.
 - Anthropic's current [authentication guidance](https://code.claude.com/docs/en/legal-and-compliance) does not allow unapproved third-party products to offer Claude.ai login or route Pro/Max credentials. The Claude harness is therefore disabled outside development builds; obtain approval or switch it to user-supplied API authentication before release.
 - Authentication and sync are not in the app's critical path. See [AUTH_PLAN.md](AUTH_PLAN.md) for the proposed optional architecture.
 - SQLite retains the complete transcript. The UI opens the latest 50 messages and loads earlier pages on demand; provider requests independently use a bounded recent context. Native SDK currently caps CLI-harness prompt input at 4 KiB.
 - Projects and chats grow dynamically instead of stopping at prototype-era 8/24 limits. Individual responses have a 64 KiB safety ceiling.
+- A message accepts up to four attachments totaling 640 KB: PNG, JPEG, WebP, GIF, PDF, UTF-8 text, Markdown, JSON, CSV, and common source-code formats. OpenRouter receives images, PDFs, and text files; Codex receives images plus bounded text-file content; the development-only Claude adapter currently accepts text files. Saved draft attachment metadata survives a restart, but the file must be removed and reattached before sending so Superchat never re-reads a local file without a fresh user action.
 - Tagged GitHub releases build a clean universal app, sign it with Developer ID, submit it for Apple notarization, staple the result, and publish the `.dmg` to GitHub Releases.
 - Automatic in-app update checks are not implemented yet; GitHub Releases is the distribution source for the beta.
 

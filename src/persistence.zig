@@ -6,6 +6,9 @@ pub const max_thread_title_bytes = 80;
 pub const max_draft_bytes = 5000;
 pub const max_model_bytes = 128;
 pub const max_message_bytes = 64 * 1024;
+pub const max_attachments_per_message = 4;
+pub const max_attachment_path_bytes = 1024;
+pub const max_attachment_name_bytes = 128;
 pub const max_projects = 4096;
 pub const max_threads = 4096;
 pub const max_visible_messages = 50;
@@ -39,6 +42,8 @@ pub const ThreadRecord = struct {
     model_slug_len: usize = 0,
     active_model: [max_model_bytes]u8 = undefined,
     active_model_len: usize = 0,
+    attachments: [max_attachments_per_message]AttachmentRecord = [_]AttachmentRecord{.{}} ** max_attachments_per_message,
+    attachment_count: usize = 0,
 
     pub fn from(thread: anytype, position: usize) ThreadRecord {
         var record = ThreadRecord{
@@ -52,6 +57,23 @@ pub const ThreadRecord = struct {
         record.draft_len = copyText(&record.draft, thread.draft());
         record.model_slug_len = copyText(&record.model_slug, thread.modelName());
         record.active_model_len = copyText(&record.active_model, thread.active_model_storage[0..thread.active_model_len]);
+        record.attachment_count = thread.draft_attachment_count;
+        for (thread.draft_attachments[0..thread.draft_attachment_count], 0..) |*attachment, index| record.attachments[index] = AttachmentRecord.from(attachment);
+        return record;
+    }
+};
+
+pub const AttachmentRecord = struct {
+    kind: u8 = 0,
+    path: [max_attachment_path_bytes]u8 = undefined,
+    path_len: usize = 0,
+    name: [max_attachment_name_bytes]u8 = undefined,
+    name_len: usize = 0,
+
+    pub fn from(attachment: anytype) AttachmentRecord {
+        var record = AttachmentRecord{ .kind = @intFromEnum(attachment.kind) };
+        record.path_len = copyText(&record.path, attachment.path());
+        record.name_len = copyText(&record.name, attachment.name());
         return record;
     }
 };
@@ -62,10 +84,14 @@ pub const MessageRecord = struct {
     role: u8,
     content: [max_message_bytes]u8 = undefined,
     content_len: usize = 0,
+    attachments: [max_attachments_per_message]AttachmentRecord = [_]AttachmentRecord{.{}} ** max_attachments_per_message,
+    attachment_count: usize = 0,
 
     pub fn from(thread_id: u32, message: anytype) MessageRecord {
         var record = MessageRecord{ .id = message.id, .thread_id = thread_id, .role = @intFromEnum(message.role) };
         record.content_len = copyText(&record.content, message.content());
+        record.attachment_count = message.attachment_count;
+        for (message.attachments[0..message.attachment_count], 0..) |*attachment, index| record.attachments[index] = AttachmentRecord.from(attachment);
         return record;
     }
 };
@@ -244,18 +270,24 @@ pub const Worker = struct {
     fn apply(worker: *Worker, command: Command) !void {
         switch (command) {
             .upsert_project => |record| try worker.database.upsertProject(record.id, record.name[0..record.name_len], record.archived_at_ms, record.position),
-            .upsert_thread => |record| try worker.database.upsertThread(
-                record.id,
-                record.project_id,
-                record.title[0..record.title_len],
-                record.archived_at_ms,
-                record.position,
-                record.draft[0..record.draft_len],
-                record.model_choice,
-                record.model_slug[0..record.model_slug_len],
-                record.active_model[0..record.active_model_len],
-            ),
-            .upsert_message => |record| try worker.database.upsertMessage(record.id, record.thread_id, record.role, record.content[0..record.content_len]),
+            .upsert_thread => |record| {
+                try worker.database.upsertThread(
+                    record.id,
+                    record.project_id,
+                    record.title[0..record.title_len],
+                    record.archived_at_ms,
+                    record.position,
+                    record.draft[0..record.draft_len],
+                    record.model_choice,
+                    record.model_slug[0..record.model_slug_len],
+                    record.active_model[0..record.active_model_len],
+                );
+                try worker.database.replaceAttachments(record.id, 0, record.attachments[0..record.attachment_count]);
+            },
+            .upsert_message => |record| {
+                try worker.database.upsertMessage(record.id, record.thread_id, record.role, record.content[0..record.content_len]);
+                try worker.database.replaceAttachments(record.thread_id, record.id, record.attachments[0..record.attachment_count]);
+            },
             .clear_messages => |thread_id| try worker.database.clearMessages(thread_id),
             .reconcile => |record| try worker.database.reconcile(record.project_ids[0..record.project_count], record.thread_ids[0..record.thread_count]),
             .meta => |record| try worker.database.saveMeta(record.active_project_id, record.active_thread_id, record.next_project_id, record.next_thread_id, record.next_message_id),

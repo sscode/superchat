@@ -6,7 +6,7 @@
       <text size="heading">{brandLabel}</text>
       <spacer grow="1" />
       <select size="sm" width="210" on-press="toggle_model_picker" label="Model selector">{selectedModelLabel}</select>
-      <button size="sm" variant="ghost" icon="trash" on-press="clear" disabled="{cannotClear}" label="Clear current chat"></button>
+      <button size="sm" variant="ghost" icon="trash" on-press="clear" disabled="{cannotClear}" label="{clearButtonLabel}"></button>
       <spacer width="{chrome_trailing}" />
     </row>
     <separator />
@@ -62,7 +62,7 @@
               <if test="{m.isUser}">
                 <row main="end">
                   <bubble variant="primary" label="You said">
-                    <text wrap="true">{m.content}</text>
+                    <text wrap="true">{m.content}  {m.attachmentSummary}</text>
                   </bubble>
                 </row>
               </if>
@@ -100,9 +100,13 @@
         </scroll>
         <separator />
         <column padding="14" gap="8" background="surface">
-          <textarea key="{composerKey}" text="{draft}" on-input="draft_edit" on-submit="composer_newline" autofocus="true" height="92" placeholder="Message any model…" label="Message" />
+          <for each="draftAttachmentRows" key="index" as="a">
+            <button size="sm" variant="outline" icon="x" on-press="remove_attachment:{a.index}" label="Remove {a.name}">{a.detail} · {a.name}</button>
+          </for>
+          <textarea key="{composerKey}" text="{draft}" on-input="draft_edit" on-submit="composer_newline" autofocus="true" height="92" placeholder="Message any model, or drop images and files…" label="Message" />
           <row cross="center" gap="8">
-            <text foreground="text_muted" grow="1">Return to send · Command + Return for a new line</text>
+            <button size="sm" variant="ghost" icon="plus" on-press="open_file_picker" label="Attach images or files, Command U">Attach · Cmd + U</button>
+            <spacer grow="1" />
             <if test="{missingKey}">
               <button size="sm" variant="outline" icon="settings" on-press="open_settings">Add API key</button>
             </if>
@@ -117,17 +121,18 @@
   <if test="{model_picker_open}">
     <panel background="scrim" on-press="close_model_picker" label="Model picker backdrop">
       <column main="center" cross="center">
-        <dialog width="620" height="520" label="Choose an OpenRouter model">
+        <dialog width="620" height="440" label="Choose a model">
           <column padding="20" gap="10">
             <text size="heading">Choose a model</text>
             <grid columns="3" gap="6">
               <for each="quickModels" as="q">
                 <button variant="outline" on-press="select_quick_model:{q.number}" label="{q.slug}">{q.number} · {q.label}</button>
               </for>
+              <button variant="outline" on-press="select_codex_subscription">Codex · ChatGPT</button>
+              <button variant="outline" on-press="select_claude_subscription" disabled="{claudeSubscriptionDisabled}">Claude · Experimental</button>
             </grid>
             <text-field text="{modelSearch}" on-input="model_search_edit" placeholder="Search models or providers…" autofocus="true" label="Search OpenRouter models" />
             <text size="sm" foreground="text_muted">{modelCatalogStatus}</text>
-            <if test="{modelCatalogLoading}"><row gap="8"><spinner size="sm" /><text>Searching</text></row></if>
             <scroll grow="1" label="OpenRouter model results">
               <column gap="4">
                 <for each="catalogRows" key="index" as="m">
@@ -139,8 +144,6 @@
               </column>
             </scroll>
             <row gap="8" main="end">
-              <button variant="outline" on-press="select_codex_subscription">Codex</button>
-              <button variant="outline" on-press="select_claude_subscription" disabled="{claudeSubscriptionDisabled}">Claude · Experimental</button>
               <button variant="outline" on-press="select_auto_model">OpenRouter Auto</button>
               <button variant="ghost" on-press="select_custom_model">Enter model ID manually</button>
               <button variant="primary" on-press="close_model_picker">Done</button>
@@ -154,14 +157,13 @@
   <if test="{settings_open}">
     <panel background="scrim" on-press="close_settings" label="Settings backdrop">
       <column main="center" cross="center">
-        <dialog width="600" height="610" label="Settings">
+        <dialog width="600" height="440" label="Settings">
           <column padding="20" gap="10">
             <text size="heading">Settings</text>
-            <button variant="outline" on-press="connect_codex">{codexConnectionButtonText}</button>
+            <button variant="outline" on-press="connect_codex" disabled="{codexConnectionBusy}">{codexConnectionButtonText}</button>
             <button variant="outline" on-press="connect_claude" disabled="{claudeSubscriptionDisabled}">{claudeConnectionButtonText}</button>
-            <text-field text="{apiKeyField}" on-input="api_key_edit" on-submit="save_settings" placeholder="{apiKeyPlaceholder}" autofocus="true" label="OpenRouter API key" />
+            <text-field text="{apiKeyField}" on-input="api_key_edit" on-submit="save_settings" placeholder="{apiKeyPlaceholder}" label="OpenRouter API key" />
             <text-field text="{modelName}" on-input="model_edit" on-submit="save_settings" placeholder="provider/model" label="Custom OpenRouter model" />
-            <text size="heading">Keyboard shortcuts</text>
             <scroll grow="1" label="Keyboard shortcuts">
               <column gap="2">
                 <for each="shortcutHints" as="h">
@@ -190,7 +192,6 @@
           <column padding="24" gap="10">
             <text size="heading">Fork this response</text>
             <text size="sm" foreground="text_muted">Clone its history into one chat per selected model. Cmd + Shift + F</text>
-            <text size="heading">Starting point</text>
             <text wrap="true" foreground="text_muted">{forkSourcePreview}</text>
             <textarea text="{forkSeed}" on-input="fork_seed_edit" on-submit="create_forks" height="84" placeholder="Optional follow-up for every selected model…" label="Fork follow-up message" />
             <text size="heading">Models</text>
@@ -202,7 +203,6 @@
             <if test="{forkNeedsOpenRouterKey}">
               <text size="sm" foreground="text_muted">Without an API key, the follow-up remains a draft.</text>
             </if>
-            <spacer grow="1" />
             <row gap="8" main="end">
               <button size="sm" variant="ghost" on-press="close_fork">Cancel</button>
               <button size="sm" variant="primary" on-press="create_forks" disabled="{cannotCreateForks}">{forkCountLabel}</button>
@@ -231,28 +231,31 @@
   <if test="{archive_open}">
     <panel background="scrim" on-press="close_archive" label="Archive backdrop">
       <column main="center" cross="center">
-        <dialog width="680" height="500" label="Archive">
+        <dialog width="680" height="440" label="Archive">
           <column padding="24" gap="10">
             <text size="heading">Archive</text>
             <text foreground="text_muted">Items are permanently deleted 30 days after they are archived.</text>
-            <if test="{archiveEmpty}">
-              <text foreground="text_muted" grow="1">Nothing is archived.</text>
-            </if>
-            <for each="archivedProjectRows" as="p">
-              <row gap="8" cross="center">
-                <text grow="1">{p.name} · {p.expiry}</text>
-                <button variant="outline" on-press="restore_project:{p.id}">Restore</button>
-                <button variant="ghost" on-press="delete_project:{p.id}">Delete forever</button>
-              </row>
-            </for>
-            <for each="archivedThreadRows" as="t">
-              <row gap="8" cross="center">
-                <text grow="1">{t.title} · {t.project_name} · {t.expiry}</text>
-                <button variant="outline" on-press="restore_thread:{t.id}">Restore</button>
-                <button variant="ghost" on-press="delete_thread:{t.id}">Delete forever</button>
-              </row>
-            </for>
-            <spacer grow="1" />
+            <scroll grow="1" label="Archived items">
+              <column gap="8">
+                <if test="{archiveEmpty}">
+                  <text foreground="text_muted">Nothing is archived.</text>
+                </if>
+                <for each="archivedProjectRows" as="p">
+                  <row gap="8" cross="center">
+                    <text grow="1">{p.name} · {p.expiry}</text>
+                    <button variant="outline" on-press="restore_project:{p.id}">Restore</button>
+                    <button variant="ghost" on-press="delete_project:{p.id}">Delete forever</button>
+                  </row>
+                </for>
+                <for each="archivedThreadRows" as="t">
+                  <row gap="8" cross="center">
+                    <text grow="1">{t.title} · {t.project_name} · {t.expiry}</text>
+                    <button variant="outline" on-press="restore_thread:{t.id}">Restore</button>
+                    <button variant="ghost" on-press="delete_thread:{t.id}">Delete forever</button>
+                  </row>
+                </for>
+              </column>
+            </scroll>
             <if test="{delete_confirm_open}">
               <row gap="8" cross="center">
                 <text grow="1" wrap="true">{deleteTargetLabel}</text>
@@ -270,11 +273,11 @@
   <if test="{onboarding_open}">
     <panel background="scrim" label="Welcome to Superchat">
       <column main="center" cross="center">
-        <dialog width="620" height="530" label="Connect a model provider">
+        <dialog width="620" height="430" label="Connect a model provider">
           <column padding="24" gap="10">
             <text size="heading">Welcome to Superchat</text>
-            <text foreground="text_muted">Use a subscription you already have, or connect OpenRouter. Superchat never reads or stores provider session tokens.</text>
-            <button variant="outline" on-press="connect_codex">{codexConnectionButtonText}</button>
+            <text foreground="text_muted" wrap="true">Use Codex with your ChatGPT account, or connect OpenRouter. Provider sign-in stays in the official app or CLI.</text>
+            <button variant="outline" on-press="connect_codex" disabled="{codexConnectionBusy}">{codexConnectionButtonText}</button>
             <button variant="outline" on-press="connect_claude" disabled="{claudeSubscriptionDisabled}">{claudeConnectionButtonText}</button>
             <text foreground="text_muted" wrap="true">{statusLine}</text>
             <text-field text="{apiKeyField}" on-input="api_key_edit" on-submit="finish_onboarding" placeholder="sk-or-v1-…" autofocus="true" label="OpenRouter API key" />

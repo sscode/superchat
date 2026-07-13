@@ -4,12 +4,12 @@
 
 Add identity and eventual cross-device sync without making an account a requirement for using Superchat. A user must always be able to open the app, add their own OpenRouter key, and chat locally.
 
-The current account dialog is intentionally a local-only placeholder. It does not collect an email, contact a server, create an account, persist an identity, or sync data. Its purpose is to reserve a clear navigation point without simulating authentication that does not exist.
+No Superchat account UI is shipped today. The app does not collect an email, contact a Superchat backend, create an identity, or sync data. Provider sign-in is separate: OpenRouter keys remain device-local, while Codex authentication stays in the official provider app or CLI.
 
 ## Current constraints
 
 - The app is a native Zig application using Native SDK, not a browser shell.
-- Projects, threads, messages, drafts, model choices, and archive timestamps persist in a local SQLite database.
+- Projects, threads, messages, drafts, model choices, archive timestamps, and attachment metadata persist in a local SQLite database. Attachment contents remain in their original files and are not copied into the database.
 - The OpenRouter API key is stored in the operating system credential store. Codex authentication remains owned by the official CLI; Superchat only launches its status, login, and chat commands. The equivalent Claude CLI harness is development-only pending Anthropic approval for third-party subscription routing.
 - Network access is already permitted for OpenRouter, but external navigation is denied.
 - There is no backend or deep-link handler yet; SQLite is strictly device-local.
@@ -105,7 +105,7 @@ Suggested ownership:
 
 ### Phase 0 — now
 
-- Keep the account UI as a clearly labeled local-only placeholder.
+- Keep account UI out of the product until it provides a real, working sync benefit.
 - Preserve local-only mode.
 - Add no auth dependency and send no account data over the network.
 

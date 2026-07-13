@@ -1,4 +1,4 @@
-//! Superchat: a small, native OpenRouter chat client.
+//! Superchat: a fast, local-first native AI chat workspace.
 //!
 //! The interface is declarative `.native` markup. This file owns the
 //! model/message/update loop and uses Native SDK's typed HTTP effect so
@@ -63,6 +63,12 @@ const max_status_bytes = 240;
 const max_toast_bytes = 96;
 const max_stream_line_bytes = 32 * 1024;
 const max_request_bytes = native_sdk.max_effect_fetch_payload_bytes;
+const max_attachments_per_message = 4;
+const max_attachment_path_bytes = 1024;
+const max_attachment_name_bytes = 128;
+const max_attachment_total_bytes = 640 * 1024;
+const attachment_read_key_base: u64 = 1 << 56;
+const request_body_key_base: u64 = 1 << 55;
 
 fn utf8PrefixLen(text: []const u8, limit: usize) usize {
     var len = @min(text.len, limit);
@@ -77,6 +83,8 @@ const app_permissions = [_][]const u8{
     native_sdk.security.permission_network,
     native_sdk.security.permission_credentials,
     native_sdk.security.permission_clipboard,
+    native_sdk.security.permission_filesystem,
+    native_sdk.security.permission_dialog,
 };
 const shell_views = [_]native_sdk.ShellView{
     .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Chat canvas", .accessibility_label = "Superchat", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
@@ -114,6 +122,29 @@ pub const ModelChoice = enum {
 pub const CredentialAction = enum { none, save, delete, complete_onboarding };
 pub const RenameKind = enum { project, thread };
 pub const ConnectionState = enum { disabled, checking, connected, disconnected, connecting, unavailable, failed };
+pub const AttachmentKind = enum { image, pdf, text };
+
+pub const Attachment = struct {
+    kind: AttachmentKind = .text,
+    path_storage: [max_attachment_path_bytes]u8 = undefined,
+    path_len: usize = 0,
+    name_storage: [max_attachment_name_bytes]u8 = undefined,
+    name_len: usize = 0,
+    bytes: []u8 = @constCast(&[_]u8{}),
+
+    pub fn path(attachment: *const Attachment) []const u8 {
+        return attachment.path_storage[0..attachment.path_len];
+    }
+
+    pub fn name(attachment: *const Attachment) []const u8 {
+        return attachment.name_storage[0..attachment.name_len];
+    }
+
+    pub fn deinit(attachment: *Attachment, allocator: std.mem.Allocator) void {
+        if (attachment.bytes.len > 0) allocator.free(attachment.bytes);
+        attachment.* = .{};
+    }
+};
 
 pub const ModelOption = struct {
     choice: ModelChoice,
@@ -156,6 +187,8 @@ pub const Message = struct {
     role: Role = .user,
     content_storage: []u8 = @constCast(&[_]u8{}),
     content_len: usize = 0,
+    attachments: [max_attachments_per_message]Attachment = [_]Attachment{.{}} ** max_attachments_per_message,
+    attachment_count: usize = 0,
 
     pub fn content(message: *const Message) []const u8 {
         return message.content_storage[0..message.content_len];
@@ -169,7 +202,26 @@ pub const Message = struct {
         return message.role == .assistant;
     }
 
+    pub fn hasAttachments(message: *const Message) bool {
+        return message.attachment_count > 0;
+    }
+
+    pub fn attachmentSummary(message: *const Message, arena: std.mem.Allocator) []const u8 {
+        if (message.attachment_count == 0) return "";
+        var writer: std.Io.Writer.Allocating = .init(arena);
+        for (message.attachments[0..message.attachment_count], 0..) |*attachment, index| {
+            if (index > 0) writer.writer.writeAll("  ·  ") catch return "Attachments";
+            writer.writer.print("{s} {s}", .{ switch (attachment.kind) {
+                .image => "Image",
+                .pdf => "PDF",
+                .text => "File",
+            }, attachment.name() }) catch return "Attachments";
+        }
+        return writer.written();
+    }
+
     fn deinit(message: *Message, allocator: std.mem.Allocator) void {
+        for (message.attachments[0..message.attachment_count]) |*attachment| attachment.deinit(allocator);
         if (message.content_storage.len > 0) allocator.free(message.content_storage);
         message.* = .{};
     }
@@ -213,6 +265,10 @@ pub const Thread = struct {
     stream_flush_scheduled: bool = false,
     has_older_messages: bool = false,
     history_loading: bool = false,
+    request_path_storage: [128]u8 = undefined,
+    request_path_len: usize = 0,
+    draft_attachments: [max_attachments_per_message]Attachment = [_]Attachment{.{}} ** max_attachments_per_message,
+    draft_attachment_count: usize = 0,
 
     pub fn title(thread: *const Thread) []const u8 {
         return thread.title_storage[0..thread.title_len];
@@ -235,6 +291,10 @@ pub const Thread = struct {
 
     pub fn modelName(thread: *const Thread) []const u8 {
         return thread.model_buffer.text();
+    }
+
+    fn requestPath(thread: *const Thread) []const u8 {
+        return thread.request_path_storage[0..thread.request_path_len];
     }
 
     fn setStatus(thread: *Thread, text: []const u8) void {
@@ -265,15 +325,24 @@ pub const Thread = struct {
 
     fn appendMessage(thread: *Thread, allocator: std.mem.Allocator, next_message_id: *u32, role: Role, content: []const u8) bool {
         const trimmed = std.mem.trim(u8, content, " \t\r\n");
-        if (trimmed.len == 0) return false;
-        const len = utf8PrefixLen(trimmed, max_message_bytes);
+        if (trimmed.len == 0 and (role != .user or thread.draft_attachment_count == 0)) return false;
+        const visible_content = if (trimmed.len > 0) trimmed else "Please analyze the attached files.";
+        const len = utf8PrefixLen(visible_content, max_message_bytes);
         if (!thread.ensureMessageCapacity(allocator, thread.message_count + 1)) return false;
-        const owned = allocator.dupe(u8, trimmed[0..len]) catch return false;
-        const message = Message{ .id = next_message_id.*, .role = role, .content_storage = owned, .content_len = len };
+        const owned = allocator.dupe(u8, visible_content[0..len]) catch return false;
+        var message = Message{ .id = next_message_id.*, .role = role, .content_storage = owned, .content_len = len };
+        if (role == .user) {
+            message.attachment_count = thread.draft_attachment_count;
+            for (thread.draft_attachments[0..thread.draft_attachment_count], 0..) |attachment, index| {
+                message.attachments[index] = attachment;
+                thread.draft_attachments[index] = .{};
+            }
+            thread.draft_attachment_count = 0;
+        }
         thread.messages[thread.message_count] = message;
         thread.message_count += 1;
         next_message_id.* += 1;
-        if (role == .user and thread.message_count == 1) thread.setTitle(trimmed);
+        if (role == .user and thread.message_count == 1) thread.setTitle(if (trimmed.len > 0) trimmed else message.attachments[0].name());
         return true;
     }
 
@@ -281,6 +350,15 @@ pub const Thread = struct {
         if (!thread.ensureMessageCapacity(allocator, thread.message_count + 1)) return false;
         var cloned = source.*;
         cloned.content_storage = allocator.dupe(u8, source.content()) catch return false;
+        for (source.attachments[0..source.attachment_count], 0..) |*source_attachment, index| {
+            cloned.attachments[index].bytes = if (source_attachment.bytes.len > 0)
+                allocator.dupe(u8, source_attachment.bytes) catch {
+                    cloned.deinit(allocator);
+                    return false;
+                }
+            else
+                @constCast(&[_]u8{});
+        }
         cloned.id = next_message_id.*;
         thread.messages[thread.message_count] = cloned;
         thread.message_count += 1;
@@ -330,6 +408,7 @@ pub const Thread = struct {
     }
 
     fn deinit(thread: *Thread, allocator: std.mem.Allocator) void {
+        for (thread.draft_attachments[0..thread.draft_attachment_count]) |*attachment| attachment.deinit(allocator);
         for (thread.messages[0..thread.message_count]) |*message| message.deinit(allocator);
         if (thread.messages.len > 0) allocator.free(thread.messages);
         if (thread.stream_pending_storage.len > 0) allocator.free(thread.stream_pending_storage);
@@ -377,6 +456,24 @@ pub const ArchivedThreadRow = struct {
     expiry: []const u8,
 };
 
+pub const AttachmentRow = struct {
+    index: u8,
+    name: []const u8,
+    detail: []const u8,
+};
+
+const PendingAttachment = struct {
+    key: u64 = 0,
+    thread_id: u32 = 0,
+    kind: AttachmentKind = .text,
+    path_storage: [max_attachment_path_bytes]u8 = undefined,
+    path_len: usize = 0,
+
+    fn path(pending: *const PendingAttachment) []const u8 {
+        return pending.path_storage[0..pending.path_len];
+    }
+};
+
 pub const chats_project_id: u32 = 0;
 const chats_project_name = "Chats";
 
@@ -388,10 +485,10 @@ pub const cmd_next_thread = "workspace.next-thread";
 pub const cmd_previous_project = "workspace.previous-project";
 pub const cmd_next_project = "workspace.next-project";
 pub const cmd_focus_composer = "workspace.focus-composer";
+pub const cmd_attach_files = "workspace.attach-files";
 pub const cmd_model_picker = "workspace.model-picker";
 pub const cmd_auto_model = "workspace.model-auto";
 pub const cmd_codex_subscription = "workspace.model-codex-subscription";
-pub const cmd_claude_subscription = "workspace.model-claude-subscription";
 pub const cmd_settings = "workspace.settings";
 pub const cmd_fork_latest = "workspace.fork-latest";
 pub const cmd_copy_latest = "workspace.copy-latest";
@@ -480,6 +577,15 @@ fn draftSaveThreadId(key: u64) ?u32 {
     return @intCast(key - draft_save_key_base);
 }
 
+fn requestBodyKey(thread_id: u32) u64 {
+    return request_body_key_base + thread_id;
+}
+
+fn requestBodyThreadId(key: u64) ?u32 {
+    if (key <= request_body_key_base or key - request_body_key_base > std.math.maxInt(u32)) return null;
+    return @intCast(key - request_body_key_base);
+}
+
 const ApiMessage = struct {
     role: []const u8,
     content: []const u8,
@@ -542,6 +648,11 @@ const RemoteModels = struct { data: []const RemoteModel = &.{} };
 pub const Msg = union(enum) {
     draft_edit: canvas.TextInputEvent,
     composer_newline,
+    open_file_picker,
+    files_dropped: native_sdk.platform.FileDropEvent,
+    attachment_file_result: native_sdk.EffectFileResult,
+    request_body_written: native_sdk.EffectFileResult,
+    remove_attachment: u8,
     model_edit: canvas.TextInputEvent,
     api_key_edit: canvas.TextInputEvent,
     model_search_edit: canvas.TextInputEvent,
@@ -610,6 +721,7 @@ pub const Msg = union(enum) {
     stream_line: native_sdk.EffectLine,
     harness_line: native_sdk.EffectLine,
     harness_exit: native_sdk.EffectExit,
+    openrouter_exit: native_sdk.EffectExit,
     connection_exit: native_sdk.EffectExit,
     stream_flush: native_sdk.EffectTimer,
     persist_draft: native_sdk.EffectTimer,
@@ -622,6 +734,7 @@ pub const Msg = union(enum) {
         "stream_line",
         "harness_line",
         "harness_exit",
+        "openrouter_exit",
         "connection_exit",
         "stream_flush",
         "history_poll",
@@ -629,6 +742,9 @@ pub const Msg = union(enum) {
         "persist_draft",
         "dismiss_toast",
         "clipboard_result",
+        "files_dropped",
+        "attachment_file_result",
+        "request_body_written",
         "chrome_changed",
         "previous_project",
         "next_project",
@@ -648,6 +764,7 @@ pub const Msg = union(enum) {
         "select_top_level_chats",
         "select_project_slot",
         "select_thread_slot",
+        "open_file_picker",
     };
 };
 
@@ -691,6 +808,7 @@ pub const Model = struct {
     rename_id: u32 = 0,
     rename_buffer: canvas.TextBuffer(max_thread_title_bytes) = .{},
     archive_open: bool = false,
+    clear_confirm_thread_id: u32 = 0,
     delete_confirm_open: bool = false,
     delete_kind: RenameKind = .thread,
     delete_id: u32 = 0,
@@ -715,6 +833,12 @@ pub const Model = struct {
     stream_parse_storage: [max_stream_line_bytes * 2]u8 = undefined,
     codex_connection: ConnectionState = .checking,
     claude_connection: ConnectionState = .checking,
+    codex_login_thread_id: u32 = 0,
+    claude_login_thread_id: u32 = 0,
+    pending_attachments: [16]PendingAttachment = [_]PendingAttachment{.{}} ** 16,
+    pending_attachment_count: usize = 0,
+    next_attachment_read_key: u64 = attachment_read_key_base + 1,
+    file_picker_requested: bool = false,
 
     // These are implementation state read by the derived bindings below
     // or by update/effects; they are intentionally not exposed directly
@@ -773,6 +897,13 @@ pub const Model = struct {
         "stream_parse_storage",
         "codex_connection",
         "claude_connection",
+        "codex_login_thread_id",
+        "claude_login_thread_id",
+        "pending_attachments",
+        "pending_attachment_count",
+        "next_attachment_read_key",
+        "file_picker_requested",
+        "clear_confirm_thread_id",
         "delete_kind",
         "delete_id",
         "activeThread",
@@ -803,7 +934,7 @@ pub const Model = struct {
         .{ .choice = .gemini, .label = "Gemini 3.5 Flash", .slug = "google/gemini-3.5-flash" },
         .{ .choice = .deepseek, .label = "DeepSeek V4 Pro", .slug = "deepseek/deepseek-v4-pro" },
         .{ .choice = .custom, .label = "Custom model…", .slug = "" },
-        .{ .choice = .codex_subscription, .label = "Codex · ChatGPT plan", .slug = "codex/default" },
+        .{ .choice = .codex_subscription, .label = "Codex · ChatGPT", .slug = "codex/default" },
         .{ .choice = .claude_subscription, .label = "Claude · Pro/Max · Experimental", .slug = "sonnet" },
     };
 
@@ -821,6 +952,7 @@ pub const Model = struct {
         .{ .action = "Previous project", .keys = "Cmd + Option + Up" },
         .{ .action = "Next project", .keys = "Cmd + Option + Down" },
         .{ .action = "Focus message", .keys = "Cmd + L" },
+        .{ .action = "Attach images or files", .keys = "Cmd + U" },
         .{ .action = "Choose model", .keys = "Cmd + K" },
         .{ .action = "Quick model: Auto", .keys = "Cmd + Shift + 0" },
         .{ .action = "Quick model: GPT-5.5", .keys = "Cmd + Shift + 1" },
@@ -832,8 +964,7 @@ pub const Model = struct {
         .{ .action = "Quick model: GLM 5.2", .keys = "Cmd + Shift + 7" },
         .{ .action = "Quick model: Kimi K2.6", .keys = "Cmd + Shift + 8" },
         .{ .action = "Quick model: Kimi K2.7 Code", .keys = "Cmd + Shift + 9" },
-        .{ .action = "Use Codex subscription", .keys = "Cmd + Option + Shift + 1" },
-        .{ .action = "Use Claude subscription", .keys = "Cmd + Option + Shift + 2" },
+        .{ .action = "Use Codex", .keys = "Cmd + Option + Shift + 1" },
         .{ .action = "Open settings", .keys = "Cmd + ," },
         .{ .action = "Fork latest response", .keys = "Cmd + Shift + F" },
         .{ .action = "Copy latest response", .keys = "Cmd + Shift + C" },
@@ -852,6 +983,30 @@ pub const Model = struct {
     pub fn draft(model: *const Model) []const u8 {
         const thread = model.activeThreadConst() orelse return "";
         return thread.draft();
+    }
+
+    pub fn draftAttachmentRows(model: *const Model, arena: std.mem.Allocator) []const AttachmentRow {
+        const thread = model.activeThreadConst() orelse return &.{};
+        const rows = arena.alloc(AttachmentRow, thread.draft_attachment_count) catch return &.{};
+        for (thread.draft_attachments[0..thread.draft_attachment_count], 0..) |*attachment, index| {
+            rows[index] = .{
+                .index = @intCast(index),
+                .name = attachment.name(),
+                .detail = std.fmt.allocPrint(arena, "{s} · {d} KB", .{
+                    switch (attachment.kind) { .image => "Image", .pdf => "PDF", .text => "File" },
+                    (attachment.bytes.len + 1023) / 1024,
+                }) catch "Attached",
+            };
+        }
+        return rows;
+    }
+
+    fn attachmentLoading(model: *const Model) bool {
+        const thread = model.activeThreadConst() orelse return false;
+        for (model.pending_attachments[0..model.pending_attachment_count]) |pending| {
+            if (pending.thread_id == thread.id) return true;
+        }
+        return false;
     }
 
     fn markWorkspaceDirty(model: *Model) void {
@@ -915,7 +1070,7 @@ pub const Model = struct {
     pub fn projectSidebarRows(model: *const Model, arena: std.mem.Allocator) []const ProjectSidebarRow {
         const out = arena.alloc(ProjectSidebarRow, model.project_count + model.thread_count) catch return &.{};
         var count: usize = 0;
-        for (model.projects[0..model.project_count]) |project| {
+        for (model.projects[0..model.project_count]) |*project| {
             if (project.id == chats_project_id or project.isArchived()) continue;
             out[count] = .{
                 .key = project.id,
@@ -1077,10 +1232,6 @@ pub const Model = struct {
         return rows;
     }
 
-    pub fn modelCatalogLoading(model: *const Model) bool {
-        return model.model_catalog_loading;
-    }
-
     pub fn modelCatalogStatus(model: *const Model) []const u8 {
         return model.model_catalog_status_storage[0..model.model_catalog_status_len];
     }
@@ -1093,6 +1244,7 @@ pub const Model = struct {
 
     fn selectCatalogModel(model: *Model, index: u32) void {
         if (index >= model.model_catalog_count) return;
+        if (model.blockModelChangeWhileSending()) return;
         const entry = &model.model_catalog[index];
         const thread = model.activeThread() orelse return;
         thread.model_choice = .custom;
@@ -1103,6 +1255,7 @@ pub const Model = struct {
 
     fn selectQuickModel(model: *Model, number: u8) void {
         if (number == 0 or number > quickModels.len) return;
+        if (model.blockModelChangeWhileSending()) return;
         const option = quickModels[number - 1];
         const thread = model.activeThread() orelse return;
         thread.model_choice = .custom;
@@ -1180,7 +1333,7 @@ pub const Model = struct {
         return switch (model.codex_connection) {
             .disabled => "Codex connection disabled",
             .checking => "Checking Codex sign-in…",
-            .connected => "Connected through your ChatGPT plan",
+            .connected => "Connected through your ChatGPT account",
             .disconnected => "Not signed in to Codex",
             .connecting => "Waiting for Codex browser sign-in…",
             .unavailable => "Codex CLI not found; install Codex or the ChatGPT app",
@@ -1205,7 +1358,7 @@ pub const Model = struct {
             .disabled => unreachable,
             .checking => "Codex · Checking sign-in…",
             .connected => "Codex · Connected · Use",
-            .disconnected => "Codex · Connect ChatGPT plan",
+            .disconnected => "Codex · Connect ChatGPT",
             .connecting => "Codex · Waiting for browser sign-in…",
             .unavailable => "Codex CLI not installed",
             .failed => "Codex · Retry connection",
@@ -1230,7 +1383,11 @@ pub const Model = struct {
     }
 
     pub fn claudeSubscriptionDisabled(model: *const Model) bool {
-        return !model.dev_mode;
+        return !model.dev_mode or model.claude_connection == .checking or model.claude_connection == .connecting;
+    }
+
+    pub fn codexConnectionBusy(model: *const Model) bool {
+        return model.codex_connection == .checking or model.codex_connection == .connecting;
     }
 
     pub fn messageRows(model: *const Model) []const Message {
@@ -1256,14 +1413,22 @@ pub const Model = struct {
         return !model.hasMessages();
     }
 
+    pub fn clearButtonLabel(model: *const Model) []const u8 {
+        return if (model.clear_confirm_thread_id != 0 and model.clear_confirm_thread_id == model.active_thread_id)
+            "Confirm clearing every message"
+        else
+            "Clear current chat";
+    }
+
     pub fn canSend(model: *const Model) bool {
         const thread = model.activeThreadConst() orelse return false;
         const has_connection = switch (thread.model_choice) {
-            .codex_subscription => true,
-            .claude_subscription => model.dev_mode,
+            .codex_subscription => model.codex_connection == .connected,
+            .claude_subscription => model.dev_mode and model.claude_connection == .connected,
             else => model.api_key_len > 0,
         };
-        return !thread.sending and has_connection and !thread.draft_buffer.isEmpty() and !thread.model_buffer.isEmpty();
+        for (thread.draft_attachments[0..thread.draft_attachment_count]) |attachment| if (attachment.bytes.len == 0) return false;
+        return !thread.sending and has_connection and (!thread.draft_buffer.isEmpty() or thread.draft_attachment_count > 0) and !thread.model_buffer.isEmpty() and !model.attachmentLoading();
     }
 
     pub fn cannotSend(model: *const Model) bool {
@@ -1296,6 +1461,9 @@ pub const Model = struct {
         const thread = model.activeThreadConst();
         if (thread) |active| {
             if (active.status_len > 0) return active.status_storage[0..active.status_len];
+            for (active.draft_attachments[0..active.draft_attachment_count]) |attachment| {
+                if (attachment.bytes.len == 0) return "Remove and reattach saved draft files before sending";
+            }
         }
         if (thread) |active| {
             switch (active.model_choice) {
@@ -1330,6 +1498,7 @@ pub const Model = struct {
     }
 
     fn selectModel(model: *Model, choice: ModelChoice) void {
+        if (model.blockModelChangeWhileSending()) return;
         const thread = model.activeThread() orelse return;
         thread.model_choice = choice;
         model.model_picker_open = false;
@@ -1342,6 +1511,14 @@ pub const Model = struct {
             }
             return;
         }
+    }
+
+    fn blockModelChangeWhileSending(model: *Model) bool {
+        const thread = model.activeThread() orelse return false;
+        if (!thread.sending) return false;
+        thread.setStatus("Wait for the current response before changing models");
+        model.model_picker_open = false;
+        return true;
     }
 
     fn setStatus(model: *Model, text: []const u8) void {
@@ -1465,6 +1642,7 @@ pub const Model = struct {
         model.settings_open = false;
         model.fork_open = false;
         model.archive_open = false;
+        model.clear_confirm_thread_id = 0;
         model.rename_open = true;
     }
 
@@ -1552,7 +1730,10 @@ pub const Model = struct {
 
         if (model.activeThreadConst()) |thread| {
             const project = model.projectByIdConst(thread.project_id);
-            if (!thread.isArchived() and project != null and !project.?.isArchived()) return true;
+            if (!thread.isArchived() and project != null and !project.?.isArchived()) {
+                model.active_project_id = thread.project_id;
+                return true;
+            }
         }
         if (model.activateFirstVisible()) return true;
         const thread_id = model.addThread(chats_project_id) orelse return false;
@@ -1690,6 +1871,7 @@ pub const Model = struct {
         model.settings_open = false;
         model.rename_open = false;
         model.archive_open = false;
+        model.clear_confirm_thread_id = 0;
         model.fork_open = true;
     }
 
@@ -1815,6 +1997,72 @@ pub const Model = struct {
         return writer.buffered();
     }
 
+    fn buildAttachmentRequest(model: *Model, thread: *const Thread) ?[]u8 {
+        var output: std.Io.Writer.Allocating = .init(model.allocator);
+        defer output.deinit();
+        const writer = &output.writer;
+        writer.writeAll("{\"model\":") catch return null;
+        std.json.Stringify.value(std.mem.trim(u8, thread.modelName(), " \t"), .{}, writer) catch return null;
+        writer.writeAll(",\"messages\":[") catch return null;
+        const first = thread.message_count -| provider_context_messages;
+        for (thread.messages[first..thread.message_count], 0..) |*message, message_index| {
+            if (message_index > 0) writer.writeByte(',') catch return null;
+            writer.writeAll("{\"role\":") catch return null;
+            std.json.Stringify.value(if (message.role == .user) "user" else "assistant", .{}, writer) catch return null;
+            writer.writeAll(",\"content\":") catch return null;
+            if (message.attachment_count == 0) {
+                std.json.Stringify.value(message.content(), .{}, writer) catch return null;
+            } else {
+                writer.writeAll("[{\"type\":\"text\",\"text\":") catch return null;
+                std.json.Stringify.value(message.content(), .{}, writer) catch return null;
+                writer.writeByte('}') catch return null;
+                for (message.attachments[0..message.attachment_count]) |*attachment| {
+                    if (attachment.bytes.len == 0) {
+                        writer.writeAll(",{\"type\":\"text\",\"text\":") catch return null;
+                        const note = std.fmt.allocPrint(model.allocator, "Previously attached file: {s}", .{attachment.name()}) catch return null;
+                        defer model.allocator.free(note);
+                        std.json.Stringify.value(note, .{}, writer) catch return null;
+                        writer.writeByte('}') catch return null;
+                        continue;
+                    }
+                    switch (attachment.kind) {
+                        .text => {
+                            if (!std.unicode.utf8ValidateSlice(attachment.bytes)) return null;
+                            writer.writeAll(",{\"type\":\"text\",\"text\":") catch return null;
+                            const prefix = std.fmt.allocPrint(model.allocator, "Attached file {s}:\n", .{attachment.name()}) catch return null;
+                            defer model.allocator.free(prefix);
+                            var combined: std.Io.Writer.Allocating = .init(model.allocator);
+                            defer combined.deinit();
+                            combined.writer.writeAll(prefix) catch return null;
+                            combined.writer.writeAll(attachment.bytes) catch return null;
+                            std.json.Stringify.value(combined.written(), .{}, writer) catch return null;
+                            writer.writeByte('}') catch return null;
+                        },
+                        .image => {
+                            writer.writeAll(",{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:") catch return null;
+                            writer.writeAll(imageMimeType(attachment.path())) catch return null;
+                            writer.writeAll(";base64,") catch return null;
+                            std.base64.standard.Encoder.encodeWriter(writer, attachment.bytes) catch return null;
+                            writer.writeAll("\"}}") catch return null;
+                        },
+                        .pdf => {
+                            writer.writeAll(",{\"type\":\"file\",\"file\":{\"filename\":") catch return null;
+                            std.json.Stringify.value(attachment.name(), .{}, writer) catch return null;
+                            writer.writeAll(",\"file_data\":\"data:application/pdf;base64,") catch return null;
+                            std.base64.standard.Encoder.encodeWriter(writer, attachment.bytes) catch return null;
+                            writer.writeAll("\"}}") catch return null;
+                        },
+                    }
+                }
+                writer.writeByte(']') catch return null;
+            }
+            writer.writeByte('}') catch return null;
+        }
+        writer.writeAll("],\"stream\":true}") catch return null;
+        if (output.written().len > native_sdk.max_effect_file_bytes) return null;
+        return output.toOwnedSlice() catch null;
+    }
+
     pub fn deinit(model: *Model) void {
         for (model.threads[0..model.thread_count]) |*thread| thread.deinit(model.allocator);
         if (model.threads.len > 0) model.allocator.free(model.threads);
@@ -1826,12 +2074,17 @@ pub const Model = struct {
     }
 };
 
+pub fn normalizeLoadedWorkspace(model: *Model) bool {
+    return model.normalizeLoadedWorkspace();
+}
+
 pub const ChatApp = native_sdk.UiAppWithFeatures(Model, Msg, .{ .runtime_markup = builtin.mode == .Debug });
 pub const Effects = ChatApp.Effects;
 
 const codex_runner_script = "if [ -x /Applications/ChatGPT.app/Contents/Resources/codex ]; then exec /Applications/ChatGPT.app/Contents/Resources/codex \"$@\"; elif [ -x \"$HOME/.local/bin/codex\" ]; then exec \"$HOME/.local/bin/codex\" \"$@\"; else exec codex \"$@\"; fi";
 const claude_runner_script = "if [ -x \"$HOME/.local/bin/claude\" ]; then exec \"$HOME/.local/bin/claude\" \"$@\"; else exec claude \"$@\"; fi";
 const claude_chat_script = "if [ -x \"$HOME/.local/bin/claude\" ]; then CLAUDE=\"$HOME/.local/bin/claude\"; else CLAUDE=claude; fi; exec \"$CLAUDE\" -p --output-format stream-json --verbose --include-partial-messages --no-session-persistence --safe-mode --tools \"\" --max-turns 1 --model sonnet";
+const openrouter_curl_script = "path=\"$1\"; trap 'rm -f -- \"$path\"' EXIT; /bin/chmod 600 \"$path\"; /usr/bin/curl --silent --show-error --no-buffer --fail-with-body --config - -H 'Content-Type: application/json' -H 'X-OpenRouter-Title: Superchat' --data-binary \"@$path\" https://openrouter.ai/api/v1/chat/completions";
 
 fn checkConnections(model: *Model, fx: *Effects) void {
     model.codex_connection = .checking;
@@ -1859,6 +2112,7 @@ pub fn initEffects(model: *Model, fx: *Effects) void {
 }
 
 fn connectCodex(model: *Model, fx: *Effects) void {
+    if (model.codex_connection == .checking or model.codex_connection == .connecting) return;
     if (model.codex_connection == .connected) {
         model.selectModel(.codex_subscription);
         if (model.activeThreadConst()) |thread| model.markThreadDirty(thread.id);
@@ -1868,6 +2122,7 @@ fn connectCodex(model: *Model, fx: *Effects) void {
         }
         return;
     }
+    model.codex_login_thread_id = model.active_thread_id;
     model.codex_connection = .connecting;
     fx.spawn(.{
         .key = codex_login_key,
@@ -1879,9 +2134,10 @@ fn connectCodex(model: *Model, fx: *Effects) void {
 
 fn connectClaude(model: *Model, fx: *Effects) void {
     if (!model.dev_mode) {
-        model.setStatus("Claude subscription routing is experimental and disabled in public builds");
+        model.setStatus("The experimental Claude connection is disabled in public builds");
         return;
     }
+    if (model.claude_connection == .checking or model.claude_connection == .connecting) return;
     if (model.claude_connection == .connected) {
         model.selectModel(.claude_subscription);
         if (model.activeThreadConst()) |thread| model.markThreadDirty(thread.id);
@@ -1891,6 +2147,7 @@ fn connectClaude(model: *Model, fx: *Effects) void {
         }
         return;
     }
+    model.claude_login_thread_id = model.active_thread_id;
     model.claude_connection = .connecting;
     fx.spawn(.{
         .key = claude_login_key,
@@ -1952,10 +2209,10 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, cmd_previous_project)) return .previous_project;
     if (std.mem.eql(u8, name, cmd_next_project)) return .next_project;
     if (std.mem.eql(u8, name, cmd_focus_composer)) return .focus_composer;
+    if (std.mem.eql(u8, name, cmd_attach_files)) return .open_file_picker;
     if (std.mem.eql(u8, name, cmd_model_picker)) return .open_model_picker;
     if (std.mem.eql(u8, name, cmd_auto_model)) return .select_auto_model;
     if (std.mem.eql(u8, name, cmd_codex_subscription)) return .{ .select_model = .codex_subscription };
-    if (std.mem.eql(u8, name, cmd_claude_subscription)) return .{ .select_model = .claude_subscription };
     if (std.mem.eql(u8, name, cmd_top_level_chats)) return .select_top_level_chats;
     if (std.mem.eql(u8, name, cmd_load_older)) return .load_older;
     if (std.mem.eql(u8, name, cmd_settings)) return .open_settings;
@@ -1969,6 +2226,121 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, cmd_clear_thread)) return .clear;
     if (std.mem.eql(u8, name, cmd_close_overlay)) return .close_overlay;
     return null;
+}
+
+fn attachmentKindForPath(path: []const u8) ?AttachmentKind {
+    const extension = std.fs.path.extension(path);
+    if (std.ascii.eqlIgnoreCase(extension, ".png") or
+        std.ascii.eqlIgnoreCase(extension, ".jpg") or
+        std.ascii.eqlIgnoreCase(extension, ".jpeg") or
+        std.ascii.eqlIgnoreCase(extension, ".webp") or
+        std.ascii.eqlIgnoreCase(extension, ".gif")) return .image;
+    if (std.ascii.eqlIgnoreCase(extension, ".pdf")) return .pdf;
+    const text_extensions = [_][]const u8{
+        ".txt", ".md", ".markdown", ".json", ".jsonl", ".csv", ".tsv", ".xml", ".yaml", ".yml",
+        ".html", ".css", ".js", ".jsx", ".ts", ".tsx", ".zig", ".py", ".rb", ".go", ".rs", ".java",
+        ".c", ".h", ".cpp", ".hpp", ".swift", ".kt", ".kts", ".sh", ".zsh", ".sql", ".toml", ".ini",
+        ".log", ".rtf",
+    };
+    for (text_extensions) |candidate| if (std.ascii.eqlIgnoreCase(extension, candidate)) return .text;
+    return null;
+}
+
+fn imageMimeType(path: []const u8) []const u8 {
+    const extension = std.fs.path.extension(path);
+    if (std.ascii.eqlIgnoreCase(extension, ".png")) return "image/png";
+    if (std.ascii.eqlIgnoreCase(extension, ".webp")) return "image/webp";
+    if (std.ascii.eqlIgnoreCase(extension, ".gif")) return "image/gif";
+    return "image/jpeg";
+}
+
+fn threadAttachmentBytes(thread: *const Thread) usize {
+    var total: usize = 0;
+    for (thread.draft_attachments[0..thread.draft_attachment_count]) |attachment| total += attachment.bytes.len;
+    return total;
+}
+
+fn queueAttachmentRead(model: *Model, thread: *Thread, path: []const u8, fx: *Effects) void {
+    if (path.len == 0 or path.len > max_attachment_path_bytes) {
+        thread.setStatus("That file path is too long to attach");
+        return;
+    }
+    const kind = attachmentKindForPath(path) orelse {
+        thread.setStatus("Attach PNG, JPEG, WebP, GIF, PDF, or a plain-text/code file");
+        return;
+    };
+    var reserved = thread.draft_attachment_count;
+    for (model.pending_attachments[0..model.pending_attachment_count]) |pending| {
+        if (pending.thread_id == thread.id) reserved += 1;
+    }
+    if (reserved >= max_attachments_per_message or model.pending_attachment_count == model.pending_attachments.len) {
+        thread.setStatus("A message can include up to four attachments");
+        return;
+    }
+    for (thread.draft_attachments[0..thread.draft_attachment_count]) |*attachment| {
+        if (std.mem.eql(u8, attachment.path(), path)) return;
+    }
+    for (model.pending_attachments[0..model.pending_attachment_count]) |*pending| {
+        if (pending.thread_id == thread.id and std.mem.eql(u8, pending.path(), path)) return;
+    }
+    const key = model.next_attachment_read_key;
+    model.next_attachment_read_key +%= 1;
+    if (model.next_attachment_read_key <= attachment_read_key_base) model.next_attachment_read_key = attachment_read_key_base + 1;
+    var pending = PendingAttachment{ .key = key, .thread_id = thread.id, .kind = kind, .path_len = path.len };
+    @memcpy(pending.path_storage[0..path.len], path);
+    model.pending_attachments[model.pending_attachment_count] = pending;
+    model.pending_attachment_count += 1;
+    thread.setStatus("Reading attachment…");
+    fx.readFile(.{ .key = key, .path = path, .on_result = Effects.fileMsg(.attachment_file_result) });
+}
+
+fn receiveAttachment(model: *Model, result: native_sdk.EffectFileResult, fx: *Effects) void {
+    var pending_index: ?usize = null;
+    for (model.pending_attachments[0..model.pending_attachment_count], 0..) |pending, index| {
+        if (pending.key == result.key) pending_index = index;
+    }
+    const index = pending_index orelse return;
+    const pending = model.pending_attachments[index];
+    model.pending_attachment_count -= 1;
+    if (index != model.pending_attachment_count) model.pending_attachments[index] = model.pending_attachments[model.pending_attachment_count];
+    const thread = model.threadById(pending.thread_id) orelse return;
+    if (result.outcome != .ok) {
+        thread.setStatus(switch (result.outcome) {
+            .truncated => "That file is over the 1 MB local attachment limit",
+            .not_found => "That file is no longer available",
+            .io_failed => "Superchat could not read that file",
+            .rejected => "The attachment could not be queued",
+            .cancelled => "Attachment cancelled",
+            .ok => unreachable,
+        });
+        return;
+    }
+    if (result.bytes.len == 0) {
+        thread.setStatus("Empty files cannot be attached");
+        return;
+    }
+    if (pending.kind == .text and !std.unicode.utf8ValidateSlice(result.bytes)) {
+        thread.setStatus("That file is not valid UTF-8 text");
+        return;
+    }
+    if (thread.draft_attachment_count == max_attachments_per_message) return;
+    if (threadAttachmentBytes(thread) + result.bytes.len > max_attachment_total_bytes) {
+        thread.setStatus("Attachments in one message can total up to 640 KB");
+        return;
+    }
+    const name = std.fs.path.basename(pending.path());
+    var attachment = Attachment{ .kind = pending.kind, .path_len = pending.path_len, .name_len = utf8PrefixLen(name, max_attachment_name_bytes) };
+    @memcpy(attachment.path_storage[0..pending.path_len], pending.path());
+    @memcpy(attachment.name_storage[0..attachment.name_len], name[0..attachment.name_len]);
+    attachment.bytes = model.allocator.dupe(u8, result.bytes) catch {
+        thread.setStatus("Superchat ran out of memory while attaching that file");
+        return;
+    };
+    thread.draft_attachments[thread.draft_attachment_count] = attachment;
+    thread.draft_attachment_count += 1;
+    thread.clearStatus();
+    model.markThreadDirty(thread.id);
+    model.showToast("Attachment added", fx);
 }
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
@@ -1995,9 +2367,30 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 .on_fire = Effects.timerMsg(.persist_draft),
             });
         },
+        .open_file_picker => model.file_picker_requested = true,
+        .files_dropped => |drop| {
+            const thread = model.activeThread() orelse return;
+            for (drop.paths) |path| queueAttachmentRead(model, thread, path, fx);
+        },
+        .attachment_file_result => |result| receiveAttachment(model, result, fx),
+        .request_body_written => |result| receiveRequestBodyWritten(model, result, fx),
+        .remove_attachment => |attachment_index| {
+            const thread = model.activeThread() orelse return;
+            if (attachment_index >= thread.draft_attachment_count) return;
+            thread.draft_attachments[attachment_index].deinit(model.allocator);
+            const index: usize = attachment_index;
+            if (index + 1 < thread.draft_attachment_count) {
+                std.mem.copyForwards(Attachment, thread.draft_attachments[index .. thread.draft_attachment_count - 1], thread.draft_attachments[index + 1 .. thread.draft_attachment_count]);
+            }
+            thread.draft_attachment_count -= 1;
+            thread.draft_attachments[thread.draft_attachment_count] = .{};
+            model.markThreadDirty(thread.id);
+            model.showToast("Attachment removed", fx);
+        },
         .fork_seed_edit => |edit| model.fork_seed_buffer.apply(edit),
         .rename_edit => |edit| model.rename_buffer.apply(edit),
         .model_edit => |edit| {
+            if (model.blockModelChangeWhileSending()) return;
             const thread = model.activeThread() orelse return;
             thread.model_buffer.apply(edit);
             thread.model_choice = .custom;
@@ -2016,7 +2409,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .close_model_picker => model.model_picker_open = false,
         .select_model => |choice| {
             if (choice == .claude_subscription and !model.dev_mode) {
-                model.setStatus("Claude subscription routing is experimental and disabled in public builds");
+                model.setStatus("The experimental Claude connection is disabled in public builds");
                 return;
             }
             model.selectModel(choice);
@@ -2033,7 +2426,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .select_claude_subscription => {
             if (!model.dev_mode) {
-                model.setStatus("Claude subscription routing is experimental and disabled in public builds");
+                model.setStatus("The experimental Claude connection is disabled in public builds");
                 return;
             }
             model.selectModel(.claude_subscription);
@@ -2052,6 +2445,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.fork_open = false;
             model.rename_open = false;
             model.archive_open = false;
+            model.clear_confirm_thread_id = 0;
             model.clearApiKeyInput();
             model.settings_open = true;
         },
@@ -2151,6 +2545,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.settings_open = false;
             model.fork_open = false;
             model.rename_open = false;
+            model.clear_confirm_thread_id = 0;
             model.delete_confirm_open = false;
             model.archive_open = true;
         },
@@ -2266,6 +2661,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.fork_open = false;
             model.rename_open = false;
             model.archive_open = false;
+            model.clear_confirm_thread_id = 0;
             model.delete_confirm_open = false;
             model.model_picker_open = true;
             if (model.model_catalog_count == 0) model.setModelCatalogStatus("Search OpenRouter by model or provider");
@@ -2276,6 +2672,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.rename_open = false;
             model.archive_open = false;
             model.model_picker_open = false;
+            model.clear_confirm_thread_id = 0;
             model.clearApiKeyInput();
             model.fork_seed_buffer.clear();
             model.rename_buffer.clear();
@@ -2301,6 +2698,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             });
         },
         .clear => {
+            if (model.cannotClear()) return;
+            if (model.clear_confirm_thread_id != model.active_thread_id) {
+                model.clear_confirm_thread_id = model.active_thread_id;
+                model.showToast("Press Clear again to permanently remove every message", fx);
+                return;
+            }
+            model.settings_open = false;
+            model.fork_open = false;
+            model.rename_open = false;
+            model.archive_open = false;
+            model.model_picker_open = false;
+            model.clear_confirm_thread_id = 0;
             const thread = model.activeThread() orelse return;
             if (thread.sending) {
                 fx.cancel(requestKey(thread.id));
@@ -2317,6 +2726,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             thread.stream_flush_scheduled = false;
             fx.cancelTimer(streamFlushKey(thread.id));
             model.markMessagesCleared(thread.id);
+            model.showToast("Chat cleared", fx);
         },
         .send => submitDraft(model, fx),
         .stream_line => |line| receiveStreamLine(model, line, fx),
@@ -2324,6 +2734,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .harness_exit => |exit_event| {
             const thread_id = requestThreadId(exit_event.key) orelse return;
             receiveHarnessExit(model, exit_event, fx);
+            model.markMessagesDirty(thread_id);
+        },
+        .openrouter_exit => |exit_event| {
+            const thread_id = requestThreadId(exit_event.key) orelse return;
+            receiveOpenRouterExit(model, exit_event, fx);
             model.markMessagesDirty(thread_id);
         },
         .connection_exit => |exit_event| receiveConnectionExit(model, exit_event),
@@ -2341,7 +2756,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (model.threadByIdConst(thread_id) != null) model.markThreadDirty(thread_id);
         },
         .dismiss_toast => |timer| {
-            if (timer.key == toast_timer_key) model.toast_len = 0;
+            if (timer.key == toast_timer_key) {
+                model.toast_len = 0;
+                model.clear_confirm_thread_id = 0;
+            }
         },
         .response => |response| {
             if (response.key == key_validation_request) {
@@ -2475,24 +2893,30 @@ fn receiveConnectionExit(model: *Model, exit_event: native_sdk.EffectExit) void 
         codex_login_key => {
             model.codex_connection = if (connected) .connected else if (unavailable) .unavailable else .failed;
             if (connected) {
-                model.selectModel(.codex_subscription);
-                if (model.activeThreadConst()) |thread| model.markThreadDirty(thread.id);
+                if (model.threadById(model.codex_login_thread_id)) |thread| {
+                    Model.configureThreadModel(thread, .codex_subscription, "");
+                    model.markThreadDirty(thread.id);
+                }
                 if (model.onboarding_open) {
                     model.onboarding_open = false;
                     model.credential_action = .complete_onboarding;
                 }
             }
+            model.codex_login_thread_id = 0;
         },
         claude_login_key => {
             model.claude_connection = if (connected) .connected else if (unavailable) .unavailable else .failed;
             if (connected) {
-                model.selectModel(.claude_subscription);
-                if (model.activeThreadConst()) |thread| model.markThreadDirty(thread.id);
+                if (model.threadById(model.claude_login_thread_id)) |thread| {
+                    Model.configureThreadModel(thread, .claude_subscription, "");
+                    model.markThreadDirty(thread.id);
+                }
                 if (model.onboarding_open) {
                     model.onboarding_open = false;
                     model.credential_action = .complete_onboarding;
                 }
             }
+            model.claude_login_thread_id = 0;
         },
         else => {},
     }
@@ -2578,6 +3002,71 @@ fn isSubscriptionChoice(choice: ModelChoice) bool {
     return choice == .codex_subscription or choice == .claude_subscription;
 }
 
+fn hasContextAttachments(thread: *const Thread) bool {
+    const first = thread.message_count -| provider_context_messages;
+    for (thread.messages[first..thread.message_count]) |message| if (message.attachment_count > 0) return true;
+    return false;
+}
+
+fn startAttachmentRequest(model: *Model, thread: *Thread, fx: *Effects) bool {
+    const body = model.buildAttachmentRequest(thread) orelse {
+        thread.setStatus("Attachments could not be prepared; use text, supported images, or a PDF under 640 KB total");
+        return false;
+    };
+    defer model.allocator.free(body);
+    var nonce: u64 = undefined;
+    std.c.arc4random_buf(@ptrCast(&nonce), @sizeOf(u64));
+    const path = std.fmt.bufPrint(&thread.request_path_storage, "/tmp/superchat-request-{d}-{x}.json", .{ thread.id, nonce }) catch {
+        thread.setStatus("The temporary attachment request could not be created");
+        return false;
+    };
+    thread.request_path_len = path.len;
+    fx.writeFile(.{
+        .key = requestBodyKey(thread.id),
+        .path = path,
+        .bytes = body,
+        .on_result = Effects.fileMsg(.request_body_written),
+    });
+    thread.sending = true;
+    thread.stream_message_index = null;
+    thread.stream_failed = false;
+    thread.setStatus("Preparing attachments…");
+    return true;
+}
+
+fn receiveRequestBodyWritten(model: *Model, result: native_sdk.EffectFileResult, fx: *Effects) void {
+    const thread_id = requestBodyThreadId(result.key) orelse return;
+    const thread = model.threadById(thread_id) orelse return;
+    if (!thread.sending) return;
+    if (result.outcome != .ok) {
+        thread.sending = false;
+        thread.request_path_len = 0;
+        thread.setStatus("The attachment request could not be prepared on disk");
+        return;
+    }
+    const path = thread.requestPath();
+    if (path.len == 0) {
+        thread.sending = false;
+        thread.setStatus("The temporary attachment request could not be opened");
+        return;
+    }
+    var auth_storage: [max_api_key_bytes + 40]u8 = undefined;
+    const auth = std.fmt.bufPrint(&auth_storage, "header = \"Authorization: Bearer {s}\"\n", .{model.apiKey()}) catch {
+        thread.sending = false;
+        thread.setStatus("The OpenRouter API key is too long");
+        return;
+    };
+    fx.spawn(.{
+        .key = requestKey(thread.id),
+        .argv = &.{ "/bin/zsh", "-lc", openrouter_curl_script, "superchat", path },
+        .stdin = auth,
+        .max_line_bytes = max_stream_line_bytes,
+        .on_line = Effects.lineMsg(.stream_line),
+        .on_exit = Effects.exitMsg(.openrouter_exit),
+    });
+    thread.setStatus("Thinking…");
+}
+
 fn buildHarnessPrompt(model: *Model, thread: *const Thread) ?[]const u8 {
     const header = "You are the assistant in Superchat. Answer the conversation directly. Do not inspect files or run tools.\n";
     const footer = "\n\nAssistant:\n";
@@ -2608,6 +3097,15 @@ fn buildHarnessPrompt(model: *Model, thread: *const Thread) ?[]const u8 {
         const remaining = limit - writer.buffered().len -| footer.len;
         const content_len = utf8PrefixLen(message.content(), remaining);
         writer.writeAll(message.content()[0..content_len]) catch return null;
+        for (message.attachments[0..message.attachment_count]) |*attachment| {
+            if (attachment.kind != .text or attachment.bytes.len == 0 or !std.unicode.utf8ValidateSlice(attachment.bytes)) continue;
+            const attachment_prefix = "\n\nAttached text file:\n";
+            if (writer.buffered().len + attachment_prefix.len + footer.len >= limit) break;
+            writer.writeAll(attachment_prefix) catch return null;
+            const file_remaining = limit - writer.buffered().len -| footer.len;
+            const file_len = utf8PrefixLen(attachment.bytes, file_remaining);
+            writer.writeAll(attachment.bytes[0..file_len]) catch return null;
+        }
     }
     writer.writeAll(footer) catch return null;
     return writer.buffered();
@@ -2619,14 +3117,32 @@ fn startHarnessRequest(model: *Model, thread: *Thread, fx: *Effects) bool {
         return false;
     };
     switch (thread.model_choice) {
-        .codex_subscription => fx.spawn(.{
-            .key = requestKey(thread.id),
-            .argv = &.{ "/bin/zsh", "-lc", codex_runner_script, "superchat", "exec", "--json", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--sandbox", "read-only", "--skip-git-repo-check", "-C", "/tmp", "-" },
-            .stdin = prompt,
-            .max_line_bytes = max_stream_line_bytes,
-            .on_line = Effects.lineMsg(.harness_line),
-            .on_exit = Effects.exitMsg(.harness_exit),
-        }),
+        .codex_subscription => {
+            var argv: [28][]const u8 = undefined;
+            var count: usize = 0;
+            const base = [_][]const u8{ "/bin/zsh", "-lc", codex_runner_script, "superchat", "exec", "--json", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--sandbox", "read-only", "--skip-git-repo-check", "-C", "/tmp" };
+            for (base) |arg| {
+                argv[count] = arg;
+                count += 1;
+            }
+            const last = &thread.messages[thread.message_count - 1];
+            for (last.attachments[0..last.attachment_count]) |*attachment| {
+                if (attachment.kind != .image) continue;
+                argv[count] = "--image";
+                argv[count + 1] = attachment.path();
+                count += 2;
+            }
+            argv[count] = "-";
+            count += 1;
+            fx.spawn(.{
+                .key = requestKey(thread.id),
+                .argv = argv[0..count],
+                .stdin = prompt,
+                .max_line_bytes = max_stream_line_bytes,
+                .on_line = Effects.lineMsg(.harness_line),
+                .on_exit = Effects.exitMsg(.harness_exit),
+            });
+        },
         .claude_subscription => fx.spawn(.{
             .key = requestKey(thread.id),
             .argv = &.{ "/bin/zsh", "-lc", claude_chat_script, "superchat" },
@@ -2645,17 +3161,46 @@ fn startHarnessRequest(model: *Model, thread: *Thread, fx: *Effects) bool {
 }
 
 fn sendThread(model: *Model, thread: *Thread, fx: *Effects) void {
-    if (thread.sending or thread.draft_buffer.isEmpty() or thread.model_buffer.isEmpty()) return;
+    if (thread.sending or (thread.draft_buffer.isEmpty() and thread.draft_attachment_count == 0) or thread.model_buffer.isEmpty()) return;
     if (thread.model_choice == .claude_subscription and !model.dev_mode) {
-        thread.setStatus("Claude subscription routing is experimental and disabled in public builds");
+        thread.setStatus("The experimental Claude connection is disabled in public builds");
+        return;
+    }
+    if (thread.model_choice == .codex_subscription and model.codex_connection != .connected) {
+        thread.setStatus("Connect Codex in Settings before sending");
+        return;
+    }
+    if (thread.model_choice == .claude_subscription and model.claude_connection != .connected) {
+        thread.setStatus("Connect Claude in Settings before sending");
         return;
     }
     if (!isSubscriptionChoice(thread.model_choice) and model.api_key_len == 0) return;
+    if (thread.model_choice == .codex_subscription) {
+        for (thread.draft_attachments[0..thread.draft_attachment_count]) |attachment| {
+            if (attachment.kind == .pdf) {
+                thread.setStatus("Codex accepts images and text files here; use OpenRouter for PDFs");
+                return;
+            }
+        }
+    }
+    if (thread.model_choice == .claude_subscription) {
+        for (thread.draft_attachments[0..thread.draft_attachment_count]) |attachment| {
+            if (attachment.kind != .text) {
+                thread.setStatus("The experimental Claude connection currently accepts text files only");
+                return;
+            }
+        }
+    }
     if (!thread.appendMessage(model.allocator, &model.next_message_id, .user, thread.draft())) return;
     thread.draft_buffer.clear();
 
     if (isSubscriptionChoice(thread.model_choice)) {
         _ = startHarnessRequest(model, thread, fx);
+        return;
+    }
+
+    if (hasContextAttachments(thread)) {
+        _ = startAttachmentRequest(model, thread, fx);
         return;
     }
 
@@ -2707,7 +3252,9 @@ fn receiveStreamLine(model: *Model, line: native_sdk.EffectLine, fx: *Effects) v
 
     const event_line = std.mem.trim(u8, line.line, " \t\r");
     if (event_line.len == 0 or event_line[0] == ':') return;
-    const payload = if (std.mem.startsWith(u8, event_line, "data:"))
+    const is_data = std.mem.startsWith(u8, event_line, "data:");
+    if (!is_data and event_line[0] != '{') return;
+    const payload = if (is_data)
         std.mem.trim(u8, event_line[5..], " \t")
     else
         event_line;
@@ -2785,7 +3332,7 @@ fn receiveHarnessLine(model: *Model, line: native_sdk.EffectLine, fx: *Effects) 
             if (!std.mem.eql(u8, parsed.value.type, "item.completed")) return;
             const item = parsed.value.item orelse return;
             if (!std.mem.eql(u8, item.type, "agent_message") or item.text.len == 0) return;
-            thread.setActiveModel("Codex · ChatGPT plan");
+            thread.setActiveModel("Codex · ChatGPT");
             queueHarnessText(model, thread, line.key, item.text, fx);
         },
         .claude_subscription => {
@@ -2811,6 +3358,13 @@ fn receiveHarnessLine(model: *Model, line: native_sdk.EffectLine, fx: *Effects) 
 fn receiveHarnessExit(model: *Model, exit_event: native_sdk.EffectExit, fx: *Effects) void {
     const thread_id = requestThreadId(exit_event.key) orelse return;
     const thread = model.threadById(thread_id) orelse return;
+    const unavailable = exit_event.reason == .spawn_failed or exit_event.code == 127;
+    const succeeded = exit_event.reason == .exited and exit_event.code == 0;
+    if (exit_event.reason != .cancelled) switch (thread.model_choice) {
+        .codex_subscription => model.codex_connection = if (succeeded) .connected else if (unavailable) .unavailable else .disconnected,
+        .claude_subscription => model.claude_connection = if (succeeded) .connected else if (unavailable) .unavailable else .disconnected,
+        else => {},
+    };
     if (thread.stream_flush_scheduled) fx.cancelTimer(streamFlushKey(thread.id));
     if (thread.stream_pending_len > 0 and !thread.flushStreamDelta(model.allocator, &model.next_message_id)) {
         thread.stream_failed = true;
@@ -2830,7 +3384,6 @@ fn receiveHarnessExit(model: *Model, exit_event: native_sdk.EffectExit, fx: *Eff
     }
     if (exit_event.reason != .exited or exit_event.code != 0) {
         if (thread.stream_failed) return;
-        const unavailable = exit_event.reason == .spawn_failed or exit_event.code == 127;
         thread.setStatus(switch (thread.model_choice) {
             .codex_subscription => if (unavailable) "Codex CLI not found; install Codex or the ChatGPT app" else "Codex request failed; reconnect it in Settings",
             .claude_subscription => if (unavailable) "Claude CLI not found; install it, then retry" else "Claude request failed; reconnect it in Settings",
@@ -2841,6 +3394,38 @@ fn receiveHarnessExit(model: *Model, exit_event: native_sdk.EffectExit, fx: *Eff
     if (thread.stream_failed) return;
     if (!received_content) {
         thread.setStatus("The provider returned no text");
+        return;
+    }
+    thread.clearStatus();
+}
+
+fn receiveOpenRouterExit(model: *Model, exit_event: native_sdk.EffectExit, fx: *Effects) void {
+    const thread_id = requestThreadId(exit_event.key) orelse return;
+    const thread = model.threadById(thread_id) orelse return;
+    thread.request_path_len = 0;
+    if (thread.stream_flush_scheduled) fx.cancelTimer(streamFlushKey(thread.id));
+    if (thread.stream_pending_len > 0 and !thread.flushStreamDelta(model.allocator, &model.next_message_id)) {
+        thread.stream_failed = true;
+        thread.setStatus("Response exceeded the 64 KiB safety limit");
+    }
+    const received_content = thread.stream_message_index != null;
+    thread.sending = false;
+    thread.stream_message_index = null;
+    if (thread.stream_failed) return;
+    if (exit_event.reason == .cancelled) {
+        thread.setStatus("Request cancelled");
+        return;
+    }
+    if (exit_event.dropped_lines > 0) {
+        thread.setStatus("OpenRouter output was incomplete");
+        return;
+    }
+    if (exit_event.reason != .exited or exit_event.code != 0) {
+        thread.setStatus("OpenRouter could not complete the attachment request");
+        return;
+    }
+    if (!received_content) {
+        thread.setStatus("OpenRouter returned no text");
         return;
     }
     thread.clearStatus();
@@ -2972,6 +3557,35 @@ const SecureChatApp = struct {
         }
 
         try self.inner.event(runtime, value);
+        if (value == .files_dropped) {
+            const drop = value.files_dropped;
+            try self.chat.dispatch(runtime, drop.window_id, .{ .files_dropped = drop });
+        }
+        if (self.chat.model.file_picker_requested) {
+            self.chat.model.file_picker_requested = false;
+            var paths_buffer: [native_sdk.platform.max_dialog_paths_bytes]u8 = undefined;
+            const filters = [_]native_sdk.platform.FileFilter{
+                .{ .name = "Images, PDFs, and text files", .extensions = &.{ "png", "jpg", "jpeg", "webp", "gif", "pdf", "txt", "md", "json", "csv", "tsv", "xml", "yaml", "yml", "html", "css", "js", "jsx", "ts", "tsx", "zig", "py", "rb", "go", "rs", "java", "c", "h", "cpp", "hpp", "swift", "kt", "sh", "sql", "toml", "ini", "log", "rtf" } },
+            };
+            const selected = runtime.showOpenDialog(.{
+                .title = "Attach to Superchat",
+                .filters = &filters,
+                .allow_multiple = true,
+            }, &paths_buffer) catch null;
+            if (selected) |result| {
+                if (result.count > 0) {
+                    var paths: [16][]const u8 = undefined;
+                    var count: usize = 0;
+                    var split = std.mem.splitScalar(u8, result.paths, '\n');
+                    while (split.next()) |path| {
+                        if (path.len == 0 or count == paths.len) continue;
+                        paths[count] = path;
+                        count += 1;
+                    }
+                    if (count > 0) try self.chat.dispatch(runtime, 1, .{ .files_dropped = .{ .window_id = 1, .view_label = canvas_label, .paths = paths[0..count] } });
+                }
+            }
+        }
         if (self.chat.model.history_request_thread_id != 0) {
             const thread_id = self.chat.model.history_request_thread_id;
             self.chat.model.history_request_thread_id = 0;
@@ -2993,12 +3607,23 @@ const SecureChatApp = struct {
                 if (thread.ensureMessageCapacity(model.allocator, thread.message_count + count)) {
                     std.mem.copyBackwards(Message, thread.messages[count .. count + thread.message_count], thread.messages[0..thread.message_count]);
                     for (result.page.messages, 0..) |history, index| {
-                        thread.messages[index] = .{
+                        var message = Message{
                             .id = history.id,
                             .role = if (history.role == @intFromEnum(Role.assistant)) .assistant else .user,
                             .content_storage = history.content,
                             .content_len = history.content.len,
                         };
+                        for (history.attachments[0..history.attachment_count], 0..) |attachment, attachment_index| {
+                            if (attachment.kind >= std.meta.fields(AttachmentKind).len) continue;
+                            var restored = Attachment{ .kind = @enumFromInt(attachment.kind) };
+                            restored.path_len = utf8PrefixLen(attachment.path, restored.path_storage.len);
+                            @memcpy(restored.path_storage[0..restored.path_len], attachment.path[0..restored.path_len]);
+                            restored.name_len = utf8PrefixLen(attachment.name, restored.name_storage.len);
+                            @memcpy(restored.name_storage[0..restored.name_len], attachment.name[0..restored.name_len]);
+                            message.attachments[attachment_index] = restored;
+                            message.attachment_count += 1;
+                        }
+                        thread.messages[index] = message;
                         result.page.messages[index].content = @constCast(&[_]u8{});
                     }
                     thread.message_count += count;

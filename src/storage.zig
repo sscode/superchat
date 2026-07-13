@@ -11,10 +11,20 @@ pub const Error = error{
     PathTooLong,
 };
 
+const max_history_attachments = 4;
+
+pub const HistoryAttachment = struct {
+    kind: u8 = 0,
+    path: []u8 = @constCast(&[_]u8{}),
+    name: []u8 = @constCast(&[_]u8{}),
+};
+
 pub const HistoryMessage = struct {
     id: u32,
     role: u8,
     content: []u8,
+    attachments: [max_history_attachments]HistoryAttachment = [_]HistoryAttachment{.{}} ** max_history_attachments,
+    attachment_count: usize = 0,
 };
 
 pub const HistoryPage = struct {
@@ -22,7 +32,13 @@ pub const HistoryPage = struct {
     has_more: bool,
 
     pub fn deinit(page: *HistoryPage, allocator: std.mem.Allocator) void {
-        for (page.messages) |message| if (message.content.len > 0) allocator.free(message.content);
+        for (page.messages) |message| {
+            if (message.content.len > 0) allocator.free(message.content);
+            for (message.attachments[0..message.attachment_count]) |attachment| {
+                if (attachment.path.len > 0) allocator.free(attachment.path);
+                if (attachment.name.len > 0) allocator.free(attachment.name);
+            }
+        }
         if (page.messages.len > 0) allocator.free(page.messages);
         page.messages = &.{};
     }
@@ -46,7 +62,7 @@ pub const Database = struct {
         errdefer database.close();
         try database.configure();
         const version = try database.schemaVersion();
-        if (version > 0 and version < 2) try database.backup(path, version);
+        if (version > 0 and version < 3) try database.backup(path, version);
         try database.migrate();
         return database;
     }
@@ -103,7 +119,16 @@ pub const Database = struct {
             \\  favorite INTEGER NOT NULL DEFAULT 0,
             \\  updated_at_ms INTEGER NOT NULL DEFAULT 0
             \\);
-            \\PRAGMA user_version = 2;
+            \\CREATE TABLE IF NOT EXISTS attachments (
+            \\  thread_id INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+            \\  message_id INTEGER NOT NULL DEFAULT 0,
+            \\  position INTEGER NOT NULL,
+            \\  kind INTEGER NOT NULL,
+            \\  path TEXT NOT NULL,
+            \\  name TEXT NOT NULL,
+            \\  PRIMARY KEY(thread_id,message_id,position)
+            \\);
+            \\PRAGMA user_version = 3;
             \\COMMIT;
         );
     }
@@ -180,12 +205,20 @@ pub const Database = struct {
             "SELECT id,role,content FROM messages WHERE thread_id=?1 AND id<?2 ORDER BY id DESC LIMIT ?3;",
         );
         defer _ = c.sqlite3_finalize(statement);
+        const attachment_statement = try database.prepare("SELECT kind,path,name FROM attachments WHERE thread_id=?1 AND message_id=?2 ORDER BY position LIMIT 4;");
+        defer _ = c.sqlite3_finalize(attachment_statement);
         try bindInt(statement, 1, thread_id);
         try bindInt(statement, 2, before_id);
         try bindInt(statement, 3, limit + 1);
         var messages: std.ArrayList(HistoryMessage) = .empty;
         errdefer {
-            for (messages.items) |message| allocator.free(message.content);
+            for (messages.items) |message| {
+                allocator.free(message.content);
+                for (message.attachments[0..message.attachment_count]) |attachment| {
+                    allocator.free(attachment.path);
+                    allocator.free(attachment.name);
+                }
+            }
             messages.deinit(allocator);
         }
         while (true) {
@@ -194,16 +227,43 @@ pub const Database = struct {
             if (result != c.SQLITE_ROW) return error.SqlFailed;
             const content = try allocator.dupe(u8, textColumn(statement, 2));
             errdefer allocator.free(content);
-            try messages.append(allocator, .{
+            var message = HistoryMessage{
                 .id = intColumn(u32, statement, 0),
                 .role = intColumn(u8, statement, 1),
                 .content = content,
-            });
+            };
+            errdefer for (message.attachments[0..message.attachment_count]) |attachment| {
+                allocator.free(attachment.path);
+                allocator.free(attachment.name);
+            };
+            try bindInt(attachment_statement, 1, thread_id);
+            try bindInt(attachment_statement, 2, message.id);
+            while (message.attachment_count < message.attachments.len) {
+                const attachment_result = c.sqlite3_step(attachment_statement);
+                if (attachment_result == c.SQLITE_DONE) break;
+                if (attachment_result != c.SQLITE_ROW) return error.SqlFailed;
+                const path = try allocator.dupe(u8, textColumn(attachment_statement, 1));
+                errdefer allocator.free(path);
+                const name = try allocator.dupe(u8, textColumn(attachment_statement, 2));
+                errdefer allocator.free(name);
+                message.attachments[message.attachment_count] = .{
+                    .kind = intColumn(u8, attachment_statement, 0),
+                    .path = path,
+                    .name = name,
+                };
+                message.attachment_count += 1;
+            }
+            reset(attachment_statement);
+            try messages.append(allocator, message);
         }
         const has_more = messages.items.len > limit;
         if (has_more) {
             const removed = messages.pop().?;
             allocator.free(removed.content);
+            for (removed.attachments[0..removed.attachment_count]) |attachment| {
+                allocator.free(attachment.path);
+                allocator.free(attachment.name);
+            }
         }
         std.mem.reverse(HistoryMessage, messages.items);
         return .{ .messages = try messages.toOwnedSlice(allocator), .has_more = has_more };
@@ -277,7 +337,32 @@ pub const Database = struct {
         try stepDone(statement);
     }
 
+    pub fn replaceAttachments(database: *Database, thread_id: u32, message_id: u32, attachments: anytype) Error!void {
+        const clear = try database.prepare("DELETE FROM attachments WHERE thread_id=?1 AND message_id=?2;");
+        defer _ = c.sqlite3_finalize(clear);
+        try bindInt(clear, 1, thread_id);
+        try bindInt(clear, 2, message_id);
+        try stepDone(clear);
+
+        const insert = try database.prepare("INSERT INTO attachments(thread_id,message_id,position,kind,path,name) VALUES(?1,?2,?3,?4,?5,?6);");
+        defer _ = c.sqlite3_finalize(insert);
+        for (attachments, 0..) |*attachment, position| {
+            try bindInt(insert, 1, thread_id);
+            try bindInt(insert, 2, message_id);
+            try bindInt(insert, 3, position);
+            try bindInt(insert, 4, attachmentKindValue(attachment));
+            try bindText(insert, 5, attachmentPathValue(attachment));
+            try bindText(insert, 6, attachmentNameValue(attachment));
+            try stepDone(insert);
+            reset(insert);
+        }
+    }
+
     pub fn clearMessages(database: *Database, thread_id: u32) Error!void {
+        const attachments = try database.prepare("DELETE FROM attachments WHERE thread_id=?1 AND message_id<>0;");
+        defer _ = c.sqlite3_finalize(attachments);
+        try bindInt(attachments, 1, thread_id);
+        try stepDone(attachments);
         const statement = try database.prepare("DELETE FROM messages WHERE thread_id=?1;");
         defer _ = c.sqlite3_finalize(statement);
         try bindInt(statement, 1, thread_id);
@@ -369,6 +454,7 @@ pub const Database = struct {
             try bindText(thread_statement, 9, thread.active_model_storage[0..thread.active_model_len]);
             try stepDone(thread_statement);
             reset(thread_statement);
+            try database.replaceAttachments(thread.id, 0, thread.draft_attachments[0..thread.draft_attachment_count]);
         }
 
         const message_statement = try database.prepare("INSERT INTO messages(id,thread_id,role,content,position) VALUES(?1,?2,?3,?4,?5);");
@@ -382,6 +468,7 @@ pub const Database = struct {
                 try bindInt(message_statement, 5, position);
                 try stepDone(message_statement);
                 reset(message_statement);
+                try database.replaceAttachments(thread.id, message.id, message.attachments[0..message.attachment_count]);
             }
         }
 
@@ -475,6 +562,39 @@ pub const Database = struct {
             thread.has_older_messages = thread.message_count == 50;
         }
 
+        const attachments = try database.prepare("SELECT thread_id,message_id,kind,path,name FROM attachments ORDER BY thread_id,message_id,position;");
+        defer _ = c.sqlite3_finalize(attachments);
+        while (true) {
+            const result = c.sqlite3_step(attachments);
+            if (result == c.SQLITE_DONE) break;
+            if (result != c.SQLITE_ROW) return error.SqlFailed;
+            const thread_id = intColumn(u32, attachments, 0);
+            const message_id = intColumn(u32, attachments, 1);
+            var target_thread: ?*@TypeOf(model.threads[0]) = null;
+            for (model.threads[0..model.thread_count]) |*thread| {
+                if (thread.id == thread_id) target_thread = thread;
+            }
+            const thread = target_thread orelse continue;
+            const kind_value = intColumn(u8, attachments, 2);
+            if (message_id == 0) {
+                if (thread.draft_attachment_count == thread.draft_attachments.len or kind_value >= std.meta.fields(@TypeOf(thread.draft_attachments[0].kind)).len) continue;
+                var attachment: @TypeOf(thread.draft_attachments[0]) = .{ .kind = @enumFromInt(kind_value) };
+                setFixed(&attachment.path_storage, &attachment.path_len, textColumn(attachments, 3));
+                setFixed(&attachment.name_storage, &attachment.name_len, textColumn(attachments, 4));
+                thread.draft_attachments[thread.draft_attachment_count] = attachment;
+                thread.draft_attachment_count += 1;
+                continue;
+            }
+            for (thread.messages[0..thread.message_count]) |*message| {
+                if (message.id != message_id or message.attachment_count == message.attachments.len or kind_value >= std.meta.fields(@TypeOf(message.attachments[0].kind)).len) continue;
+                var attachment: @TypeOf(message.attachments[0]) = .{ .kind = @enumFromInt(kind_value) };
+                setFixed(&attachment.path_storage, &attachment.path_len, textColumn(attachments, 3));
+                setFixed(&attachment.name_storage, &attachment.name_len, textColumn(attachments, 4));
+                message.attachments[message.attachment_count] = attachment;
+                message.attachment_count += 1;
+            }
+        }
+
         const meta = try database.prepare("SELECT active_project_id,active_thread_id,next_project_id,next_thread_id,next_message_id FROM workspace_meta WHERE singleton=1;");
         defer _ = c.sqlite3_finalize(meta);
         if (c.sqlite3_step(meta) == c.SQLITE_ROW) {
@@ -527,6 +647,23 @@ fn textColumn(statement: *c.sqlite3_stmt, column: c_int) []const u8 {
 
 fn intColumn(comptime T: type, statement: *c.sqlite3_stmt, column: c_int) T {
     return @intCast(c.sqlite3_column_int64(statement, column));
+}
+
+fn attachmentKindValue(attachment: anytype) u8 {
+    return switch (@typeInfo(@TypeOf(attachment.kind))) {
+        .@"enum" => @intCast(@intFromEnum(attachment.kind)),
+        else => @intCast(attachment.kind),
+    };
+}
+
+fn attachmentPathValue(attachment: anytype) []const u8 {
+    if (@hasField(@TypeOf(attachment.*), "path_storage")) return attachment.path();
+    return attachment.path[0..attachment.path_len];
+}
+
+fn attachmentNameValue(attachment: anytype) []const u8 {
+    if (@hasField(@TypeOf(attachment.*), "name_storage")) return attachment.name();
+    return attachment.name[0..attachment.name_len];
 }
 
 fn containsId(ids: []const u32, target: u32) bool {

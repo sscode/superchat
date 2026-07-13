@@ -19,6 +19,11 @@ fn buildTree(arena: std.mem.Allocator, model: *const main.Model) !main.AppUi.Tre
     return ui.finalize(node);
 }
 
+fn buildCompiledTree(arena: std.mem.Allocator, model: *const main.Model) !main.AppUi.Tree {
+    var ui = main.AppUi.init(arena);
+    return ui.finalize(main.CompiledAppView.build(&ui, model));
+}
+
 fn findByKind(widget: canvas.Widget, kind: canvas.WidgetKind) ?canvas.Widget {
     if (widget.kind == kind) return widget;
     for (widget.children) |child| {
@@ -55,7 +60,7 @@ fn streamLine(model: *main.Model, fx: *main.Effects, key: u64, line: []const u8)
 fn removeTestDatabase(path: []const u8) void {
     std.Io.Dir.deleteFileAbsolute(testing.io, path) catch {};
     var buffer: [256]u8 = undefined;
-    for ([_][]const u8{ "-wal", "-shm", ".backup-v1" }) |suffix| {
+    for ([_][]const u8{ "-wal", "-shm", ".backup-v1", ".backup-v2" }) |suffix| {
         const sidecar = std.fmt.bufPrint(&buffer, "{s}{s}", .{ path, suffix }) catch continue;
         std.Io.Dir.deleteFileAbsolute(testing.io, sidecar) catch {};
     }
@@ -73,7 +78,7 @@ test "schema migrations create a recoverable pre-migration backup" {
     {
         var migrated = try main.workspace_storage.Database.open(path);
         defer migrated.close();
-        try testing.expectEqual(@as(i64, 2), try migrated.schemaVersion());
+        try testing.expectEqual(@as(i64, 3), try migrated.schemaVersion());
     }
     var backup = try std.Io.Dir.openFileAbsolute(testing.io, path ++ ".backup-v1", .{});
     backup.close(testing.io);
@@ -103,6 +108,78 @@ test "send creates a typed OpenRouter fetch and preserves the user turn" {
     try testing.expect(std.mem.indexOf(u8, request.body, "\"stream\":true") != null);
     try testing.expect(std.mem.indexOf(u8, request.body, "Hello from Native SDK") != null);
     try testing.expect(std.mem.indexOf(u8, request.body, "test-key") == null);
+}
+
+test "dropped images become removable multimodal OpenRouter attachments" {
+    var model = main.initialModel("test-key");
+    defer model.deinit();
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    const paths = [_][]const u8{"/tmp/example.png"};
+    main.update(&model, .{ .files_dropped = .{ .paths = &paths } }, &fx);
+    const read = fx.pendingFileAt(0) orelse return error.TestExpectedFileRead;
+    try testing.expectEqual(native_sdk.EffectFileOp.read, read.op);
+    try testing.expectEqualStrings(paths[0], read.path);
+
+    const png = "small-png-payload";
+    main.update(&model, .{ .attachment_file_result = .{ .key = read.key, .bytes = png } }, &fx);
+    const thread = activeThread(&model);
+    try testing.expectEqual(@as(usize, 1), thread.draft_attachment_count);
+    try testing.expectEqualStrings("example.png", thread.draft_attachments[0].name());
+    try testing.expectEqualStrings(png, thread.draft_attachments[0].bytes);
+
+    thread.draft_buffer.set("What is in this image?");
+    main.update(&model, .send, &fx);
+    try testing.expectEqual(@as(usize, 1), thread.messages[0].attachment_count);
+    try testing.expectEqual(@as(usize, 0), thread.draft_attachment_count);
+
+    var write: ?main.Effects.FileRequest = null;
+    for (0..fx.pendingFileCount()) |index| {
+        const candidate = fx.pendingFileAt(index) orelse continue;
+        if (candidate.op == .write) write = candidate;
+    }
+    const request_file = write orelse return error.TestExpectedFileWrite;
+    try testing.expect(std.mem.indexOf(u8, request_file.bytes, "\"type\":\"image_url\"") != null);
+    try testing.expect(std.mem.indexOf(u8, request_file.bytes, "data:image/png;base64,") != null);
+    try testing.expect(std.mem.indexOf(u8, request_file.bytes, "c21hbGwtcG5nLXBheWxvYWQ=") != null);
+    try testing.expect(std.mem.indexOf(u8, request_file.bytes, "test-key") == null);
+}
+
+test "attachment metadata survives a SQLite restart without storing file contents" {
+    const path = "/tmp/superchat-attachments.sqlite3";
+    removeTestDatabase(path);
+    defer removeTestDatabase(path);
+
+    var model = main.initialModel("");
+    defer model.deinit();
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    const paths = [_][]const u8{"/tmp/notes.md"};
+    main.update(&model, .{ .files_dropped = .{ .paths = &paths } }, &fx);
+    const read = fx.pendingFileAt(0) orelse return error.TestExpectedFileRead;
+    main.update(&model, .{ .attachment_file_result = .{ .key = read.key, .bytes = "# Local notes" } }, &fx);
+
+    {
+        var database = try main.workspace_storage.Database.open(path);
+        defer database.close();
+        try database.save(&model);
+    }
+
+    var restored = main.initialModel("");
+    defer restored.deinit();
+    {
+        var database = try main.workspace_storage.Database.open(path);
+        defer database.close();
+        try testing.expect(try database.load(&restored));
+    }
+    const thread = activeThread(&restored);
+    try testing.expectEqual(@as(usize, 1), thread.draft_attachment_count);
+    try testing.expectEqualStrings("notes.md", thread.draft_attachments[0].name());
+    try testing.expectEqualStrings(paths[0], thread.draft_attachments[0].path());
+    try testing.expectEqual(@as(usize, 0), thread.draft_attachments[0].bytes.len);
 }
 
 test "Return sends while Command Return inserts a new line" {
@@ -139,6 +216,8 @@ test "a completion appends assistant text and records the routed model" {
     main.update(&model, .send, &fx);
 
     streamLine(&model, &fx, 1001, ": OPENROUTER PROCESSING");
+    streamLine(&model, &fx, 1001, "event: message");
+    streamLine(&model, &fx, 1001, "id: response-1");
     streamLine(&model, &fx, 1001, "data: {\"model\":\"anthropic/claude-sonnet-4.6\",\"choices\":[{\"delta\":{\"content\":\"Hi \"}}]}");
     try testing.expectEqual(@as(usize, 1), activeThread(&model).message_count);
     try testing.expectEqualStrings("Hi ", activeThread(&model).stream_pending_storage[0..activeThread(&model).stream_pending_len]);
@@ -155,6 +234,20 @@ test "a completion appends assistant text and records the routed model" {
     try testing.expectEqual(@as(usize, 2), thread.message_count);
     try testing.expectEqualStrings("Hi there!", thread.messages[1].content());
     try testing.expectEqualStrings("anthropic/claude-sonnet-4.6", thread.active_model_storage[0..thread.active_model_len]);
+}
+
+test "an in-flight response keeps its provider identity stable" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    activeThread(&model).draft_buffer.set("Keep this request on its original model");
+    main.update(&model, .send, &fx);
+    main.update(&model, .{ .select_model = .codex_subscription }, &fx);
+
+    try testing.expectEqual(main.ModelChoice.auto, activeThread(&model).model_choice);
+    try testing.expectEqualStrings("Wait for the current response before changing models", activeThread(&model).status_storage[0..activeThread(&model).status_len]);
 }
 
 test "the empty and populated views build and lay out" {
@@ -179,6 +272,17 @@ test "the empty and populated views build and lay out" {
     try testing.expect(findByKind(tree.root, .bubble) != null);
 }
 
+test "the release-compiled view builds and lays out" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var model = main.initialModel("");
+    const tree = try buildCompiledTree(arena_state.allocator(), &model);
+    try testing.expect(findByKind(tree.root, .textarea) != null);
+    var nodes: [240]canvas.WidgetLayoutNode = undefined;
+    const layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, main.window_width, main.window_height), &nodes);
+    try testing.expect(layout.nodes.len > 0);
+}
+
 test "missing credentials disable send" {
     var model = main.initialModel("");
     activeThread(&model).draft_buffer.set("This should not leave the app");
@@ -192,14 +296,30 @@ test "missing credentials disable send" {
     try testing.expect(fx.pendingFetchAt(0) == null);
 }
 
-test "Codex subscription threads run through the signed-in CLI without an API key" {
+test "CLI models cannot send until their provider is connected" {
     var model = main.initialModel("");
     var fx = main.Effects.init(testing.allocator);
     defer fx.deinit();
     fx.executor = .fake;
 
     main.update(&model, .{ .select_model = .codex_subscription }, &fx);
-    activeThread(&model).draft_buffer.set("Answer from my ChatGPT plan");
+    activeThread(&model).draft_buffer.set("Wait for sign-in");
+    try testing.expect(!model.canSend());
+    main.update(&model, .send, &fx);
+    try testing.expect(fx.pendingSpawnAt(0) == null);
+    try testing.expectEqual(@as(usize, 0), activeThread(&model).message_count);
+    try testing.expectEqualStrings("Connect Codex in Settings before sending", activeThread(&model).status_storage[0..activeThread(&model).status_len]);
+}
+
+test "Codex subscription threads run through the signed-in CLI without an API key" {
+    var model = main.initialModel("");
+    model.codex_connection = .connected;
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .{ .select_model = .codex_subscription }, &fx);
+    activeThread(&model).draft_buffer.set("Answer from my ChatGPT account");
     try testing.expect(model.canSend());
     main.update(&model, .send, &fx);
 
@@ -207,7 +327,7 @@ test "Codex subscription threads run through the signed-in CLI without an API ke
     try testing.expectEqualStrings("/bin/zsh", request.argv[0]);
     try testing.expect(std.mem.indexOf(u8, request.argv[2], "ChatGPT.app") != null);
     try testing.expectEqualStrings("exec", request.argv[4]);
-    try testing.expect(std.mem.indexOf(u8, request.stdin, "Answer from my ChatGPT plan") != null);
+    try testing.expect(std.mem.indexOf(u8, request.stdin, "Answer from my ChatGPT account") != null);
     try testing.expect(std.mem.indexOf(u8, request.stdin, "API key") == null);
 
     main.update(&model, .{ .harness_line = .{
@@ -218,10 +338,12 @@ test "Codex subscription threads run through the signed-in CLI without an API ke
     try testing.expectEqual(@as(usize, 2), activeThread(&model).message_count);
     try testing.expectEqualStrings("Codex answer", activeThread(&model).messages[1].content());
     try testing.expect(!activeThread(&model).sending);
+    try testing.expectEqual(main.ConnectionState.connected, model.codex_connection);
 }
 
 test "Claude subscription threads stream text deltas through Claude Code" {
     var model = main.initialModelWithMode("", true);
+    model.claude_connection = .connected;
     var fx = main.Effects.init(testing.allocator);
     defer fx.deinit();
     fx.executor = .fake;
@@ -254,6 +376,7 @@ test "Claude subscription routing stays disabled outside development builds" {
 test "subscription connection buttons use provider-owned browser login" {
     var model = main.initialModel("");
     model.onboarding_open = true;
+    model.codex_connection = .disconnected;
     var fx = main.Effects.init(testing.allocator);
     defer fx.deinit();
     fx.executor = .fake;
@@ -266,6 +389,31 @@ test "subscription connection buttons use provider-owned browser login" {
     try testing.expectEqual(main.ConnectionState.connected, model.codex_connection);
     try testing.expect(!model.onboarding_open);
     try testing.expectEqual(main.CredentialAction.complete_onboarding, model.credential_action);
+}
+
+test "provider login completion configures the chat that started it" {
+    var model = main.initialModel("");
+    model.codex_connection = .disconnected;
+    const originating_thread_id = model.active_thread_id;
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .connect_codex, &fx);
+    const request = fx.pendingSpawnAt(0) orelse return error.TestExpectedSpawn;
+    try testing.expectEqual(originating_thread_id, model.codex_login_thread_id);
+
+    main.update(&model, .new_thread, &fx);
+    const navigated_thread_id = model.active_thread_id;
+    try testing.expect(navigated_thread_id != originating_thread_id);
+    main.update(&model, .connect_codex, &fx);
+    try testing.expect(fx.pendingSpawnAt(1) == null);
+
+    main.update(&model, .{ .connection_exit = .{ .key = request.key, .code = 0 } }, &fx);
+    try testing.expectEqual(main.ModelChoice.codex_subscription, threadWithId(&model, originating_thread_id).model_choice);
+    try testing.expectEqual(main.ModelChoice.auto, threadWithId(&model, navigated_thread_id).model_choice);
+    try testing.expectEqual(navigated_thread_id, model.active_thread_id);
+    try testing.expectEqual(@as(u32, 0), model.codex_login_thread_id);
 }
 
 test "API key can be entered and replaced inside settings without rendering the secret" {
@@ -486,12 +634,14 @@ test "project chats are grouped directly beneath their project" {
     try testing.expectEqual(@as(usize, 5), rows.len);
     try testing.expectEqualStrings("", rows[0].prefix);
     try testing.expectEqual(first_project, rows[0].id);
+    try testing.expectEqualStrings(projectWithId(&model, first_project).name(), rows[0].title);
     try testing.expect(rows[1].prefix.len > 0);
     try testing.expectEqual(first_project_thread, rows[1].id);
     try testing.expect(rows[2].prefix.len > 0);
     try testing.expectEqual(second_first_project_thread, rows[2].id);
     try testing.expectEqualStrings("", rows[3].prefix);
     try testing.expectEqual(second_project, rows[3].id);
+    try testing.expectEqualStrings(projectWithId(&model, second_project).name(), rows[3].title);
     try testing.expect(rows[4].prefix.len > 0);
     try testing.expectEqual(second_project_thread, rows[4].id);
 
@@ -501,6 +651,21 @@ test "project chats are grouped directly beneath their project" {
     main.update(&model, .{ .select_sidebar_row = rows[3].key }, &fx);
     try testing.expectEqual(second_project, model.active_project_id);
     try testing.expectEqual(second_project_thread, model.active_thread_id);
+}
+
+test "loading repairs a stale active project from the active chat" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    main.update(&model, .new_project, &fx);
+    const project_thread_id = model.active_thread_id;
+    const project_id = model.active_project_id;
+    model.active_project_id = main.chats_project_id;
+    model.active_thread_id = project_thread_id;
+
+    try testing.expect(main.normalizeLoadedWorkspace(&model));
+    try testing.expectEqual(project_id, model.active_project_id);
+    try testing.expectEqual(project_thread_id, model.active_thread_id);
 }
 
 test "projects and chats can be renamed without changing their identity" {
@@ -660,7 +825,7 @@ test "SQLite restores the workspace after reopening and purges expired archives"
     {
         var database = try main.workspace_storage.Database.open(path);
         defer database.close();
-        try testing.expectEqual(@as(i64, 2), try database.schemaVersion());
+        try testing.expectEqual(@as(i64, 3), try database.schemaVersion());
         try database.save(model);
     }
 
@@ -918,6 +1083,10 @@ test "clearing an in-flight thread waits for cancellation before allowing reuse"
     try testing.expect(activeThread(&model).sending);
 
     main.update(&model, .clear, &fx);
+    try testing.expectEqual(model.active_thread_id, model.clear_confirm_thread_id);
+    try testing.expectEqual(@as(usize, 1), activeThread(&model).message_count);
+    main.update(&model, .clear, &fx);
+    try testing.expectEqual(@as(u32, 0), model.clear_confirm_thread_id);
     try testing.expect(activeThread(&model).sending);
     try testing.expectEqual(@as(usize, 0), activeThread(&model).message_count);
     try testing.expect(!model.canSend());
@@ -930,6 +1099,26 @@ test "clearing an in-flight thread waits for cancellation before allowing reuse"
 
     activeThread(&model).draft_buffer.set("Safe to send again");
     try testing.expect(model.canSend());
+}
+
+test "clear confirmation cannot carry across chats" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    try testing.expect(model.appendMessage(.user, "First chat"));
+    main.update(&model, .clear, &fx);
+    const first_thread_id = model.active_thread_id;
+    try testing.expectEqual(first_thread_id, model.clear_confirm_thread_id);
+
+    main.update(&model, .new_thread, &fx);
+    try testing.expect(model.active_thread_id != first_thread_id);
+    try testing.expect(model.appendMessage(.user, "Second chat"));
+    main.update(&model, .clear, &fx);
+
+    try testing.expectEqual(@as(usize, 1), activeThread(&model).message_count);
+    try testing.expectEqual(model.active_thread_id, model.clear_confirm_thread_id);
 }
 
 test "a mid-stream OpenRouter error preserves partial text and its explanation" {
@@ -1077,6 +1266,15 @@ test "modal forms can submit without a mouse" {
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "on-submit=\"save_rename\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "on-submit=\"finish_onboarding\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "on-submit=\"create_forks\"") != null);
+}
+
+test "modal layouts fit the minimum window and long archives scroll" {
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"520\"") == null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"610\"") == null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"500\"") == null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"530\"") == null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Archived items\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Choose a model\"") != null);
 }
 
 test "first-run onboarding is bypassed by credentials completion or dev mode" {
