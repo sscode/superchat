@@ -1,0 +1,759 @@
+const std = @import("std");
+const native_sdk = @import("native_sdk");
+const main = @import("main.zig");
+
+const canvas = native_sdk.canvas;
+const testing = std.testing;
+const AppMarkup = canvas.MarkupView(main.Model, main.Msg);
+
+fn buildTree(arena: std.mem.Allocator, model: *const main.Model) !main.AppUi.Tree {
+    var view = try AppMarkup.init(arena, main.app_markup);
+    var ui = main.AppUi.init(arena);
+    const node = view.build(&ui, model) catch |err| {
+        if (err == error.MarkupBuild) {
+            std.debug.print("app.native:{d}:{d}: {s}\n", .{ view.diagnostic.line, view.diagnostic.column, view.diagnostic.message });
+        }
+        return err;
+    };
+    return ui.finalize(node);
+}
+
+fn findByKind(widget: canvas.Widget, kind: canvas.WidgetKind) ?canvas.Widget {
+    if (widget.kind == kind) return widget;
+    for (widget.children) |child| {
+        if (findByKind(child, kind)) |found| return found;
+    }
+    return null;
+}
+
+fn activeThread(model: *main.Model) *main.Thread {
+    for (model.threads[0..model.thread_count]) |*thread| {
+        if (thread.id == model.active_thread_id) return thread;
+    }
+    unreachable;
+}
+
+fn threadWithId(model: *main.Model, thread_id: u32) *main.Thread {
+    for (model.threads[0..model.thread_count]) |*thread| {
+        if (thread.id == thread_id) return thread;
+    }
+    unreachable;
+}
+
+fn projectWithId(model: *main.Model, project_id: u32) *main.Project {
+    for (model.projects[0..model.project_count]) |*project| {
+        if (project.id == project_id) return project;
+    }
+    unreachable;
+}
+
+fn streamLine(model: *main.Model, fx: *main.Effects, key: u64, line: []const u8) void {
+    main.update(model, .{ .stream_line = .{ .key = key, .line = line } }, fx);
+}
+
+fn removeTestDatabase(path: []const u8) void {
+    std.Io.Dir.deleteFileAbsolute(testing.io, path) catch {};
+    var buffer: [256]u8 = undefined;
+    for ([_][]const u8{ "-wal", "-shm" }) |suffix| {
+        const sidecar = std.fmt.bufPrint(&buffer, "{s}{s}", .{ path, suffix }) catch continue;
+        std.Io.Dir.deleteFileAbsolute(testing.io, sidecar) catch {};
+    }
+}
+
+test "send creates a typed OpenRouter fetch and preserves the user turn" {
+    var model = main.initialModel("test-key");
+    activeThread(&model).draft_buffer.set("Hello from Native SDK");
+
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .send, &fx);
+
+    const thread = activeThread(&model);
+    try testing.expect(thread.sending);
+    try testing.expectEqual(@as(usize, 1), thread.message_count);
+    try testing.expectEqualStrings("Hello from Native SDK", thread.messages[0].content());
+    try testing.expect(thread.draft_buffer.isEmpty());
+
+    const request = fx.pendingFetchAt(0) orelse return error.TestExpectedFetch;
+    try testing.expectEqual(std.http.Method.POST, request.method);
+    try testing.expectEqualStrings("https://openrouter.ai/api/v1/chat/completions", request.url);
+    try testing.expectEqual(native_sdk.FetchResponseMode.stream, request.response);
+    try testing.expect(std.mem.indexOf(u8, request.body, "\"model\":\"openrouter/auto\"") != null);
+    try testing.expect(std.mem.indexOf(u8, request.body, "\"stream\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, request.body, "Hello from Native SDK") != null);
+    try testing.expect(std.mem.indexOf(u8, request.body, "test-key") == null);
+}
+
+test "a completion appends assistant text and records the routed model" {
+    var model = main.initialModel("test-key");
+    activeThread(&model).draft_buffer.set("Hello");
+
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    main.update(&model, .send, &fx);
+
+    streamLine(&model, &fx, 1001, ": OPENROUTER PROCESSING");
+    streamLine(&model, &fx, 1001, "data: {\"model\":\"anthropic/claude-sonnet-4.6\",\"choices\":[{\"delta\":{\"content\":\"Hi \"}}]}");
+    try testing.expectEqualStrings("Hi ", activeThread(&model).messages[1].content());
+    try testing.expect(activeThread(&model).sending);
+    streamLine(&model, &fx, 1001, "data: {\"choices\":[{\"delta\":{\"content\":\"there!\"}}]}");
+    streamLine(&model, &fx, 1001, "data: [DONE]");
+    main.update(&model, .{ .response = .{
+        .key = 1001,
+        .status = 200,
+    } }, &fx);
+
+    const thread = activeThread(&model);
+    try testing.expect(!thread.sending);
+    try testing.expectEqual(@as(usize, 2), thread.message_count);
+    try testing.expectEqualStrings("Hi there!", thread.messages[1].content());
+    try testing.expectEqualStrings("anthropic/claude-sonnet-4.6", thread.active_model_storage[0..thread.active_model_len]);
+}
+
+test "the empty and populated views build and lay out" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = main.initialModel("");
+    var tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findByKind(tree.root, .textarea) != null);
+    try testing.expect(findByKind(tree.root, .status_bar) != null);
+
+    var nodes: [240]canvas.WidgetLayoutNode = undefined;
+    const empty_layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, main.window_width, main.window_height), &nodes);
+    try testing.expect(empty_layout.nodes.len > 0);
+    const minimum_layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, main.window_min_width, main.window_min_height), &nodes);
+    try testing.expect(minimum_layout.nodes.len > 0);
+
+    try testing.expect(model.appendMessage(.user, "Does the populated thread render?"));
+    try testing.expect(model.appendMessage(.assistant, "Yes — with **Markdown** too."));
+    _ = arena_state.reset(.retain_capacity);
+    tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findByKind(tree.root, .bubble) != null);
+}
+
+test "missing credentials disable send" {
+    var model = main.initialModel("");
+    activeThread(&model).draft_buffer.set("This should not leave the app");
+    try testing.expect(!model.canSend());
+
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    main.update(&model, .send, &fx);
+    try testing.expectEqual(@as(usize, 0), activeThread(&model).message_count);
+    try testing.expect(fx.pendingFetchAt(0) == null);
+}
+
+test "API key can be entered and replaced inside settings without rendering the secret" {
+    var model = main.initialModel("");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .open_settings, &fx);
+    try testing.expect(model.settings_open);
+    main.update(&model, .{ .api_key_edit = .{ .insert_text = "sk-or-v1-in-app" } }, &fx);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const masked = model.apiKeyField(arena_state.allocator());
+    try testing.expectEqual(model.api_key_buffer.text().len, masked.len);
+    try testing.expect(std.mem.indexOf(u8, masked, "sk-or") == null);
+    for (masked) |byte| try testing.expectEqual(@as(u8, '*'), byte);
+
+    main.update(&model, .save_settings, &fx);
+    try testing.expect(!model.settings_open);
+    try testing.expect(!model.missingKey());
+    try testing.expect(model.api_key_buffer.isEmpty());
+    for (model.api_key_buffer.storage) |byte| try testing.expectEqual(@as(u8, 0), byte);
+
+    activeThread(&model).draft_buffer.set("Use the in-app credential");
+    main.update(&model, .send, &fx);
+    const request = fx.pendingFetchAt(0) orelse return error.TestExpectedFetch;
+    try testing.expect(std.mem.indexOf(u8, request.body, "sk-or-v1-in-app") == null);
+}
+
+test "model selector applies quick picks and custom slugs" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    const first_thread = model.active_thread_id;
+
+    main.update(&model, .{ .select_model = .gpt }, &fx);
+    try testing.expectEqual(main.ModelChoice.gpt, activeThread(&model).model_choice);
+    try testing.expectEqualStrings("openai/gpt-5.5", model.modelName());
+    try testing.expectEqualStrings("GPT-5.5", model.selectedModelLabel());
+
+    main.update(&model, .{ .select_model = .custom }, &fx);
+    try testing.expect(model.settings_open);
+    activeThread(&model).model_buffer.set("mistralai/custom-model");
+    main.update(&model, .save_settings, &fx);
+    try testing.expectEqual(main.ModelChoice.custom, activeThread(&model).model_choice);
+    try testing.expectEqualStrings("mistralai/custom-model", model.selectedModelLabel());
+
+    main.update(&model, .new_thread, &fx);
+    try testing.expectEqual(main.ModelChoice.auto, activeThread(&model).model_choice);
+    main.update(&model, .{ .select_thread = first_thread }, &fx);
+    try testing.expectEqual(main.ModelChoice.custom, activeThread(&model).model_choice);
+    try testing.expectEqualStrings("mistralai/custom-model", model.selectedModelLabel());
+}
+
+test "projects and threads preserve independent conversations" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    const first_project = model.active_project_id;
+    const first_thread = model.active_thread_id;
+    activeThread(&model).draft_buffer.set("Plan the native app");
+    main.update(&model, .send, &fx);
+    streamLine(&model, &fx, 1001, "data: {\"model\":\"openrouter/auto\",\"choices\":[{\"delta\":{\"content\":\"Start with the shell.\"}}]}");
+    main.update(&model, .{ .response = .{
+        .key = 1001,
+        .status = 200,
+    } }, &fx);
+    try testing.expectEqualStrings("Plan the native app", model.activeThreadTitle());
+
+    main.update(&model, .new_thread, &fx);
+    const second_thread = model.active_thread_id;
+    try testing.expect(second_thread != first_thread);
+    try testing.expectEqual(@as(usize, 0), activeThread(&model).message_count);
+    try testing.expectEqualStrings("New chat", model.activeThreadTitle());
+
+    main.update(&model, .{ .select_thread = first_thread }, &fx);
+    try testing.expectEqual(@as(usize, 2), activeThread(&model).message_count);
+    try testing.expectEqualStrings("Plan the native app", activeThread(&model).messages[0].content());
+    try testing.expectEqualStrings("Start with the shell.", activeThread(&model).messages[1].content());
+
+    main.update(&model, .new_project, &fx);
+    try testing.expect(model.active_project_id != first_project);
+    try testing.expectEqual(@as(usize, 2), model.project_count);
+    try testing.expectEqual(@as(usize, 3), model.thread_count);
+
+    main.update(&model, .{ .select_project = first_project }, &fx);
+    try testing.expectEqual(first_project, model.active_project_id);
+    try testing.expectEqual(first_thread, model.active_thread_id);
+    var rows_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer rows_arena.deinit();
+    const rows = model.threadRows(rows_arena.allocator());
+    try testing.expectEqual(@as(usize, 2), rows.len);
+}
+
+test "projects and chats can be renamed without changing their identity" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    const project_id = model.active_project_id;
+    const thread_id = model.active_thread_id;
+    main.update(&model, .open_rename_project, &fx);
+    try testing.expect(model.rename_open);
+    model.rename_buffer.clear();
+    main.update(&model, .{ .rename_edit = .{ .insert_text = "  Client launch  " } }, &fx);
+    main.update(&model, .save_rename, &fx);
+    try testing.expectEqual(project_id, model.active_project_id);
+    try testing.expectEqualStrings("Client launch", projectWithId(&model, project_id).name());
+
+    main.update(&model, .open_rename_thread, &fx);
+    model.rename_buffer.clear();
+    main.update(&model, .{ .rename_edit = .{ .insert_text = "Release checklist" } }, &fx);
+    main.update(&model, .save_rename, &fx);
+    try testing.expectEqual(thread_id, model.active_thread_id);
+    try testing.expectEqualStrings("Release checklist", threadWithId(&model, thread_id).title());
+}
+
+test "archived chats leave the workspace and can be restored" {
+    var test_clock: native_sdk.TestClock = .{};
+    test_clock.setWallMs(1_700_000_000_000);
+    var model = main.initialModelWithClock("test-key", test_clock.clock());
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    const archived_id = model.active_thread_id;
+    activeThread(&model).draft_buffer.set("Background request");
+    main.update(&model, .send, &fx);
+    try testing.expect(activeThread(&model).sending);
+    main.update(&model, .archive_thread, &fx);
+
+    try testing.expect(threadWithId(&model, archived_id).isArchived());
+    try testing.expect(!threadWithId(&model, archived_id).sending);
+    try testing.expect(model.active_thread_id != archived_id);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expectEqual(@as(usize, 1), model.threadRows(arena_state.allocator()).len);
+    const archived = model.archivedThreadRows(arena_state.allocator());
+    try testing.expectEqual(@as(usize, 1), archived.len);
+    try testing.expectEqualStrings("Deletes in 30 days", archived[0].expiry);
+
+    main.update(&model, .open_archive, &fx);
+    const tree = try buildTree(arena_state.allocator(), &model);
+    var nodes: [360]canvas.WidgetLayoutNode = undefined;
+    const layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, main.window_min_width, main.window_min_height), &nodes);
+    try testing.expect(layout.nodes.len > 0);
+    main.update(&model, .{ .restore_thread = archived_id }, &fx);
+    try testing.expect(!threadWithId(&model, archived_id).isArchived());
+    try testing.expectEqual(archived_id, model.active_thread_id);
+    try testing.expect(!model.archive_open);
+}
+
+test "archived projects cascade their chats and permanent delete requires confirmation" {
+    var test_clock: native_sdk.TestClock = .{};
+    test_clock.setWallMs(1_700_000_000_000);
+    var model = main.initialModelWithClock("test-key", test_clock.clock());
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .new_project, &fx);
+    const archived_project_id = model.active_project_id;
+    const child_thread_id = model.active_thread_id;
+    main.update(&model, .archive_project, &fx);
+    try testing.expect(projectWithId(&model, archived_project_id).isArchived());
+    try testing.expect(model.active_project_id != archived_project_id);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expectEqual(@as(usize, 1), model.archivedProjectRows(arena_state.allocator()).len);
+    try testing.expectEqual(@as(usize, 0), model.archivedThreadRows(arena_state.allocator()).len);
+
+    main.update(&model, .{ .restore_project = archived_project_id }, &fx);
+    try testing.expect(!projectWithId(&model, archived_project_id).isArchived());
+    try testing.expectEqual(archived_project_id, model.active_project_id);
+    main.update(&model, .archive_project, &fx);
+    try testing.expect(projectWithId(&model, archived_project_id).isArchived());
+
+    main.update(&model, .{ .delete_project = archived_project_id }, &fx);
+    try testing.expect(model.delete_confirm_open);
+    try testing.expect(projectWithId(&model, archived_project_id).isArchived());
+    main.update(&model, .confirm_delete, &fx);
+    try testing.expect(!model.delete_confirm_open);
+    for (model.projects[0..model.project_count]) |project| try testing.expect(project.id != archived_project_id);
+    for (model.threads[0..model.thread_count]) |thread| try testing.expect(thread.id != child_thread_id);
+}
+
+test "archive purges items after thirty days" {
+    var test_clock: native_sdk.TestClock = .{};
+    test_clock.setWallMs(1_700_000_000_000);
+    var model = main.initialModelWithClock("test-key", test_clock.clock());
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    const archived_id = model.active_thread_id;
+    main.update(&model, .archive_thread, &fx);
+    test_clock.advanceMs(29 * 24 * 60 * 60 * 1000);
+    main.update(&model, .open_archive, &fx);
+    try testing.expect(threadWithId(&model, archived_id).isArchived());
+
+    test_clock.advanceMs(24 * 60 * 60 * 1000);
+    main.update(&model, .open_archive, &fx);
+    for (model.threads[0..model.thread_count]) |thread| try testing.expect(thread.id != archived_id);
+    try testing.expect(model.archiveEmpty());
+}
+
+test "SQLite restores the workspace after reopening and purges expired archives" {
+    const path = "/tmp/superchat-native-storage-roundtrip.sqlite3";
+    removeTestDatabase(path);
+    defer removeTestDatabase(path);
+
+    var test_clock: native_sdk.TestClock = .{};
+    test_clock.setWallMs(1_700_000_000_000);
+    const model = try testing.allocator.create(main.Model);
+    defer testing.allocator.destroy(model);
+    model.* = main.initialModelWithClock("test-key", test_clock.clock());
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    const persisted_project_id = model.active_project_id;
+    const persisted_thread_id = model.active_thread_id;
+    try testing.expect(model.appendMessage(.user, "Persist this conversation"));
+    try testing.expect(model.appendMessage(.assistant, "Stored locally in SQLite."));
+    activeThread(model).draft_buffer.set("An unfinished local draft");
+    main.update(model, .{ .select_model = .gemini }, &fx);
+    main.update(model, .open_rename_project, &fx);
+    model.rename_buffer.clear();
+    main.update(model, .{ .rename_edit = .{ .insert_text = "Persistent project" } }, &fx);
+    main.update(model, .save_rename, &fx);
+    main.update(model, .new_project, &fx);
+    const archived_project_id = model.active_project_id;
+    main.update(model, .archive_project, &fx);
+    const archived_at = projectWithId(model, archived_project_id).archived_at_ms;
+
+    {
+        var database = try main.workspace_storage.Database.open(path);
+        defer database.close();
+        try testing.expectEqual(@as(i64, 1), try database.schemaVersion());
+        try database.save(model);
+    }
+
+    const restored = try testing.allocator.create(main.Model);
+    defer testing.allocator.destroy(restored);
+    restored.* = main.initialModelWithClock("", test_clock.clock());
+    {
+        var database = try main.workspace_storage.Database.open(path);
+        defer database.close();
+        try testing.expect(try database.load(restored));
+        try testing.expectEqual(persisted_project_id, restored.active_project_id);
+        try testing.expectEqual(persisted_thread_id, restored.active_thread_id);
+        try testing.expectEqualStrings("Persistent project", projectWithId(restored, persisted_project_id).name());
+        const thread = threadWithId(restored, persisted_thread_id);
+        try testing.expectEqualStrings("An unfinished local draft", thread.draft());
+        try testing.expectEqual(main.ModelChoice.gemini, thread.model_choice);
+        try testing.expectEqual(@as(usize, 2), thread.message_count);
+        try testing.expectEqualStrings("Stored locally in SQLite.", thread.messages[1].content());
+        try testing.expect(projectWithId(restored, archived_project_id).isArchived());
+
+        // At exactly 30 days, the archived project and its chats cascade away.
+        try database.purgeExpired(archived_at);
+    }
+
+    const purged = try testing.allocator.create(main.Model);
+    defer testing.allocator.destroy(purged);
+    purged.* = main.initialModelWithClock("", test_clock.clock());
+    {
+        var database = try main.workspace_storage.Database.open(path);
+        defer database.close();
+        try testing.expect(try database.load(purged));
+    }
+    for (purged.projects[0..purged.project_count]) |project| try testing.expect(project.id != archived_project_id);
+}
+
+test "background responses return to their owning thread while navigation stays live" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    const first_thread = model.active_thread_id;
+    activeThread(&model).draft_buffer.set("First background task");
+    main.update(&model, .send, &fx);
+    try testing.expect(activeThread(&model).sending);
+    try testing.expectEqual(@as(u64, 1001), (fx.pendingFetchAt(0) orelse return error.TestExpectedFetch).key);
+
+    // Navigation and a second request remain available while the first
+    // thread is waiting.
+    main.update(&model, .new_thread, &fx);
+    const second_thread = model.active_thread_id;
+    try testing.expect(second_thread != first_thread);
+    try testing.expect(!activeThread(&model).sending);
+    activeThread(&model).draft_buffer.set("Second background task");
+    main.update(&model, .send, &fx);
+    try testing.expectEqual(@as(u64, 1002), (fx.pendingFetchAt(1) orelse return error.TestExpectedFetch).key);
+
+    main.update(&model, .{ .select_thread = first_thread }, &fx);
+    activeThread(&model).draft_buffer.set("Keep this unfinished draft");
+    try testing.expect(activeThread(&model).sending);
+
+    // The second response updates its owning thread directly without
+    // changing the visible transcript or unfinished draft.
+    streamLine(&model, &fx, 1002, "data: {\"model\":\"openai/gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"Second result\"}}]}");
+    main.update(&model, .{ .response = .{
+        .key = 1002,
+        .status = 200,
+    } }, &fx);
+    try testing.expectEqual(first_thread, model.active_thread_id);
+    try testing.expect(activeThread(&model).sending);
+    try testing.expectEqualStrings("Keep this unfinished draft", model.draft());
+    try testing.expectEqual(@as(usize, 1), activeThread(&model).message_count);
+
+    main.update(&model, .{ .select_thread = second_thread }, &fx);
+    try testing.expect(!activeThread(&model).sending);
+    try testing.expectEqual(@as(usize, 2), activeThread(&model).message_count);
+    try testing.expectEqualStrings("Second result", activeThread(&model).messages[1].content());
+
+    // The first request can finish later and still lands in thread one.
+    streamLine(&model, &fx, 1001, "data: {\"model\":\"openrouter/auto\",\"choices\":[{\"delta\":{\"content\":\"First result\"}}]}");
+    main.update(&model, .{ .response = .{
+        .key = 1001,
+        .status = 200,
+    } }, &fx);
+    try testing.expectEqual(second_thread, model.active_thread_id);
+    main.update(&model, .{ .select_thread = first_thread }, &fx);
+    try testing.expect(!activeThread(&model).sending);
+    try testing.expectEqual(@as(usize, 2), activeThread(&model).message_count);
+    try testing.expectEqualStrings("First result", activeThread(&model).messages[1].content());
+    try testing.expectEqualStrings("Keep this unfinished draft", model.draft());
+}
+
+test "assistant responses can be copied as a whole" {
+    var model = main.initialModel("test-key");
+    try testing.expect(model.appendMessage(.user, "Give me a concise answer"));
+    try testing.expect(model.appendMessage(.assistant, "A complete response to copy."));
+    const response_id = activeThread(&model).messages[1].id;
+
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    main.update(&model, .{ .copy_message = response_id }, &fx);
+
+    const request = fx.pendingClipboardAt(0) orelse return error.TestExpectedClipboardWrite;
+    try testing.expectEqual(native_sdk.EffectClipboardOp.write, request.op);
+    try testing.expectEqualStrings("A complete response to copy.", request.text);
+    try testing.expectEqualStrings("Response copied", activeThread(&model).status_storage[0..activeThread(&model).status_len]);
+}
+
+test "one response can fork into several model-specific chats" {
+    var model = main.initialModel("test-key");
+    try testing.expect(model.appendMessage(.user, "Design the API"));
+    try testing.expect(model.appendMessage(.assistant, "Start with a small provider interface."));
+    const source_thread_id = model.active_thread_id;
+    const response_id = activeThread(&model).messages[1].id;
+    try testing.expect(model.appendMessage(.user, "Now add an unrelated dashboard"));
+    try testing.expect(model.appendMessage(.assistant, "That belongs after the API is stable."));
+
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .{ .open_fork = response_id }, &fx);
+    try testing.expect(model.fork_open);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const tree = try buildTree(arena_state.allocator(), &model);
+    var nodes: [360]canvas.WidgetLayoutNode = undefined;
+    const layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, main.window_min_width, main.window_min_height), &nodes);
+    try testing.expect(layout.nodes.len > 0);
+
+    // Replace the default Auto selection with GPT and Gemini.
+    main.update(&model, .{ .toggle_fork_model = .auto }, &fx);
+    main.update(&model, .{ .toggle_fork_model = .gpt }, &fx);
+    main.update(&model, .{ .toggle_fork_model = .gemini }, &fx);
+    main.update(&model, .{ .fork_seed_edit = .{ .insert_text = "Compare two implementation strategies" } }, &fx);
+    main.update(&model, .create_forks, &fx);
+
+    try testing.expect(!model.fork_open);
+    try testing.expectEqual(@as(usize, 3), model.thread_count);
+    try testing.expectEqual(@as(usize, 2), fx.activeCount());
+    const gpt_thread = activeThread(&model);
+    try testing.expectEqual(main.ModelChoice.gpt, gpt_thread.model_choice);
+    try testing.expect(gpt_thread.sending);
+    try testing.expectEqual(@as(usize, 3), gpt_thread.message_count);
+    try testing.expectEqualStrings("Start with a small provider interface.", gpt_thread.messages[1].content());
+    try testing.expect(gpt_thread.messages[1].id != response_id);
+    // Messages after the selected response are deliberately excluded.
+    try testing.expectEqualStrings("Compare two implementation strategies", gpt_thread.messages[2].content());
+
+    var gemini_thread_id: u32 = 0;
+    for (model.threads[0..model.thread_count]) |thread| {
+        if (thread.model_choice == .gemini) gemini_thread_id = thread.id;
+    }
+    try testing.expect(gemini_thread_id != 0);
+    try testing.expect(threadWithId(&model, gemini_thread_id).sending);
+    try testing.expect(std.mem.indexOf(u8, (fx.pendingFetchAt(0) orelse return error.TestExpectedFetch).body, "\"model\":\"openai/gpt-5.5\"") != null);
+    try testing.expect(std.mem.indexOf(u8, (fx.pendingFetchAt(1) orelse return error.TestExpectedFetch).body, "\"model\":\"google/gemini-3.5-flash\"") != null);
+
+    // The same response can be forked again without sending a message.
+    main.update(&model, .{ .select_thread = source_thread_id }, &fx);
+    main.update(&model, .{ .open_fork = response_id }, &fx);
+    main.update(&model, .create_forks, &fx);
+    try testing.expectEqual(@as(usize, 4), model.thread_count);
+    try testing.expect(!activeThread(&model).sending);
+    try testing.expectEqual(@as(usize, 2), activeThread(&model).message_count);
+}
+
+test "clearing an in-flight thread waits for cancellation before allowing reuse" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    activeThread(&model).draft_buffer.set("Cancel this request");
+    main.update(&model, .send, &fx);
+    try testing.expect(activeThread(&model).sending);
+
+    main.update(&model, .clear, &fx);
+    try testing.expect(activeThread(&model).sending);
+    try testing.expectEqual(@as(usize, 0), activeThread(&model).message_count);
+    try testing.expect(!model.canSend());
+
+    main.update(&model, .{ .response = .{
+        .key = 1001,
+        .outcome = .cancelled,
+    } }, &fx);
+    try testing.expect(!activeThread(&model).sending);
+
+    activeThread(&model).draft_buffer.set("Safe to send again");
+    try testing.expect(model.canSend());
+}
+
+test "a mid-stream OpenRouter error preserves partial text and its explanation" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    activeThread(&model).draft_buffer.set("Start a response");
+    main.update(&model, .send, &fx);
+    streamLine(&model, &fx, 1001, "data: {\"choices\":[{\"delta\":{\"content\":\"Partial answer\"}}]}");
+    streamLine(&model, &fx, 1001, "data: {\"error\":{\"message\":\"Provider disconnected\"},\"choices\":[]}");
+    main.update(&model, .{ .response = .{ .key = 1001, .outcome = .cancelled } }, &fx);
+
+    const thread = activeThread(&model);
+    try testing.expect(!thread.sending);
+    try testing.expectEqual(@as(usize, 2), thread.message_count);
+    try testing.expectEqualStrings("Partial answer", thread.messages[1].content());
+    try testing.expectEqualStrings("Provider disconnected", thread.status_storage[0..thread.status_len]);
+}
+
+test "an incomplete stream is cancelled instead of silently losing text" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    activeThread(&model).draft_buffer.set("Do not return damaged output");
+    main.update(&model, .send, &fx);
+    main.update(&model, .{ .stream_line = .{
+        .key = 1001,
+        .line = "data: {cut}",
+        .truncated = true,
+    } }, &fx);
+    main.update(&model, .{ .response = .{ .key = 1001, .outcome = .cancelled } }, &fx);
+
+    const thread = activeThread(&model);
+    try testing.expect(!thread.sending);
+    try testing.expectEqual(@as(usize, 1), thread.message_count);
+    try testing.expectEqualStrings("Streaming response was incomplete; request cancelled", thread.status_storage[0..thread.status_len]);
+}
+
+test "the global shortcut map reaches creation navigation focus and settings" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    const commands = [_][]const u8{
+        main.cmd_new_thread,
+        main.cmd_new_project,
+        main.cmd_previous_thread,
+        main.cmd_next_thread,
+        main.cmd_previous_project,
+        main.cmd_next_project,
+        main.cmd_focus_composer,
+        main.cmd_model_picker,
+        main.cmd_settings,
+        main.cmd_account,
+        main.cmd_fork_latest,
+        main.cmd_copy_latest,
+        main.cmd_rename_thread,
+        main.cmd_rename_project,
+        main.cmd_archive_thread,
+        main.cmd_archive_project,
+        main.cmd_open_archive,
+        main.cmd_clear_thread,
+        main.cmd_close_overlay,
+    };
+    for (commands) |command| try testing.expect(main.onCommand(command) != null);
+    try testing.expect(main.onCommand("workspace.unknown") == null);
+
+    main.update(&model, main.onCommand(main.cmd_new_thread).?, &fx);
+    const first_project = model.active_project_id;
+    const second_thread = model.active_thread_id;
+    try testing.expectEqual(@as(usize, 2), model.thread_count);
+
+    main.update(&model, main.onCommand(main.cmd_previous_thread).?, &fx);
+    try testing.expect(model.active_thread_id != second_thread);
+    main.update(&model, main.onCommand(main.cmd_next_thread).?, &fx);
+    try testing.expectEqual(second_thread, model.active_thread_id);
+
+    main.update(&model, main.onCommand(main.cmd_new_project).?, &fx);
+    const second_project = model.active_project_id;
+    try testing.expect(second_project != first_project);
+    main.update(&model, main.onCommand(main.cmd_previous_project).?, &fx);
+    try testing.expectEqual(first_project, model.active_project_id);
+    main.update(&model, main.onCommand(main.cmd_next_project).?, &fx);
+    try testing.expectEqual(second_project, model.active_project_id);
+
+    const focus_before = model.composer_focus_flip;
+    main.update(&model, main.onCommand(main.cmd_focus_composer).?, &fx);
+    try testing.expect(model.composer_focus_flip != focus_before);
+    main.update(&model, main.onCommand(main.cmd_model_picker).?, &fx);
+    try testing.expect(model.model_picker_open);
+    main.update(&model, main.onCommand(main.cmd_settings).?, &fx);
+    try testing.expect(model.settings_open);
+    main.update(&model, main.onCommand(main.cmd_account).?, &fx);
+    try testing.expect(model.account_open and !model.settings_open);
+    main.update(&model, main.onCommand(main.cmd_close_overlay).?, &fx);
+    try testing.expect(!model.settings_open and !model.model_picker_open and !model.account_open);
+}
+
+test "account scaffold remains optional and never starts network work" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .open_account, &fx);
+    try testing.expect(model.account_open);
+    try testing.expect(fx.pendingFetchAt(0) == null);
+
+    main.update(&model, .close_account, &fx);
+    try testing.expect(!model.account_open);
+}
+
+test "first-run onboarding is bypassed by credentials completion or dev mode" {
+    try testing.expect(main.shouldShowOnboarding(false, false, false, false));
+    try testing.expect(!main.shouldShowOnboarding(false, false, true, false));
+    try testing.expect(!main.shouldShowOnboarding(false, false, false, true));
+    try testing.expect(!main.shouldShowOnboarding(true, false, false, false));
+    try testing.expect(main.shouldShowOnboarding(true, true, true, true));
+
+    const dev_model = main.initialModelWithMode("", true);
+    try testing.expect(dev_model.dev_mode);
+}
+
+test "onboarding exposes connection paths without faking unavailable adapters" {
+    var model = main.initialModel("");
+    model.onboarding_open = true;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const tree = try buildTree(arena_state.allocator(), &model);
+    var nodes: [240]canvas.WidgetLayoutNode = undefined;
+    const layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, main.window_min_width, main.window_min_height), &nodes);
+    try testing.expect(layout.nodes.len > 0);
+
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .onboarding_claude, &fx);
+    try testing.expectEqual(main.ConnectionChoice.claude_code, model.onboarding_choice);
+    try testing.expect(model.onboarding_open and model.missingKey());
+
+    main.update(&model, .onboarding_codex, &fx);
+    try testing.expectEqual(main.ConnectionChoice.codex, model.onboarding_choice);
+    try testing.expect(fx.pendingFetchAt(0) == null);
+
+    main.update(&model, .onboarding_openrouter, &fx);
+    main.update(&model, .finish_onboarding, &fx);
+    try testing.expect(model.onboarding_open);
+
+    main.update(&model, .{ .api_key_edit = .{ .insert_text = "sk-or-v1-onboarding" } }, &fx);
+    main.update(&model, .finish_onboarding, &fx);
+    try testing.expect(!model.onboarding_open);
+    try testing.expect(!model.missingKey());
+    try testing.expectEqual(main.CredentialAction.save, model.credential_action);
+    for (model.api_key_buffer.storage) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "onboarding can be completed without configuring a provider" {
+    var model = main.initialModel("");
+    model.onboarding_open = true;
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .skip_onboarding, &fx);
+    try testing.expect(!model.onboarding_open);
+    try testing.expect(model.missingKey());
+    try testing.expectEqual(main.CredentialAction.complete_onboarding, model.credential_action);
+}

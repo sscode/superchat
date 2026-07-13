@@ -1,0 +1,9 @@
+node_modules/
+.native/
+zig-cache/
+zig-out/
+.zig-cache/
+.DS_Store
+.env
+.env.*
+!.env.example

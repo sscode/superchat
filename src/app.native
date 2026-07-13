@@ -1,0 +1,295 @@
+<!-- Projects orient; threads act; the conversation remains the dominant plane. -->
+<stack>
+  <column background="background">
+    <row height="{header_height}" padding="12" gap="10" cross="center" background="surface" window-drag="true" label="Superchat toolbar">
+      <spacer width="{chrome_leading}" />
+      <text size="heading">{brandLabel}</text>
+      <spacer grow="1" />
+      <stack>
+        <select size="sm" width="210" on-press="toggle_model_picker" label="Model selector">{selectedModelLabel}</select>
+        <if test="{model_picker_open}">
+          <dropdown-menu anchor="below" anchor-alignment="stretch" on-dismiss="close_model_picker" label="Models">
+            <for each="modelOptions" as="m">
+              <menu-item on-press="select_model:{m.choice}" selected="{m.choice == activeModelChoice}">{m.label}</menu-item>
+            </for>
+          </dropdown-menu>
+        </if>
+      </stack>
+      <button size="sm" variant="ghost" icon="circle-dot" on-press="open_account" label="Open account">Account</button>
+      <button size="sm" variant="ghost" icon="settings" on-press="open_settings" label="Open settings"></button>
+      <button size="sm" variant="ghost" icon="trash" on-press="clear" disabled="{cannotClear}" label="Clear current chat"></button>
+      <spacer width="{chrome_trailing}" />
+    </row>
+    <separator />
+
+    <row grow="1">
+      <column width="226" background="surface">
+        <row padding="10" gap="8" cross="center">
+          <text foreground="text_muted" grow="1">Projects</text>
+          <button size="sm" variant="ghost" icon="archive" on-press="open_archive" label="Open archive"></button>
+          <button size="sm" variant="ghost" icon="plus" on-press="new_project" disabled="{cannotAddProject}" label="New project"></button>
+        </row>
+        <column padding="6" gap="2">
+          <for each="projectRows" key="id" as="p">
+            <list-item on-press="select_project:{p.id}" selected="{p.id == active_project_id}" label="{p.name}">{p.name}</list-item>
+          </for>
+        </column>
+        <separator />
+        <row padding="10" gap="8" cross="center">
+          <text foreground="text_muted" grow="1">{activeProjectName}</text>
+          <button size="sm" variant="ghost" icon="edit" on-press="open_rename_project" label="Rename project"></button>
+          <button size="sm" variant="ghost" icon="archive" on-press="archive_project" label="Archive project"></button>
+          <button size="sm" variant="ghost" icon="plus" on-press="new_thread" disabled="{cannotAddThread}" label="New chat"></button>
+        </row>
+        <scroll grow="1" label="Chats in project">
+          <column padding="6" gap="2">
+            <for each="threadRows" key="id" as="t">
+              <list-item on-press="select_thread:{t.id}" selected="{t.selected}" label="{t.title}">{t.title}</list-item>
+            </for>
+          </column>
+        </scroll>
+        <separator />
+        <row padding="10">
+          <text size="sm" foreground="text_muted">{workspaceStatus}</text>
+        </row>
+      </column>
+      <separator />
+
+      <column grow="1">
+        <row height="42" padding="12" cross="center" background="background">
+          <text grow="1">{activeThreadTitle}</text>
+          <button size="sm" variant="ghost" icon="edit" on-press="open_rename_thread" label="Rename chat"></button>
+          <button size="sm" variant="ghost" icon="archive" on-press="archive_thread" label="Archive chat"></button>
+          <if test="{sending}">
+            <badge variant="outline">Responding</badge>
+          </if>
+        </row>
+        <separator />
+        <scroll grow="1" label="Conversation">
+          <column padding="24" gap="14">
+            <for each="messageRows" key="id" as="m">
+              <if test="{m.isUser}">
+                <row main="end">
+                  <bubble variant="primary" label="You said">
+                    <text wrap="true">{m.content}</text>
+                  </bubble>
+                </row>
+              </if>
+              <else>
+                <row main="start">
+                  <column gap="4">
+                    <bubble variant="ghost" label="Assistant said">
+                      <markdown source="{m.content}" />
+                    </bubble>
+                    <row gap="4">
+                      <button size="sm" variant="ghost" icon="copy" on-press="copy_message:{m.id}" label="Copy full response">Copy</button>
+                      <button size="sm" variant="ghost" icon="git-branch" on-press="open_fork:{m.id}" label="Fork from this response">Fork</button>
+                    </row>
+                  </column>
+                </row>
+              </else>
+            </for>
+            <else>
+              <column height="300" main="center" cross="center" gap="10" padding="32">
+                <text size="heading">A blank page for any model.</text>
+                <text foreground="text_muted" wrap="true">Start this chat below. Its first message becomes the title.</text>
+              </column>
+            </else>
+            <if test="{sending}">
+              <row main="start">
+                <bubble variant="ghost" label="Assistant is responding">
+                  <row gap="8" cross="center">
+                    <spinner size="sm" />
+                    <text foreground="text_muted">Thinking</text>
+                  </row>
+                </bubble>
+              </row>
+            </if>
+          </column>
+        </scroll>
+        <separator />
+        <column padding="14" gap="8" background="surface">
+          <textarea key="{composerKey}" text="{draft}" on-input="draft_edit" on-submit="send" autofocus="true" height="92" placeholder="Message any model…" label="Message" />
+          <row cross="center" gap="8">
+            <text foreground="text_muted" grow="1">Command + Enter to send</text>
+            <if test="{missingKey}">
+              <button size="sm" variant="outline" icon="settings" on-press="open_settings">Add API key</button>
+            </if>
+            <button variant="primary" icon="send" on-press="send" disabled="{cannotSend}" label="Send message"></button>
+          </row>
+        </column>
+        <status-bar>{statusLine}</status-bar>
+      </column>
+    </row>
+  </column>
+
+  <if test="{settings_open}">
+    <panel background="scrim" on-press="close_settings" label="Settings backdrop">
+      <column main="center" cross="center">
+        <dialog width="560" height="500" label="Settings">
+          <column padding="20" gap="10">
+            <row cross="center">
+              <text size="heading" grow="1">Settings</text>
+              <text foreground="text_muted">Cmd + ,</text>
+            </row>
+            <text>OpenRouter API key</text>
+            <text-field text="{apiKeyField}" on-input="api_key_edit" placeholder="{apiKeyPlaceholder}" autofocus="true" label="OpenRouter API key" />
+            <text size="sm" foreground="text_muted">Saved securely in Keychain.</text>
+            <text>Custom model for this chat</text>
+            <text-field text="{modelName}" on-input="model_edit" placeholder="provider/model" label="Custom OpenRouter model" />
+            <text size="heading">Keyboard shortcuts</text>
+            <scroll grow="1" label="Keyboard shortcuts">
+              <column gap="2">
+                <for each="shortcutHints" as="h">
+                  <row padding="5" gap="10" cross="center">
+                    <text grow="1">{h.action}</text>
+                    <badge variant="outline">{h.keys}</badge>
+                  </row>
+                </for>
+              </column>
+            </scroll>
+            <row gap="8" main="end">
+              <button variant="ghost" on-press="remove_api_key" disabled="{missingKey}">Remove key</button><spacer grow="1" />
+              <button size="sm" variant="ghost" on-press="close_settings">Cancel</button>
+              <button size="sm" variant="primary" on-press="save_settings" disabled="{cannotSaveSettings}">Save</button>
+            </row>
+          </column>
+        </dialog>
+      </column>
+    </panel>
+  </if>
+
+  <if test="{account_open}">
+    <panel background="scrim" on-press="close_account" label="Account backdrop">
+      <column main="center" cross="center">
+        <dialog width="440" height="330" label="Account">
+          <column padding="24" gap="12">
+            <text size="heading">Your account · Cmd + Shift + A</text>
+            <text foreground="text_muted" wrap="true">Local-only for now. Accounts will arrive with backup and cross-device sync; your API key stays in Keychain.</text>
+            <button size="sm" variant="primary" on-press="close_account">Done</button>
+          </column>
+        </dialog>
+      </column>
+    </panel>
+  </if>
+
+  <if test="{fork_open}">
+    <panel background="scrim" on-press="close_fork" label="Fork conversation backdrop">
+      <column main="center" cross="center">
+        <dialog width="620" height="430" label="Fork conversation">
+          <column padding="24" gap="10">
+            <text size="heading">Fork this response</text>
+            <text size="sm" foreground="text_muted">Clone its history into one chat per selected model. Cmd + Shift + F</text>
+            <text size="heading">Starting point</text>
+            <text wrap="true" foreground="text_muted">{forkSourcePreview}</text>
+            <textarea text="{forkSeed}" on-input="fork_seed_edit" on-submit="create_forks" height="84" placeholder="Optional follow-up for every selected model…" label="Fork follow-up message" />
+            <text size="heading">Models</text>
+            <for each="forkModelRows" as="m">
+              <checkbox checked="{m.selected}" on-toggle="toggle_fork_model:{m.choice}" text="{m.label}" label="{m.label}" />
+            </for>
+            <if test="{missingKey}">
+              <text size="sm" foreground="text_muted">Without an API key, the follow-up remains a draft.</text>
+            </if>
+            <spacer grow="1" />
+            <row gap="8" main="end">
+              <button size="sm" variant="ghost" on-press="close_fork">Cancel</button>
+              <button size="sm" variant="primary" on-press="create_forks" disabled="{cannotCreateForks}">{forkCountLabel}</button>
+            </row>
+          </column>
+        </dialog>
+      </column>
+    </panel>
+  </if>
+
+  <if test="{rename_open}">
+    <panel background="scrim" on-press="close_rename" label="Rename backdrop">
+      <column main="center" cross="center">
+        <dialog width="440" height="210" label="Rename">
+          <column padding="24" gap="12">
+            <text size="heading">{renameHeading}</text>
+            <text-field text="{renameValue}" on-input="rename_edit" autofocus="true" label="New name" />
+            <button variant="primary" on-press="save_rename" disabled="{cannotSaveRename}">Rename</button>
+            <button variant="ghost" on-press="close_rename">Cancel</button>
+          </column>
+        </dialog>
+      </column>
+    </panel>
+  </if>
+
+  <if test="{archive_open}">
+    <panel background="scrim" on-press="close_archive" label="Archive backdrop">
+      <column main="center" cross="center">
+        <dialog width="680" height="500" label="Archive">
+          <column padding="24" gap="10">
+            <text size="heading">Archive</text>
+            <text foreground="text_muted">Items are permanently deleted 30 days after they are archived.</text>
+            <if test="{archiveEmpty}">
+              <text foreground="text_muted" grow="1">Nothing is archived.</text>
+            </if>
+            <for each="archivedProjectRows" as="p">
+              <row gap="8" cross="center">
+                <text grow="1">{p.name} · {p.expiry}</text>
+                <button variant="outline" on-press="restore_project:{p.id}">Restore</button>
+                <button variant="ghost" on-press="delete_project:{p.id}">Delete forever</button>
+              </row>
+            </for>
+            <for each="archivedThreadRows" as="t">
+              <row gap="8" cross="center">
+                <text grow="1">{t.title} · {t.project_name} · {t.expiry}</text>
+                <button variant="outline" on-press="restore_thread:{t.id}">Restore</button>
+                <button variant="ghost" on-press="delete_thread:{t.id}">Delete forever</button>
+              </row>
+            </for>
+            <spacer grow="1" />
+            <if test="{delete_confirm_open}">
+              <row gap="8" cross="center">
+                <text grow="1" wrap="true">{deleteTargetLabel}</text>
+                <button variant="ghost" on-press="cancel_delete">Cancel</button>
+                <button variant="primary" on-press="confirm_delete">Delete forever</button>
+              </row>
+            </if>
+            <button variant="primary" on-press="close_archive">Done</button>
+          </column>
+        </dialog>
+      </column>
+    </panel>
+  </if>
+
+  <if test="{onboarding_open}">
+    <panel background="scrim" label="Welcome to Superchat">
+      <column main="center" cross="center">
+        <dialog width="620" height="440" label="Connect a model provider">
+          <column padding="24" gap="10">
+            <text size="heading">Welcome to Superchat</text>
+            <text foreground="text_muted">Choose how this Mac will reach models. No Superchat account is required.</text>
+            <row gap="8">
+              <button size="sm" variant="outline" on-press="onboarding_openrouter">OpenRouter</button>
+              <button size="sm" variant="outline" on-press="onboarding_claude">Claude</button>
+              <button size="sm" variant="outline" on-press="onboarding_codex">ChatGPT</button>
+            </row>
+            <if test="{onboardingOpenRouter}">
+              <text size="heading">Connect OpenRouter · available</text>
+              <text foreground="text_muted" wrap="true">Use one Keychain-stored key to choose models from multiple providers.</text>
+              <text-field text="{apiKeyField}" on-input="api_key_edit" placeholder="sk-or-v1-…" autofocus="true" label="OpenRouter API key" />
+              <button variant="primary" on-press="finish_onboarding" disabled="{cannotFinishOnboarding}">Connect OpenRouter</button>
+            </if>
+            <if test="{onboardingClaude}">
+              <text size="heading">Claude subscription · adapter planned</text>
+              <text foreground="text_muted" wrap="true">The future adapter will use the official Claude Code harness and its existing login.</text>
+              <button variant="outline" disabled="true">Not available in this build</button>
+            </if>
+            <if test="{onboardingCodex}">
+              <text size="heading">ChatGPT subscription · adapter planned</text>
+              <text foreground="text_muted" wrap="true">The future adapter will use the official Codex app-server and its existing login.</text>
+              <button variant="outline" disabled="true">Not available in this build</button>
+            </if>
+            <spacer grow="1" />
+            <row main="end">
+              <button size="sm" variant="ghost" on-press="skip_onboarding">Set up later</button>
+            </row>
+          </column>
+        </dialog>
+      </column>
+    </panel>
+  </if>
+</stack>
