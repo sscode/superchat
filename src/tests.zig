@@ -105,6 +105,30 @@ test "send creates a typed OpenRouter fetch and preserves the user turn" {
     try testing.expect(std.mem.indexOf(u8, request.body, "test-key") == null);
 }
 
+test "Return sends while Command Return inserts a new line" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    activeThread(&model).draft_buffer.set("Send this now");
+    main.update(&model, .{ .draft_edit = .{ .insert_text = "\n" } }, &fx);
+    try testing.expectEqual(@as(usize, 1), activeThread(&model).message_count);
+    try testing.expectEqualStrings("Send this now", activeThread(&model).messages[0].content());
+    try testing.expect(activeThread(&model).draft_buffer.isEmpty());
+    try testing.expect(fx.pendingFetchAt(0) != null);
+
+    main.update(&model, .new_thread, &fx);
+    activeThread(&model).draft_buffer.set("Keep writing");
+    main.update(&model, .composer_newline, &fx);
+    try testing.expectEqualStrings("Keep writing\n", activeThread(&model).draft());
+    try testing.expectEqual(@as(usize, 0), activeThread(&model).message_count);
+
+    main.update(&model, .{ .draft_edit = .{ .insert_text = "pasted\nlines" } }, &fx);
+    try testing.expectEqualStrings("Keep writing\npasted\nlines", activeThread(&model).draft());
+    try testing.expectEqual(@as(usize, 0), activeThread(&model).message_count);
+}
+
 test "a completion appends assistant text and records the routed model" {
     var model = main.initialModel("test-key");
     activeThread(&model).draft_buffer.set("Hello");
@@ -248,7 +272,7 @@ test "model picker searches OpenRouter catalog and keeps favorites" {
     try testing.expectEqualStrings("anthropic/claude-test", activeThread(&model).modelName());
 }
 
-test "quick model slots map Command 1 through 9 to current OpenRouter slugs" {
+test "quick model slots map Command Shift 1 through 9 to current OpenRouter slugs" {
     var model = main.initialModel("test-key");
     var fx = main.Effects.init(testing.allocator);
     defer fx.deinit();
@@ -318,7 +342,7 @@ test "projects and threads preserve independent conversations" {
     try testing.expectEqual(@as(usize, 2), model.project_count);
     try testing.expectEqual(@as(usize, 3), model.thread_count);
 
-    main.update(&model, .{ .select_project = first_project }, &fx);
+    main.update(&model, .select_top_level_chats, &fx);
     try testing.expectEqual(first_project, model.active_project_id);
     try testing.expectEqual(first_thread, model.active_thread_id);
     var rows_arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -336,31 +360,71 @@ test "top-level and project chats have distinct creation paths" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     try testing.expectEqual(@as(usize, 1), model.topLevelThreadRows(arena_state.allocator()).len);
-    try testing.expectEqual(@as(usize, 0), model.projectRows(arena_state.allocator()).len);
+    try testing.expectEqual(@as(usize, 0), model.projectSidebarRows(arena_state.allocator()).len);
 
     main.update(&model, .new_project, &fx);
+    try testing.expect(model.composer_focus_flip);
     const project_id = model.active_project_id;
     const first_project_thread = model.active_thread_id;
     try testing.expect(project_id != main.chats_project_id);
 
     main.update(&model, .new_project_thread, &fx);
+    try testing.expect(!model.composer_focus_flip);
     const second_project_thread = model.active_thread_id;
     try testing.expect(second_project_thread != first_project_thread);
     try testing.expectEqual(project_id, activeThread(&model).project_id);
     _ = arena_state.reset(.retain_capacity);
-    try testing.expectEqual(@as(usize, 2), model.threadRows(arena_state.allocator()).len);
+    try testing.expectEqual(@as(usize, 3), model.projectSidebarRows(arena_state.allocator()).len);
 
     main.update(&model, .new_thread, &fx);
+    try testing.expect(model.composer_focus_flip);
     try testing.expectEqual(main.chats_project_id, model.active_project_id);
     try testing.expectEqual(main.chats_project_id, activeThread(&model).project_id);
     _ = arena_state.reset(.retain_capacity);
     try testing.expectEqual(@as(usize, 2), model.topLevelThreadRows(arena_state.allocator()).len);
-    try testing.expectEqual(@as(usize, 1), model.projectRows(arena_state.allocator()).len);
+    try testing.expectEqual(@as(usize, 3), model.projectSidebarRows(arena_state.allocator()).len);
 
     main.update(&model, .open_rename_project, &fx);
     try testing.expect(!model.rename_open);
     main.update(&model, .archive_project, &fx);
     try testing.expectEqual(main.chats_project_id, model.active_project_id);
+}
+
+test "project chats are grouped directly beneath their project" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    main.update(&model, .new_project, &fx);
+    const first_project = model.active_project_id;
+    const first_project_thread = model.active_thread_id;
+    main.update(&model, .new_project_thread, &fx);
+    const second_first_project_thread = model.active_thread_id;
+    main.update(&model, .new_project, &fx);
+    const second_project = model.active_project_id;
+    const second_project_thread = model.active_thread_id;
+
+    const rows = model.projectSidebarRows(arena_state.allocator());
+    try testing.expectEqual(@as(usize, 5), rows.len);
+    try testing.expectEqualStrings("", rows[0].prefix);
+    try testing.expectEqual(first_project, rows[0].id);
+    try testing.expect(rows[1].prefix.len > 0);
+    try testing.expectEqual(first_project_thread, rows[1].id);
+    try testing.expect(rows[2].prefix.len > 0);
+    try testing.expectEqual(second_first_project_thread, rows[2].id);
+    try testing.expectEqualStrings("", rows[3].prefix);
+    try testing.expectEqual(second_project, rows[3].id);
+    try testing.expect(rows[4].prefix.len > 0);
+    try testing.expectEqual(second_project_thread, rows[4].id);
+
+    main.update(&model, .{ .select_sidebar_row = rows[1].key }, &fx);
+    try testing.expectEqual(first_project, model.active_project_id);
+    try testing.expectEqual(first_project_thread, model.active_thread_id);
+    main.update(&model, .{ .select_sidebar_row = rows[3].key }, &fx);
+    try testing.expectEqual(second_project, model.active_project_id);
+    try testing.expectEqual(second_project_thread, model.active_thread_id);
 }
 
 test "projects and chats can be renamed without changing their identity" {
@@ -515,7 +579,7 @@ test "SQLite restores the workspace after reopening and purges expired archives"
     const archived_project_id = model.active_project_id;
     main.update(model, .archive_project, &fx);
     const archived_at = projectWithId(model, archived_project_id).archived_at_ms;
-    main.update(model, .{ .select_project = persisted_project_id }, &fx);
+    main.update(model, .{ .select_project_slot = 1 }, &fx);
 
     {
         var database = try main.workspace_storage.Database.open(path);
@@ -848,6 +912,9 @@ test "the global shortcut map reaches creation navigation focus and settings" {
         main.cmd_next_project,
         main.cmd_focus_composer,
         main.cmd_model_picker,
+        main.cmd_auto_model,
+        main.cmd_top_level_chats,
+        main.cmd_load_older,
         main.cmd_settings,
         main.cmd_fork_latest,
         main.cmd_copy_latest,
@@ -860,6 +927,9 @@ test "the global shortcut map reaches creation navigation focus and settings" {
         main.cmd_close_overlay,
     };
     for (commands) |command| try testing.expect(main.onCommand(command) != null);
+    for (main.project_slot_commands) |command| try testing.expect(main.onCommand(command) != null);
+    for (main.thread_slot_commands) |command| try testing.expect(main.onCommand(command) != null);
+    for (main.quick_model_commands) |command| try testing.expect(main.onCommand(command) != null);
     try testing.expect(main.onCommand("workspace.unknown") == null);
 
     main.update(&model, main.onCommand(main.cmd_new_thread).?, &fx);
@@ -893,6 +963,44 @@ test "the global shortcut map reaches creation navigation focus and settings" {
     try testing.expect(model.settings_open);
     main.update(&model, main.onCommand(main.cmd_close_overlay).?, &fx);
     try testing.expect(!model.settings_open and !model.model_picker_open);
+}
+
+test "number shortcuts select top-level chats projects threads and models" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    const first_top_level_thread = model.active_thread_id;
+    main.update(&model, .new_thread, &fx);
+    const second_top_level_thread = model.active_thread_id;
+    main.update(&model, main.onCommand(main.thread_slot_commands[0]).?, &fx);
+    try testing.expectEqual(first_top_level_thread, model.active_thread_id);
+    main.update(&model, main.onCommand(main.thread_slot_commands[1]).?, &fx);
+    try testing.expectEqual(second_top_level_thread, model.active_thread_id);
+
+    main.update(&model, .new_project, &fx);
+    const first_project = model.active_project_id;
+    main.update(&model, .new_project, &fx);
+    const second_project = model.active_project_id;
+    main.update(&model, main.onCommand(main.project_slot_commands[0]).?, &fx);
+    try testing.expectEqual(first_project, model.active_project_id);
+    main.update(&model, main.onCommand(main.project_slot_commands[1]).?, &fx);
+    try testing.expectEqual(second_project, model.active_project_id);
+
+    main.update(&model, main.onCommand(main.cmd_top_level_chats).?, &fx);
+    try testing.expectEqual(main.chats_project_id, model.active_project_id);
+    main.update(&model, main.onCommand(main.quick_model_commands[0]).?, &fx);
+    try testing.expectEqualStrings(main.Model.quickModels[0].slug, activeThread(&model).modelName());
+    main.update(&model, main.onCommand(main.cmd_auto_model).?, &fx);
+    try testing.expectEqualStrings("openrouter/auto", activeThread(&model).modelName());
+}
+
+test "modal forms can submit without a mouse" {
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "on-submit=\"save_settings\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "on-submit=\"save_rename\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "on-submit=\"finish_onboarding\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "on-submit=\"create_forks\"") != null);
 }
 
 test "first-run onboarding is bypassed by credentials completion or dev mode" {

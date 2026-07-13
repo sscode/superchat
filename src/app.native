@@ -31,15 +31,12 @@
               <button size="sm" variant="ghost" icon="plus" on-press="new_project_thread" disabled="{cannotManageProject}" label="New chat in selected project"></button>
               <button size="sm" variant="ghost" icon="plus" on-press="new_project" disabled="{cannotAddProject}" label="New project"></button>
             </row>
-            <for each="projectRows" key="id" as="p">
-              <list-item on-press="select_project:{p.id}" selected="{p.id == active_project_id}" label="{p.name}">{p.name}</list-item>
-            </for>
-            <for each="threadRows" key="id" as="t">
-              <list-item on-press="select_thread:{t.id}" selected="{t.selected}" label="{t.title}">{t.title}</list-item>
+            <for each="projectSidebarRows" key="key" as="r">
+              <list-item on-press="select_sidebar_row:{r.key}" selected="{r.selected}" label="{r.title}">{r.prefix} {r.title}</list-item>
             </for>
           </column>
         </scroll>
-        <button size="sm" variant="ghost" on-press="open_settings" label="View keyboard shortcuts">Keyboard shortcuts</button>
+        <button size="sm" variant="ghost" on-press="open_settings" label="View keyboard shortcuts, Command comma">Keyboard shortcuts · Cmd + ,</button>
       </column>
       <separator />
 
@@ -103,9 +100,9 @@
         </scroll>
         <separator />
         <column padding="14" gap="8" background="surface">
-          <textarea key="{composerKey}" text="{draft}" on-input="draft_edit" on-submit="send" autofocus="true" height="92" placeholder="Message any model…" label="Message" />
+          <textarea key="{composerKey}" text="{draft}" on-input="draft_edit" on-submit="composer_newline" autofocus="true" height="92" placeholder="Message any model…" label="Message" />
           <row cross="center" gap="8">
-            <text foreground="text_muted" grow="1">Command + Enter to send</text>
+            <text foreground="text_muted" grow="1">Return to send · Command + Return for a new line</text>
             <if test="{missingKey}">
               <button size="sm" variant="outline" icon="settings" on-press="open_settings">Add API key</button>
             </if>
@@ -159,10 +156,10 @@
           <column padding="20" gap="10">
             <text size="heading">Settings</text>
             <text>OpenRouter API key</text>
-            <text-field text="{apiKeyField}" on-input="api_key_edit" placeholder="{apiKeyPlaceholder}" autofocus="true" label="OpenRouter API key" />
+            <text-field text="{apiKeyField}" on-input="api_key_edit" on-submit="save_settings" placeholder="{apiKeyPlaceholder}" autofocus="true" label="OpenRouter API key" />
             <text size="sm" foreground="text_muted">{statusLine}</text>
             <text>Custom model for this chat</text>
-            <text-field text="{modelName}" on-input="model_edit" placeholder="provider/model" label="Custom OpenRouter model" />
+            <text-field text="{modelName}" on-input="model_edit" on-submit="save_settings" placeholder="provider/model" label="Custom OpenRouter model" />
             <text size="heading">Keyboard shortcuts</text>
             <scroll grow="1" label="Keyboard shortcuts">
               <column gap="2">
@@ -221,7 +218,7 @@
         <dialog width="440" height="210" label="Rename">
           <column padding="24" gap="12">
             <text size="heading">{renameHeading}</text>
-            <text-field text="{renameValue}" on-input="rename_edit" autofocus="true" label="New name" />
+            <text-field text="{renameValue}" on-input="rename_edit" on-submit="save_rename" autofocus="true" label="New name" />
             <button variant="primary" on-press="save_rename" disabled="{cannotSaveRename}">Rename</button>
             <button variant="ghost" on-press="close_rename">Cancel</button>
           </column>
@@ -278,7 +275,7 @@
             <text foreground="text_muted">Connect OpenRouter to reach models from multiple providers. No Superchat account is required.</text>
             <text size="heading">Connect OpenRouter · available</text>
             <text foreground="text_muted" wrap="true">{statusLine}</text>
-            <text-field text="{apiKeyField}" on-input="api_key_edit" placeholder="sk-or-v1-…" autofocus="true" label="OpenRouter API key" />
+            <text-field text="{apiKeyField}" on-input="api_key_edit" on-submit="finish_onboarding" placeholder="sk-or-v1-…" autofocus="true" label="OpenRouter API key" />
             <button variant="primary" on-press="finish_onboarding" disabled="{cannotFinishOnboarding}">Connect OpenRouter</button>
             <text size="heading">Planned connections</text>
             <text size="sm" foreground="text_muted" wrap="true">Claude and ChatGPT subscription adapters are roadmap items and are not available in this build.</text>

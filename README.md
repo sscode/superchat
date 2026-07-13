@@ -51,13 +51,13 @@ Open **Settings** with `⌘,`, choose **Add API key**, and paste your OpenRouter
 
 Debug and locally packaged ad-hoc builds deliberately keep API keys in memory for the current session instead of reading or writing Keychain. This prevents rebuilt binaries from repeatedly asking for access to the release app's credential. Set `OPENROUTER_API_KEY` when launching a development build if you do not want to paste it again. Keychain persistence is enabled only in consistently Developer-ID-signed release builds.
 
-Choose a model with `⌘K`, write a message, and press `⌘↩` to send.
+Choose a model with `⌘K`, write a message, and press `↩` to send. Use `⌘↩` when you want a new line.
 
 ## A typical workflow
 
 1. Create a top-level chat with `⌘N`. Projects are optional: create one with `⌘⇧N`, then add chats to it with `⌘⌥N`.
 2. Open the model picker with `⌘K`. Search OpenRouter's catalog, choose Auto, or enter a model slug.
-3. Send a message with `⌘↩`.
+3. Send a message with `↩`.
 4. Move to another chat while the answer streams; the original request continues in the background.
 5. On an assistant response, choose **Copy** or **Fork**. Forking can create several model-specific chats at once and optionally start each with the same follow-up message.
 
@@ -71,11 +71,16 @@ Superchat is designed to be usable without reaching for the mouse. The same refe
 | New chat in selected project | `⌘⌥N` |
 | New project | `⌘⇧N` |
 | Previous / next chat | `⌘[` / `⌘]` |
+| Top-level chats | `⌘0` |
+| Projects 1–9 | `⌘1` through `⌘9` |
+| Chats 1–9 in the current area | `⌥1` through `⌥9` |
 | Previous / next project | `⌘⌥↑` / `⌘⌥↓` |
 | Focus composer | `⌘L` |
-| Send message | `⌘↩` |
+| Send message | `↩` |
+| New line in message | `⌘↩` |
 | Choose model | `⌘K` |
-| Quick models 1–9 | `⌘1` through `⌘9` |
+| OpenRouter Auto | `⌘⇧0` |
+| Quick models 1–9 | `⌘⇧1` through `⌘⇧9` |
 | Fork latest response | `⌘⇧F` |
 | Copy latest response | `⌘⇧C` |
 | Rename chat | `⌘⇧R` |
@@ -84,8 +89,11 @@ Superchat is designed to be usable without reaching for the mouse. The same refe
 | Archive project | `⌘⌥E` |
 | Open archive | `⌘⇧H` |
 | Clear current chat | `⌘⇧⌫` |
+| Load earlier messages | `⌘⌥L` |
 | Open settings | `⌘,` |
 | Close the current panel | `Esc` |
+
+For dynamic controls—model search results, archive items, fork model choices, and confirmation buttons—use `Tab` / `Shift+Tab` to move and `Enter` or `Space` to activate. The numbered shortcuts cover the first nine visible projects and chats; the previous/next shortcuts cover everything beyond them.
 
 ## Local data and privacy
 

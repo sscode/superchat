@@ -338,6 +338,14 @@ pub const ThreadRow = struct {
     selected: bool,
 };
 
+pub const ProjectSidebarRow = struct {
+    key: u64,
+    id: u32,
+    title: []const u8,
+    prefix: []const u8,
+    selected: bool,
+};
+
 pub const ShortcutHint = struct {
     action: []const u8,
     keys: []const u8,
@@ -374,6 +382,7 @@ pub const cmd_previous_project = "workspace.previous-project";
 pub const cmd_next_project = "workspace.next-project";
 pub const cmd_focus_composer = "workspace.focus-composer";
 pub const cmd_model_picker = "workspace.model-picker";
+pub const cmd_auto_model = "workspace.model-auto";
 pub const cmd_settings = "workspace.settings";
 pub const cmd_fork_latest = "workspace.fork-latest";
 pub const cmd_copy_latest = "workspace.copy-latest";
@@ -384,6 +393,30 @@ pub const cmd_archive_project = "workspace.archive-project";
 pub const cmd_open_archive = "workspace.archive";
 pub const cmd_clear_thread = "workspace.clear-thread";
 pub const cmd_close_overlay = "workspace.close-overlay";
+pub const cmd_top_level_chats = "workspace.top-level-chats";
+pub const cmd_load_older = "workspace.load-older";
+pub const project_slot_commands = [_][]const u8{
+    "workspace.project-1",
+    "workspace.project-2",
+    "workspace.project-3",
+    "workspace.project-4",
+    "workspace.project-5",
+    "workspace.project-6",
+    "workspace.project-7",
+    "workspace.project-8",
+    "workspace.project-9",
+};
+pub const thread_slot_commands = [_][]const u8{
+    "workspace.thread-1",
+    "workspace.thread-2",
+    "workspace.thread-3",
+    "workspace.thread-4",
+    "workspace.thread-5",
+    "workspace.thread-6",
+    "workspace.thread-7",
+    "workspace.thread-8",
+    "workspace.thread-9",
+};
 pub const quick_model_commands = [_][]const u8{
     "workspace.model-1",
     "workspace.model-2",
@@ -472,6 +505,7 @@ const RemoteModels = struct { data: []const RemoteModel = &.{} };
 
 pub const Msg = union(enum) {
     draft_edit: canvas.TextInputEvent,
+    composer_newline,
     model_edit: canvas.TextInputEvent,
     api_key_edit: canvas.TextInputEvent,
     model_search_edit: canvas.TextInputEvent,
@@ -517,7 +551,10 @@ pub const Msg = union(enum) {
     new_project,
     new_thread,
     new_project_thread,
-    select_project: u32,
+    select_top_level_chats,
+    select_project_slot: u8,
+    select_thread_slot: u8,
+    select_sidebar_row: u64,
     select_thread: u32,
     previous_project,
     next_project,
@@ -562,6 +599,9 @@ pub const Msg = union(enum) {
         "open_archive",
         "close_overlay",
         "select_model",
+        "select_top_level_chats",
+        "select_project_slot",
+        "select_thread_slot",
     };
 };
 
@@ -637,6 +677,7 @@ pub const Model = struct {
         "project_count",
         "threads",
         "thread_count",
+        "active_project_id",
         "next_project_id",
         "next_thread_id",
         "next_message_id",
@@ -693,15 +734,15 @@ pub const Model = struct {
     };
 
     pub const quickModels = [_]QuickModel{
-        .{ .number = 1, .label = "GPT-5.5", .slug = "openai/gpt-5.5", .shortcut = "Cmd + 1" },
-        .{ .number = 2, .label = "GPT-5.4 Mini", .slug = "openai/gpt-5.4-mini", .shortcut = "Cmd + 2" },
-        .{ .number = 3, .label = "Claude Sonnet 5", .slug = "anthropic/claude-sonnet-5", .shortcut = "Cmd + 3" },
-        .{ .number = 4, .label = "Claude Opus 4.8", .slug = "anthropic/claude-opus-4.8", .shortcut = "Cmd + 4" },
-        .{ .number = 5, .label = "Gemini 3.5 Flash", .slug = "google/gemini-3.5-flash", .shortcut = "Cmd + 5" },
-        .{ .number = 6, .label = "Gemini 3.1 Pro", .slug = "google/gemini-3.1-pro-preview", .shortcut = "Cmd + 6" },
-        .{ .number = 7, .label = "GLM 5.2", .slug = "z-ai/glm-5.2", .shortcut = "Cmd + 7" },
-        .{ .number = 8, .label = "Kimi K2.6", .slug = "moonshotai/kimi-k2.6", .shortcut = "Cmd + 8" },
-        .{ .number = 9, .label = "Kimi K2.7 Code", .slug = "moonshotai/kimi-k2.7-code", .shortcut = "Cmd + 9" },
+        .{ .number = 1, .label = "GPT-5.5", .slug = "openai/gpt-5.5", .shortcut = "Cmd + Shift + 1" },
+        .{ .number = 2, .label = "GPT-5.4 Mini", .slug = "openai/gpt-5.4-mini", .shortcut = "Cmd + Shift + 2" },
+        .{ .number = 3, .label = "Claude Sonnet 5", .slug = "anthropic/claude-sonnet-5", .shortcut = "Cmd + Shift + 3" },
+        .{ .number = 4, .label = "Claude Opus 4.8", .slug = "anthropic/claude-opus-4.8", .shortcut = "Cmd + Shift + 4" },
+        .{ .number = 5, .label = "Gemini 3.5 Flash", .slug = "google/gemini-3.5-flash", .shortcut = "Cmd + Shift + 5" },
+        .{ .number = 6, .label = "Gemini 3.1 Pro", .slug = "google/gemini-3.1-pro-preview", .shortcut = "Cmd + Shift + 6" },
+        .{ .number = 7, .label = "GLM 5.2", .slug = "z-ai/glm-5.2", .shortcut = "Cmd + Shift + 7" },
+        .{ .number = 8, .label = "Kimi K2.6", .slug = "moonshotai/kimi-k2.6", .shortcut = "Cmd + Shift + 8" },
+        .{ .number = 9, .label = "Kimi K2.7 Code", .slug = "moonshotai/kimi-k2.7-code", .shortcut = "Cmd + Shift + 9" },
     };
 
     pub const modelOptions = [_]ModelOption{
@@ -715,24 +756,30 @@ pub const Model = struct {
     };
 
     pub const shortcutHints = [_]ShortcutHint{
+        .{ .action = "Move keyboard focus", .keys = "Tab / Shift + Tab" },
+        .{ .action = "Activate focused control", .keys = "Enter / Space" },
         .{ .action = "New top-level chat", .keys = "Cmd + N" },
         .{ .action = "New chat in project", .keys = "Cmd + Option + N" },
         .{ .action = "New project", .keys = "Cmd + Shift + N" },
         .{ .action = "Previous chat", .keys = "Cmd + [" },
         .{ .action = "Next chat", .keys = "Cmd + ]" },
+        .{ .action = "Top-level chats", .keys = "Cmd + 0" },
+        .{ .action = "Project 1–9", .keys = "Cmd + 1–9" },
+        .{ .action = "Chat 1–9", .keys = "Option + 1–9" },
         .{ .action = "Previous project", .keys = "Cmd + Option + Up" },
         .{ .action = "Next project", .keys = "Cmd + Option + Down" },
         .{ .action = "Focus message", .keys = "Cmd + L" },
         .{ .action = "Choose model", .keys = "Cmd + K" },
-        .{ .action = "Quick model: GPT-5.5", .keys = "Cmd + 1" },
-        .{ .action = "Quick model: GPT-5.4 Mini", .keys = "Cmd + 2" },
-        .{ .action = "Quick model: Claude Sonnet 5", .keys = "Cmd + 3" },
-        .{ .action = "Quick model: Claude Opus 4.8", .keys = "Cmd + 4" },
-        .{ .action = "Quick model: Gemini 3.5 Flash", .keys = "Cmd + 5" },
-        .{ .action = "Quick model: Gemini 3.1 Pro", .keys = "Cmd + 6" },
-        .{ .action = "Quick model: GLM 5.2", .keys = "Cmd + 7" },
-        .{ .action = "Quick model: Kimi K2.6", .keys = "Cmd + 8" },
-        .{ .action = "Quick model: Kimi K2.7 Code", .keys = "Cmd + 9" },
+        .{ .action = "Quick model: Auto", .keys = "Cmd + Shift + 0" },
+        .{ .action = "Quick model: GPT-5.5", .keys = "Cmd + Shift + 1" },
+        .{ .action = "Quick model: GPT-5.4 Mini", .keys = "Cmd + Shift + 2" },
+        .{ .action = "Quick model: Claude Sonnet 5", .keys = "Cmd + Shift + 3" },
+        .{ .action = "Quick model: Claude Opus 4.8", .keys = "Cmd + Shift + 4" },
+        .{ .action = "Quick model: Gemini 3.5 Flash", .keys = "Cmd + Shift + 5" },
+        .{ .action = "Quick model: Gemini 3.1 Pro", .keys = "Cmd + Shift + 6" },
+        .{ .action = "Quick model: GLM 5.2", .keys = "Cmd + Shift + 7" },
+        .{ .action = "Quick model: Kimi K2.6", .keys = "Cmd + Shift + 8" },
+        .{ .action = "Quick model: Kimi K2.7 Code", .keys = "Cmd + Shift + 9" },
         .{ .action = "Open settings", .keys = "Cmd + ," },
         .{ .action = "Fork latest response", .keys = "Cmd + Shift + F" },
         .{ .action = "Copy latest response", .keys = "Cmd + Shift + C" },
@@ -742,7 +789,9 @@ pub const Model = struct {
         .{ .action = "Archive project", .keys = "Cmd + Option + E" },
         .{ .action = "Open archive", .keys = "Cmd + Shift + H" },
         .{ .action = "Clear current chat", .keys = "Cmd + Shift + Backspace" },
-        .{ .action = "Send message", .keys = "Cmd + Enter" },
+        .{ .action = "Load earlier messages", .keys = "Cmd + Option + L" },
+        .{ .action = "Send message", .keys = "Enter" },
+        .{ .action = "New line in message", .keys = "Cmd + Enter" },
         .{ .action = "Close overlay", .keys = "Escape" },
     };
 
@@ -790,6 +839,10 @@ pub const Model = struct {
         return if (model.composer_focus_flip) "composer-a" else "composer-b";
     }
 
+    fn focusComposer(model: *Model) void {
+        model.composer_focus_flip = !model.composer_focus_flip;
+    }
+
     pub fn toastVisible(model: *const Model) bool {
         return model.toast_len > 0;
     }
@@ -805,32 +858,33 @@ pub const Model = struct {
         fx.startTimer(.{ .key = toast_timer_key, .interval_ms = toast_duration_ms, .on_fire = Effects.timerMsg(.dismiss_toast) });
     }
 
-    pub fn projectRows(model: *const Model, arena: std.mem.Allocator) []const Project {
-        const out = arena.alloc(Project, model.project_count) catch return &.{};
+    pub fn projectSidebarRows(model: *const Model, arena: std.mem.Allocator) []const ProjectSidebarRow {
+        const out = arena.alloc(ProjectSidebarRow, model.project_count + model.thread_count) catch return &.{};
         var count: usize = 0;
         for (model.projects[0..model.project_count]) |project| {
             if (project.id == chats_project_id or project.isArchived()) continue;
-            out[count] = project;
-            count += 1;
-        }
-        return out[0..count];
-    }
-
-    pub fn threadRows(model: *const Model, arena: std.mem.Allocator) []const ThreadRow {
-        if (model.active_project_id == chats_project_id) return &.{};
-        const out = arena.alloc(ThreadRow, model.thread_count) catch return &.{};
-        var count: usize = 0;
-        for (model.threads[0..model.thread_count]) |*thread| {
-            if (thread.project_id != model.active_project_id or thread.isArchived()) continue;
             out[count] = .{
-                .id = thread.id,
-                .title = if (thread.sending)
-                    std.fmt.allocPrint(arena, "{s} · responding", .{thread.title()}) catch thread.title()
-                else
-                    thread.title(),
-                .selected = thread.id == model.active_thread_id,
+                .key = project.id,
+                .id = project.id,
+                .title = project.name(),
+                .prefix = "",
+                .selected = project.id == model.active_project_id,
             };
             count += 1;
+            for (model.threads[0..model.thread_count]) |*thread| {
+                if (thread.project_id != project.id or thread.isArchived()) continue;
+                out[count] = .{
+                    .key = (@as(u64, 1) << 32) | thread.id,
+                    .id = thread.id,
+                    .title = if (thread.sending)
+                        std.fmt.allocPrint(arena, "{s} · responding", .{thread.title()}) catch thread.title()
+                    else
+                        thread.title(),
+                    .prefix = "    -",
+                    .selected = thread.id == model.active_thread_id,
+                };
+                count += 1;
+            }
         }
         return out[0..count];
     }
@@ -1530,6 +1584,35 @@ pub const Model = struct {
         return true;
     }
 
+    fn activateFirstThreadInProject(model: *Model, project_id: u32) bool {
+        for (model.threads[0..model.thread_count]) |thread| {
+            if (thread.project_id == project_id and !thread.isArchived()) return model.activateThread(thread.id);
+        }
+        return false;
+    }
+
+    fn activateProjectSlot(model: *Model, slot: u8) bool {
+        if (slot == 0) return false;
+        var visible_slot: u8 = 0;
+        for (model.projects[0..model.project_count]) |project| {
+            if (project.id == chats_project_id or project.isArchived()) continue;
+            visible_slot += 1;
+            if (visible_slot == slot) return model.activateFirstThreadInProject(project.id);
+        }
+        return false;
+    }
+
+    fn activateThreadSlot(model: *Model, slot: u8) bool {
+        if (slot == 0) return false;
+        var visible_slot: u8 = 0;
+        for (model.threads[0..model.thread_count]) |thread| {
+            if (thread.project_id != model.active_project_id or thread.isArchived()) continue;
+            visible_slot += 1;
+            if (visible_slot == slot) return model.activateThread(thread.id);
+        }
+        return false;
+    }
+
     fn cycleProject(model: *Model, forward: bool) void {
         const ids = model.allocator.alloc(u32, model.project_count) catch return;
         defer model.allocator.free(ids);
@@ -1649,6 +1732,12 @@ pub fn usesPersistentCredentialStore(dev_mode: bool) bool {
 }
 
 pub fn onCommand(name: []const u8) ?Msg {
+    for (project_slot_commands, 1..) |command, number| {
+        if (std.mem.eql(u8, name, command)) return .{ .select_project_slot = @intCast(number) };
+    }
+    for (thread_slot_commands, 1..) |command, number| {
+        if (std.mem.eql(u8, name, command)) return .{ .select_thread_slot = @intCast(number) };
+    }
     for (quick_model_commands, 1..) |command, number| {
         if (std.mem.eql(u8, name, command)) return .{ .select_quick_model = @intCast(number) };
     }
@@ -1661,6 +1750,9 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, cmd_next_project)) return .next_project;
     if (std.mem.eql(u8, name, cmd_focus_composer)) return .focus_composer;
     if (std.mem.eql(u8, name, cmd_model_picker)) return .open_model_picker;
+    if (std.mem.eql(u8, name, cmd_auto_model)) return .select_auto_model;
+    if (std.mem.eql(u8, name, cmd_top_level_chats)) return .select_top_level_chats;
+    if (std.mem.eql(u8, name, cmd_load_older)) return .load_older;
     if (std.mem.eql(u8, name, cmd_settings)) return .open_settings;
     if (std.mem.eql(u8, name, cmd_fork_latest)) return .fork_latest;
     if (std.mem.eql(u8, name, cmd_copy_latest)) return .copy_latest;
@@ -1677,8 +1769,21 @@ pub fn onCommand(name: []const u8) ?Msg {
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
         .draft_edit => |edit| {
+            if (edit == .insert_text and std.mem.eql(u8, edit.insert_text, "\n")) {
+                submitDraft(model, fx);
+                return;
+            }
             const thread = model.activeThread() orelse return;
             thread.draft_buffer.apply(edit);
+            fx.startTimer(.{
+                .key = draftSaveKey(thread.id),
+                .interval_ms = draft_save_interval_ms,
+                .on_fire = Effects.timerMsg(.persist_draft),
+            });
+        },
+        .composer_newline => {
+            const thread = model.activeThread() orelse return;
+            thread.draft_buffer.apply(.{ .insert_text = "\n" });
             fx.startTimer(.{
                 .key = draftSaveKey(thread.id),
                 .interval_ms = draft_save_interval_ms,
@@ -1868,28 +1973,42 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const project_id = model.addProject() orelse return;
             const thread_id = model.addThread(project_id) orelse return;
             _ = model.activateThread(thread_id);
+            model.focusComposer();
             model.markStructureDirty();
         },
         .new_thread => {
             const thread_id = model.addThread(chats_project_id) orelse return;
             _ = model.activateThread(thread_id);
+            model.focusComposer();
             model.markStructureDirty();
         },
         .new_project_thread => {
             if (model.active_project_id == chats_project_id) return;
             const thread_id = model.addThread(model.active_project_id) orelse return;
             _ = model.activateThread(thread_id);
+            model.focusComposer();
             model.markStructureDirty();
         },
-        .select_project => |project_id| {
-            if (project_id == model.active_project_id) return;
-            for (model.threads[0..model.thread_count]) |thread| {
-                if (thread.project_id == project_id and !thread.isArchived()) {
-                    _ = model.activateThread(thread.id);
-                    model.markMetaDirty();
-                    return;
-                }
+        .select_top_level_chats => {
+            if (model.active_project_id == chats_project_id) return;
+            if (model.activateFirstThreadInProject(chats_project_id)) model.markMetaDirty();
+        },
+        .select_project_slot => |slot| {
+            if (model.activateProjectSlot(slot)) model.markMetaDirty();
+        },
+        .select_thread_slot => |slot| {
+            if (model.activateThreadSlot(slot)) model.markMetaDirty();
+        },
+        .select_sidebar_row => |key| {
+            if (key > std.math.maxInt(u32)) {
+                const thread_id: u32 = @intCast(key & std.math.maxInt(u32));
+                if (thread_id == model.active_thread_id) return;
+                if (model.activateThread(thread_id)) model.markMetaDirty();
+                return;
             }
+            const project_id: u32 = @intCast(key);
+            if (project_id == model.active_project_id) return;
+            if (model.activateFirstThreadInProject(project_id)) model.markMetaDirty();
         },
         .select_thread => |thread_id| {
             if (thread_id == model.active_thread_id) return;
@@ -1912,7 +2031,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.cycleThread(true);
             model.markMetaDirty();
         },
-        .focus_composer => model.composer_focus_flip = !model.composer_focus_flip,
+        .focus_composer => model.focusComposer(),
         .open_model_picker => {
             model.settings_open = false;
             model.fork_open = false;
@@ -1970,12 +2089,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             fx.cancelTimer(streamFlushKey(thread.id));
             model.markMessagesCleared(thread.id);
         },
-        .send => {
-            const thread_id = model.active_thread_id;
-            const before = model.next_message_id;
-            send(model, fx);
-            if (model.next_message_id != before) model.markMessagesDirty(thread_id);
-        },
+        .send => submitDraft(model, fx),
         .stream_line => |line| receiveStreamLine(model, line, fx),
         .stream_flush => |timer| {
             const thread_id = streamFlushThreadId(timer.key) orelse return;
@@ -2114,6 +2228,13 @@ fn receiveKeyValidation(model: *Model, response: native_sdk.EffectResponse) void
     if (model.key_validation_onboarding) model.onboarding_open = false;
     model.key_validation_onboarding = false;
     model.setStatus("OpenRouter connected · key verified");
+}
+
+fn submitDraft(model: *Model, fx: *Effects) void {
+    const thread_id = model.active_thread_id;
+    const before = model.next_message_id;
+    send(model, fx);
+    if (model.next_message_id != before) model.markMessagesDirty(thread_id);
 }
 
 fn searchModels(model: *Model, fx: *Effects) void {
