@@ -4,7 +4,7 @@
 
 Superchat keeps projects, conversations, drafts, and model choices on your Mac. Talk through [OpenRouter](https://openrouter.ai/) or your signed-in [Codex CLI](https://developers.openai.com/codex/cli) session. An experimental development-only Claude CLI harness is included for local evaluation. It is built with the [Vercel Labs Native SDK](https://github.com/vercel-labs/native), Zig, and a GPU-rendered native interface—there is no web app or WebView hiding underneath.
 
-> Superchat is an early public beta. OpenRouter and Codex connections are available; cloud sync and automatic in-app updates are still planned.
+> Superchat is an early public beta. OpenRouter and Codex connections are available; cloud sync remains a future option, while update availability is checked directly against GitHub Releases.
 
 ## What you can do
 
@@ -12,9 +12,12 @@ Superchat keeps projects, conversations, drafts, and model choices on your Mac. 
 - Use Codex through your signed-in ChatGPT account, without giving Superchat its session token.
 - Search OpenRouter's live model catalog, favorite useful results, or enter a model slug directly.
 - Stream several responses at once and move between chats while they finish.
+- See unread completion markers and optionally receive a native notification when a background response finishes.
+- Search the complete local message history, including messages older than the currently loaded page.
 - Drop images, PDFs, and text/code files into a message, or attach them without leaving the keyboard.
 - Fork an assistant response into one or several new chats, each with a different model.
 - Copy complete responses or select and copy text from a rendered paragraph.
+- Stop a response, retry it, or edit an earlier user turn and resend from that point.
 - Rename, archive, restore, and permanently delete projects and chats.
 - Navigate the entire app with keyboard shortcuts.
 - Keep chat data in a local SQLite database and your API key in macOS Keychain.
@@ -64,10 +67,10 @@ Choose a model with `⌘K`, write a message, and press `↩` to send. Use `⌘�
 ## A typical workflow
 
 1. Create a top-level chat with `⌘N`. Projects are optional: create one with `⌘⇧N`, then add chats to it with `⌘⌥N`.
-2. Open the model picker with `⌘K`. Choose Codex, search OpenRouter's catalog, choose Auto, or enter a model slug. Development builds also show the experimental Claude adapter.
+2. Open the command palette with `⌘K`. Run a common action, choose Codex, search OpenRouter's catalog, choose Auto, or enter a model slug. Development builds also show the experimental Claude adapter.
 3. Optionally drop up to four images, PDFs, or text/code files into the app. Send with `↩`.
 4. Move to another chat while the answer streams; the original request continues in the background.
-5. On an assistant response, choose **Copy** or **Fork**. Forking can create several model-specific chats at once and optionally start each with the same follow-up message.
+5. On an assistant response, choose **Copy**, **Retry**, or **Fork**. Use **Edit** beside one of your messages to rewrite the conversation from that point. Forking can create several model-specific chats at once and optionally start each with the same follow-up message.
 
 ## Keyboard shortcuts
 
@@ -87,12 +90,15 @@ Superchat is designed to be usable without reaching for the mouse. The same refe
 | Attach images or files | `⌘U` |
 | Send message | `↩` |
 | New line in message | `⌘↩` |
-| Choose model | `⌘K` |
+| Open command palette and models | `⌘K` |
+| Search every chat | `⌘F` |
 | OpenRouter Auto | `⌘⇧0` |
 | Quick models 1–9 | `⌘⇧1` through `⌘⇧9` |
 | Use Codex | `⌘⌥⇧1` |
 | Fork latest response | `⌘⇧F` |
 | Copy latest response | `⌘⇧C` |
+| Retry latest response | `⌘⇧T` |
+| Stop current response | `⌘.` |
 | Rename chat | `⌘⇧R` |
 | Rename project | `⌘⌥R` |
 | Archive chat | `⌘⇧E` |
@@ -109,7 +115,7 @@ For dynamic controls—model search results, archive items, fork model choices, 
 
 Superchat does not require an account or run a local database server.
 
-- Projects, chats, messages, drafts, model choices, and archive state are stored in SQLite at `~/Library/Application Support/superchat/superchat.sqlite3`.
+- Projects, chats, messages, drafts, model choices, archive state, and the notification preference are stored in SQLite at `~/Library/Application Support/superchat/superchat.sqlite3`.
 - Attachment names, types, and user-selected paths are stored with the chat. File contents are not copied into SQLite. A private, randomly named temporary request file is created only when OpenRouter needs a larger multimodal payload and is removed when that request exits.
 - Your OpenRouter API key is stored separately in macOS Keychain. Codex and the development-only Claude harness leave authentication in each provider's own CLI credential store.
 - Requests and a bounded recent conversation context are sent only through the selected connection. Check provider privacy policies before sending sensitive information.
@@ -165,7 +171,7 @@ The intentionally small first version has a few boundaries worth knowing:
 - Projects and chats grow dynamically instead of stopping at prototype-era 8/24 limits. Individual responses have a 64 KiB safety ceiling.
 - A message accepts up to four attachments totaling 640 KB: PNG, JPEG, WebP, GIF, PDF, UTF-8 text, Markdown, JSON, CSV, and common source-code formats. OpenRouter receives images, PDFs, and text files; Codex receives images plus bounded text-file content; the development-only Claude adapter currently accepts text files. Saved draft attachment metadata survives a restart, but the file must be removed and reattached before sending so Superchat never re-reads a local file without a fresh user action.
 - Tagged GitHub releases build a clean universal app, sign it with Developer ID, submit it for Apple notarization, staple the result, and publish the `.dmg` to GitHub Releases.
-- Automatic in-app update checks are not implemented yet; GitHub Releases is the distribution source for the beta.
+- Superchat checks GitHub's latest-release endpoint at launch and from Settings. When a newer semantic version is available, it opens only the repository's allow-listed GitHub release page in the system browser; no update server or Cloudflare service is required.
 
 Before enabling the release workflow, configure the repository secrets documented below.
 
@@ -177,7 +183,7 @@ The release workflow runs for tags matching `v*`. Add these GitHub Actions secre
 - `MACOS_CERTIFICATE_PASSWORD` and `MACOS_SIGNING_IDENTITY`.
 - `APPLE_ID`, `APPLE_APP_PASSWORD`, and `APPLE_TEAM_ID` for notarization.
 
-Then update the version in `app.zon` and `package.json`, create a tag such as `v0.2.0`, and push it. GitHub hosts the resulting release and DMG; no Cloudflare service is required.
+Then update the version in `app.zon`, `package.json`, and `build.zig`, create a tag such as `v0.2.0`, and push it. GitHub hosts the resulting release and DMG; no Cloudflare service is required.
 
 ## Why Native SDK?
 

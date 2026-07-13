@@ -9,8 +9,6 @@
       <button size="sm" variant="ghost" icon="trash" on-press="clear" disabled="{cannotClear}" label="{clearButtonLabel}"></button>
       <spacer width="{chrome_trailing}" />
     </row>
-    <separator />
-
     <row grow="1">
       <column width="226" background="surface">
         <row padding="10" gap="8" cross="center">
@@ -45,25 +43,18 @@
           <text grow="1">{activeThreadTitle}</text>
           <button size="sm" variant="ghost" icon="edit" on-press="open_rename_thread" label="Rename chat"></button>
           <button size="sm" variant="ghost" icon="archive" on-press="archive_thread" label="Archive chat"></button>
-          <if test="{sending}">
-            <badge variant="outline">Responding</badge>
-          </if>
         </row>
         <separator />
         <scroll grow="1" label="Conversation">
           <column padding="24" gap="14">
             <if test="{canLoadOlder}">
-              <row main="center"><button size="sm" variant="ghost" on-press="load_older">Load earlier messages</button></row>
-            </if>
-            <if test="{historyLoading}">
-              <row main="center" gap="8"><spinner size="sm" /><text foreground="text_muted">Loading earlier messages</text></row>
+              <button on-press="load_older">Load earlier messages</button>
             </if>
             <for each="messageRows" key="id" as="m">
               <if test="{m.isUser}">
                 <row main="end">
-                  <bubble variant="primary" label="You said">
-                    <text wrap="true">{m.content}  {m.attachmentSummary}</text>
-                  </bubble>
+                  <button variant="ghost" on-press="edit_message:{m.id}">Edit</button>
+                  <bubble variant="primary" label="You said"><text wrap="true">{m.content}  {m.attachmentSummary}</text></bubble>
                 </row>
               </if>
               <else>
@@ -74,27 +65,15 @@
                     </bubble>
                     <row gap="4">
                       <button size="sm" variant="ghost" icon="copy" on-press="copy_message:{m.id}" label="Copy full response">Copy</button>
+                      <button variant="ghost" on-press="retry_message:{m.id}">Retry</button>
                       <button size="sm" variant="ghost" icon="git-branch" on-press="open_fork:{m.id}" label="Fork from this response">Fork</button>
                     </row>
                   </column>
                 </row>
               </else>
             </for>
-            <else>
-              <column height="300" main="center" cross="center" gap="10" padding="32">
-                <text size="heading">A blank page for any model.</text>
-                <text foreground="text_muted" wrap="true">Start this chat below. Its first message becomes the title.</text>
-              </column>
-            </else>
             <if test="{sending}">
-              <row main="start">
-                <bubble variant="ghost" label="Assistant is responding">
-                  <row gap="8" cross="center">
-                    <spinner size="sm" />
-                    <text foreground="text_muted">Thinking</text>
-                  </row>
-                </bubble>
-              </row>
+              <badge variant="outline">Thinking…</badge>
             </if>
           </column>
         </scroll>
@@ -110,7 +89,8 @@
             <if test="{missingKey}">
               <button size="sm" variant="outline" icon="settings" on-press="open_settings">Add API key</button>
             </if>
-            <button variant="primary" icon="send" on-press="send" disabled="{cannotSend}" label="Send message"></button>
+            <button variant="ghost" on-press="stop" disabled="{cannotStop}">Stop</button>
+            <button variant="primary" on-press="send" disabled="{cannotSend}">Send</button>
           </row>
         </column>
         <status-bar>{statusLine}</status-bar>
@@ -123,7 +103,12 @@
       <column main="center" cross="center">
         <dialog width="620" height="440" label="Choose a model">
           <column padding="20" gap="10">
-            <text size="heading">Choose a model</text>
+            <text size="heading">Command palette</text>
+            <grid columns="2">
+              <for each="paletteActionRows" as="a">
+                <button variant="ghost" on-press="palette_action:{a.id}">{a.label} · {a.shortcut}</button>
+              </for>
+            </grid>
             <grid columns="3" gap="6">
               <for each="quickModels" as="q">
                 <button variant="outline" on-press="select_quick_model:{q.number}" label="{q.slug}">{q.number} · {q.label}</button>
@@ -132,13 +117,12 @@
               <button variant="outline" on-press="select_claude_subscription" disabled="{claudeSubscriptionDisabled}">Claude · Experimental</button>
             </grid>
             <text-field text="{modelSearch}" on-input="model_search_edit" placeholder="Search models or providers…" autofocus="true" label="Search OpenRouter models" />
-            <text size="sm" foreground="text_muted">{modelCatalogStatus}</text>
             <scroll grow="1" label="OpenRouter model results">
               <column gap="4">
                 <for each="catalogRows" key="index" as="m">
-                  <row gap="6" cross="center">
-                    <button grow="1" variant="ghost" on-press="select_catalog_model:{m.index}" label="{m.slug}">{m.label} · {m.slug}</button>
-                    <button size="sm" variant="ghost" on-press="toggle_model_favorite:{m.index}" label="Favorite model">{m.favorite_label}</button>
+                  <row>
+                    <button grow="1" on-press="select_catalog_model:{m.index}">{m.label} · {m.slug}</button>
+                    <button on-press="toggle_model_favorite:{m.index}">{m.favorite_label}</button>
                   </row>
                 </for>
               </column>
@@ -154,23 +138,41 @@
     </panel>
   </if>
 
+  <if test="{search_open}">
+    <panel background="scrim" on-press="close_search" label="Search chats backdrop">
+      <column main="center" cross="center">
+        <dialog width="620" height="430" label="Search every chat">
+          <column padding="20" gap="10">
+            <text-field text="{searchText}" on-input="search_edit" placeholder="Search every chat…" autofocus="true" />
+            <scroll grow="1" label="Search results">
+              <column gap="4">
+                <for each="searchRows" key="index" as="r">
+                  <button on-press="select_search_result:{r.index}">{r.title} · {r.snippet}</button>
+                </for>
+              </column>
+            </scroll>
+          </column>
+        </dialog>
+      </column>
+    </panel>
+  </if>
+
   <if test="{settings_open}">
     <panel background="scrim" on-press="close_settings" label="Settings backdrop">
       <column main="center" cross="center">
-        <dialog width="600" height="440" label="Settings">
+        <dialog width="600" height="480" label="Settings">
           <column padding="20" gap="10">
             <text size="heading">Settings</text>
             <button variant="outline" on-press="connect_codex" disabled="{codexConnectionBusy}">{codexConnectionButtonText}</button>
             <button variant="outline" on-press="connect_claude" disabled="{claudeSubscriptionDisabled}">{claudeConnectionButtonText}</button>
             <text-field text="{apiKeyField}" on-input="api_key_edit" on-submit="save_settings" placeholder="{apiKeyPlaceholder}" label="OpenRouter API key" />
             <text-field text="{modelName}" on-input="model_edit" on-submit="save_settings" placeholder="provider/model" label="Custom OpenRouter model" />
+            <checkbox checked="{notifications_enabled}" on-toggle="toggle_notifications" text="Notify when a background response finishes" />
+            <button variant="outline" on-press="open_update" disabled="{updateButtonDisabled}">{updateStatus} · {updateButtonText}</button>
             <scroll grow="1" label="Keyboard shortcuts">
               <column gap="2">
                 <for each="shortcutHints" as="h">
-                  <row padding="5" gap="10" cross="center">
-                    <text grow="1">{h.action}</text>
-                    <badge variant="outline">{h.keys}</badge>
-                  </row>
+                  <text>{h.action} · {h.keys}</text>
                 </for>
               </column>
             </scroll>

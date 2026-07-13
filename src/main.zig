@@ -43,8 +43,12 @@ const request_key_base: u64 = 1000;
 const clipboard_key_base: u64 = 1 << 40;
 const stream_flush_key_base: u64 = 1 << 44;
 const draft_save_key_base: u64 = 1 << 48;
-const history_poll_key: u64 = 1 << 52;
+const database_poll_key: u64 = 1 << 52;
 const toast_timer_key: u64 = (1 << 52) + 2;
+const search_timer_key: u64 = (1 << 52) + 3;
+const updates_request: u64 = (1 << 61) + 6;
+const updates_url = "https://api.github.com/repos/sscode/superchat/releases/latest";
+const releases_url_prefix = "https://github.com/sscode/superchat/releases/";
 const stream_flush_interval_ms: u64 = 16;
 const draft_save_interval_ms: u64 = 300;
 const toast_duration_ms: u64 = 2200;
@@ -61,6 +65,7 @@ const max_model_bytes = 128;
 const max_api_key_bytes = 256;
 const max_status_bytes = 240;
 const max_toast_bytes = 96;
+const max_search_results = 24;
 const max_stream_line_bytes = 32 * 1024;
 const max_request_bytes = native_sdk.max_effect_fetch_payload_bytes;
 const max_attachments_per_message = 4;
@@ -85,7 +90,9 @@ const app_permissions = [_][]const u8{
     native_sdk.security.permission_clipboard,
     native_sdk.security.permission_filesystem,
     native_sdk.security.permission_dialog,
+    native_sdk.security.permission_notifications,
 };
+const allowed_external_urls = [_][]const u8{"https://github.com/sscode/superchat/releases/*"};
 const shell_views = [_]native_sdk.ShellView{
     .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Chat canvas", .accessibility_label = "Superchat", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
 };
@@ -122,7 +129,9 @@ pub const ModelChoice = enum {
 pub const CredentialAction = enum { none, save, delete, complete_onboarding };
 pub const RenameKind = enum { project, thread };
 pub const ConnectionState = enum { disabled, checking, connected, disconnected, connecting, unavailable, failed };
+pub const UpdateState = enum { idle, checking, current, available, failed };
 pub const AttachmentKind = enum { image, pdf, text };
+pub const PaletteAction = enum { search, new_thread, new_project_thread, attach, archive, settings };
 
 pub const Attachment = struct {
     kind: AttachmentKind = .text,
@@ -254,6 +263,7 @@ pub const Thread = struct {
     model_buffer: canvas.TextBuffer(max_model_bytes) = canvas.TextBuffer(max_model_bytes).init("openrouter/auto"),
     model_choice: ModelChoice = .auto,
     sending: bool = false,
+    unread: bool = false,
     status_storage: [max_status_bytes]u8 = undefined,
     status_len: usize = 0,
     active_model_storage: [max_model_bytes]u8 = undefined,
@@ -462,6 +472,41 @@ pub const AttachmentRow = struct {
     detail: []const u8,
 };
 
+pub const SearchRow = struct {
+    index: u8,
+    title: []const u8,
+    snippet: []const u8,
+};
+
+const SearchEntry = struct {
+    thread_id: u32 = 0,
+    title_storage: [max_thread_title_bytes]u8 = undefined,
+    title_len: usize = 0,
+    snippet_storage: [180]u8 = undefined,
+    snippet_len: usize = 0,
+};
+
+pub const PaletteActionRow = struct {
+    id: PaletteAction,
+    label: []const u8,
+    shortcut: []const u8,
+};
+
+pub const MessageTruncation = struct {
+    thread_id: u32,
+    from_message_id: u32,
+};
+
+pub const DirtyMessage = struct {
+    thread_id: u32,
+    message_id: u32,
+};
+
+const UpdateRelease = struct {
+    tag_name: []const u8 = "",
+    html_url: []const u8 = "",
+};
+
 const PendingAttachment = struct {
     key: u64 = 0,
     thread_id: u32 = 0,
@@ -487,6 +532,9 @@ pub const cmd_next_project = "workspace.next-project";
 pub const cmd_focus_composer = "workspace.focus-composer";
 pub const cmd_attach_files = "workspace.attach-files";
 pub const cmd_model_picker = "workspace.model-picker";
+pub const cmd_search = "workspace.search";
+pub const cmd_retry_latest = "workspace.retry-latest";
+pub const cmd_stop = "workspace.stop";
 pub const cmd_auto_model = "workspace.model-auto";
 pub const cmd_codex_subscription = "workspace.model-codex-subscription";
 pub const cmd_settings = "workspace.settings";
@@ -656,6 +704,7 @@ pub const Msg = union(enum) {
     model_edit: canvas.TextInputEvent,
     api_key_edit: canvas.TextInputEvent,
     model_search_edit: canvas.TextInputEvent,
+    search_edit: canvas.TextInputEvent,
     fork_seed_edit: canvas.TextInputEvent,
     toggle_model_picker,
     close_model_picker,
@@ -668,6 +717,12 @@ pub const Msg = union(enum) {
     select_catalog_model: u32,
     toggle_model_favorite: u32,
     model_search: native_sdk.EffectTimer,
+    search_timer: native_sdk.EffectTimer,
+    database_poll: native_sdk.EffectTimer,
+    open_search,
+    close_search,
+    select_search_result: u8,
+    palette_action: PaletteAction,
     open_settings,
     close_settings,
     save_settings,
@@ -677,6 +732,10 @@ pub const Msg = union(enum) {
     finish_onboarding,
     skip_onboarding,
     copy_message: u32,
+    edit_message: u32,
+    retry_message: u32,
+    retry_latest,
+    stop,
     copy_latest,
     clipboard_result: native_sdk.EffectClipboardResult,
     open_fork: u32,
@@ -717,7 +776,6 @@ pub const Msg = union(enum) {
     send,
     clear,
     load_older,
-    history_poll: native_sdk.EffectTimer,
     stream_line: native_sdk.EffectLine,
     harness_line: native_sdk.EffectLine,
     harness_exit: native_sdk.EffectExit,
@@ -726,6 +784,9 @@ pub const Msg = union(enum) {
     stream_flush: native_sdk.EffectTimer,
     persist_draft: native_sdk.EffectTimer,
     dismiss_toast: native_sdk.EffectTimer,
+    toggle_notifications,
+    check_updates,
+    open_update,
     response: native_sdk.EffectResponse,
     chrome_changed: native_sdk.WindowChrome,
 
@@ -737,8 +798,9 @@ pub const Msg = union(enum) {
         "openrouter_exit",
         "connection_exit",
         "stream_flush",
-        "history_poll",
+        "database_poll",
         "model_search",
+        "search_timer",
         "persist_draft",
         "dismiss_toast",
         "clipboard_result",
@@ -758,6 +820,10 @@ pub const Msg = union(enum) {
         "open_rename_project",
         "archive_thread",
         "archive_project",
+        "retry_latest",
+        "stop",
+        "open_search",
+        "check_updates",
         "open_archive",
         "close_overlay",
         "select_model",
@@ -792,6 +858,13 @@ pub const Model = struct {
     model_catalog_url_storage: [512]u8 = undefined,
     model_catalog_dirty_mask: u32 = 0,
     model_picker_open: bool = false,
+    search_open: bool = false,
+    search_buffer: canvas.TextBuffer(persistence.max_search_query_bytes) = .{},
+    search_results: [max_search_results]SearchEntry = [_]SearchEntry{.{}} ** max_search_results,
+    search_result_count: usize = 0,
+    search_generation: u32 = 0,
+    search_loading: bool = false,
+    search_request_pending: bool = false,
     settings_open: bool = false,
     onboarding_open: bool = false,
     dev_mode: bool = false,
@@ -820,15 +893,24 @@ pub const Model = struct {
     header_height: f32 = header_natural_height,
     toast_storage: [max_toast_bytes]u8 = undefined,
     toast_len: usize = 0,
-    persistence_workspace_dirty: bool = false,
+    notifications_enabled: bool = true,
+    pending_notification_thread_id: u32 = 0,
+    update_state: UpdateState = .idle,
+    update_status_storage: [120]u8 = undefined,
+    update_status_len: usize = 0,
+    update_url_storage: [256]u8 = undefined,
+    update_url_len: usize = 0,
+    open_update_requested: bool = false,
     persistence_structure_dirty: bool = false,
     persistence_meta_dirty: bool = false,
     persistence_thread_ids: [persistence_batch_ids]u32 = undefined,
     persistence_thread_count: usize = 0,
-    persistence_message_thread_ids: [persistence_batch_ids]u32 = undefined,
-    persistence_message_thread_count: usize = 0,
+    persistence_messages: [persistence_batch_ids]DirtyMessage = undefined,
+    persistence_message_count: usize = 0,
     persistence_clear_thread_ids: [persistence_batch_ids]u32 = undefined,
     persistence_clear_thread_count: usize = 0,
+    persistence_truncations: [persistence_batch_ids]MessageTruncation = undefined,
+    persistence_truncate_count: usize = 0,
     history_request_thread_id: u32 = 0,
     stream_parse_storage: [max_stream_line_bytes * 2]u8 = undefined,
     codex_connection: ConnectionState = .checking,
@@ -865,6 +947,13 @@ pub const Model = struct {
         "model_catalog_url_storage",
         "model_catalog_dirty_mask",
         "model_catalog_loading",
+        "search_loading",
+        "update_state",
+        "search_buffer",
+        "search_results",
+        "search_result_count",
+        "search_generation",
+        "search_request_pending",
         "dev_mode",
         "composer_focus_flip",
         "hasMessages",
@@ -884,15 +973,22 @@ pub const Model = struct {
         "clock",
         "toast_storage",
         "toast_len",
-        "persistence_workspace_dirty",
+        "pending_notification_thread_id",
+        "update_status_storage",
+        "update_status_len",
+        "update_url_storage",
+        "update_url_len",
+        "open_update_requested",
         "persistence_structure_dirty",
         "persistence_meta_dirty",
         "persistence_thread_ids",
         "persistence_thread_count",
-        "persistence_message_thread_ids",
-        "persistence_message_thread_count",
+        "persistence_messages",
+        "persistence_message_count",
         "persistence_clear_thread_ids",
         "persistence_clear_thread_count",
+        "persistence_truncations",
+        "persistence_truncate_count",
         "history_request_thread_id",
         "stream_parse_storage",
         "codex_connection",
@@ -954,6 +1050,7 @@ pub const Model = struct {
         .{ .action = "Focus message", .keys = "Cmd + L" },
         .{ .action = "Attach images or files", .keys = "Cmd + U" },
         .{ .action = "Choose model", .keys = "Cmd + K" },
+        .{ .action = "Search every chat", .keys = "Cmd + F" },
         .{ .action = "Quick model: Auto", .keys = "Cmd + Shift + 0" },
         .{ .action = "Quick model: GPT-5.5", .keys = "Cmd + Shift + 1" },
         .{ .action = "Quick model: GPT-5.4 Mini", .keys = "Cmd + Shift + 2" },
@@ -968,6 +1065,8 @@ pub const Model = struct {
         .{ .action = "Open settings", .keys = "Cmd + ," },
         .{ .action = "Fork latest response", .keys = "Cmd + Shift + F" },
         .{ .action = "Copy latest response", .keys = "Cmd + Shift + C" },
+        .{ .action = "Retry latest response", .keys = "Cmd + Shift + T" },
+        .{ .action = "Stop response", .keys = "Cmd + ." },
         .{ .action = "Rename chat", .keys = "Cmd + Shift + R" },
         .{ .action = "Rename project", .keys = "Cmd + Option + R" },
         .{ .action = "Archive chat", .keys = "Cmd + Shift + E" },
@@ -979,6 +1078,44 @@ pub const Model = struct {
         .{ .action = "New line in message", .keys = "Cmd + Enter" },
         .{ .action = "Close overlay", .keys = "Escape" },
     };
+
+    pub const paletteActionRows = [_]PaletteActionRow{
+        .{ .id = .search, .label = "Search every chat", .shortcut = "Cmd + F" },
+        .{ .id = .new_thread, .label = "New top-level chat", .shortcut = "Cmd + N" },
+        .{ .id = .new_project_thread, .label = "New chat in project", .shortcut = "Cmd + Opt + N" },
+        .{ .id = .attach, .label = "Attach files", .shortcut = "Cmd + U" },
+        .{ .id = .archive, .label = "Open archive", .shortcut = "Cmd + Shift + H" },
+        .{ .id = .settings, .label = "Settings and shortcuts", .shortcut = "Cmd + ," },
+    };
+
+    pub fn searchText(model: *const Model) []const u8 {
+        return model.search_buffer.text();
+    }
+
+    pub fn searchRows(model: *const Model, arena: std.mem.Allocator) []const SearchRow {
+        const rows = arena.alloc(SearchRow, model.search_result_count) catch return &.{};
+        for (model.search_results[0..model.search_result_count], 0..) |*entry, index| {
+            rows[index] = .{
+                .index = @intCast(index),
+                .title = entry.title_storage[0..entry.title_len],
+                .snippet = entry.snippet_storage[0..entry.snippet_len],
+            };
+        }
+        return rows;
+    }
+
+    pub fn updateStatus(model: *const Model) []const u8 {
+        if (model.update_status_len > 0) return model.update_status_storage[0..model.update_status_len];
+        return "Version " ++ superchat_options.version;
+    }
+
+    pub fn updateButtonText(model: *const Model) []const u8 {
+        return if (model.update_state == .available) "View available update" else "Check for updates";
+    }
+
+    pub fn updateButtonDisabled(model: *const Model) bool {
+        return model.update_state == .checking;
+    }
 
     pub fn draft(model: *const Model) []const u8 {
         const thread = model.activeThreadConst() orelse return "";
@@ -993,7 +1130,11 @@ pub const Model = struct {
                 .index = @intCast(index),
                 .name = attachment.name(),
                 .detail = std.fmt.allocPrint(arena, "{s} · {d} KB", .{
-                    switch (attachment.kind) { .image => "Image", .pdf => "PDF", .text => "File" },
+                    switch (attachment.kind) {
+                        .image => "Image",
+                        .pdf => "PDF",
+                        .text => "File",
+                    },
                     (attachment.bytes.len + 1023) / 1024,
                 }) catch "Attached",
             };
@@ -1009,12 +1150,6 @@ pub const Model = struct {
         return false;
     }
 
-    fn markWorkspaceDirty(model: *Model) void {
-        model.persistence_workspace_dirty = true;
-        model.persistence_structure_dirty = true;
-        model.persistence_meta_dirty = true;
-    }
-
     fn markStructureDirty(model: *Model) void {
         model.persistence_structure_dirty = true;
         model.persistence_meta_dirty = true;
@@ -1028,15 +1163,56 @@ pub const Model = struct {
         appendUniqueId(&model.persistence_thread_ids, &model.persistence_thread_count, thread_id);
     }
 
-    fn markMessagesDirty(model: *Model, thread_id: u32) void {
+    fn appendDirtyMessage(model: *Model, thread_id: u32, message_id: u32) void {
+        for (model.persistence_messages[0..model.persistence_message_count]) |existing| {
+            if (existing.thread_id == thread_id and existing.message_id == message_id) return;
+        }
+        if (model.persistence_message_count == model.persistence_messages.len) return;
+        model.persistence_messages[model.persistence_message_count] = .{ .thread_id = thread_id, .message_id = message_id };
+        model.persistence_message_count += 1;
+    }
+
+    fn markMessageDirty(model: *Model, thread_id: u32, message_id: u32) void {
         model.markThreadDirty(thread_id);
-        appendUniqueId(&model.persistence_message_thread_ids, &model.persistence_message_thread_count, thread_id);
+        model.appendDirtyMessage(thread_id, message_id);
+        model.persistence_meta_dirty = true;
+    }
+
+    fn markThreadMessagesDirty(model: *Model, thread_id: u32) void {
+        const thread = model.threadByIdConst(thread_id) orelse return;
+        model.markThreadDirty(thread_id);
+        for (thread.messages[0..thread.message_count]) |message| model.appendDirtyMessage(thread_id, message.id);
         model.persistence_meta_dirty = true;
     }
 
     fn markMessagesCleared(model: *Model, thread_id: u32) void {
         model.markThreadDirty(thread_id);
         appendUniqueId(&model.persistence_clear_thread_ids, &model.persistence_clear_thread_count, thread_id);
+        model.removeDirtyMessagesFrom(thread_id, 0);
+        model.persistence_meta_dirty = true;
+    }
+
+    fn removeDirtyMessagesFrom(model: *Model, thread_id: u32, from_message_id: u32) void {
+        var kept: usize = 0;
+        for (model.persistence_messages[0..model.persistence_message_count]) |dirty| {
+            if (dirty.thread_id == thread_id and dirty.message_id >= from_message_id) continue;
+            model.persistence_messages[kept] = dirty;
+            kept += 1;
+        }
+        model.persistence_message_count = kept;
+    }
+
+    fn markMessagesTruncated(model: *Model, thread_id: u32, from_message_id: u32) void {
+        model.markThreadDirty(thread_id);
+        model.removeDirtyMessagesFrom(thread_id, from_message_id);
+        for (model.persistence_truncations[0..model.persistence_truncate_count]) |*existing| {
+            if (existing.thread_id != thread_id) continue;
+            existing.from_message_id = @min(existing.from_message_id, from_message_id);
+            return;
+        }
+        if (model.persistence_truncate_count == model.persistence_truncations.len) return;
+        model.persistence_truncations[model.persistence_truncate_count] = .{ .thread_id = thread_id, .from_message_id = from_message_id };
+        model.persistence_truncate_count += 1;
         model.persistence_meta_dirty = true;
     }
 
@@ -1087,6 +1263,8 @@ pub const Model = struct {
                     .id = thread.id,
                     .title = if (thread.sending)
                         std.fmt.allocPrint(arena, "{s} · responding", .{thread.title()}) catch thread.title()
+                    else if (thread.unread)
+                        std.fmt.allocPrint(arena, "{s} · new", .{thread.title()}) catch thread.title()
                     else
                         thread.title(),
                     .prefix = "    -",
@@ -1107,6 +1285,8 @@ pub const Model = struct {
                 .id = thread.id,
                 .title = if (thread.sending)
                     std.fmt.allocPrint(arena, "{s} · responding", .{thread.title()}) catch thread.title()
+                else if (thread.unread)
+                    std.fmt.allocPrint(arena, "{s} · new", .{thread.title()}) catch thread.title()
                 else
                     thread.title(),
                 .selected = thread.id == model.active_thread_id,
@@ -1230,10 +1410,6 @@ pub const Model = struct {
             rows[index] = .{ .index = @intCast(index), .label = entry.label(), .slug = entry.slug(), .favorite = entry.favorite, .favorite_label = if (entry.favorite) "Unfavorite" else "Favorite" };
         }
         return rows;
-    }
-
-    pub fn modelCatalogStatus(model: *const Model) []const u8 {
-        return model.model_catalog_status_storage[0..model.model_catalog_status_len];
     }
 
     fn setModelCatalogStatus(model: *Model, value: []const u8) void {
@@ -1400,11 +1576,6 @@ pub const Model = struct {
         return thread.has_older_messages and !thread.history_loading and thread.message_count > 0;
     }
 
-    pub fn historyLoading(model: *const Model) bool {
-        const thread = model.activeThreadConst() orelse return false;
-        return thread.history_loading;
-    }
-
     pub fn hasMessages(model: *const Model) bool {
         return model.messageRows().len > 0;
     }
@@ -1455,6 +1626,10 @@ pub const Model = struct {
     pub fn sending(model: *const Model) bool {
         const thread = model.activeThreadConst() orelse return false;
         return thread.sending;
+    }
+
+    pub fn cannotStop(model: *const Model) bool {
+        return !model.sending();
     }
 
     pub fn statusLine(model: *const Model, arena: std.mem.Allocator) []const u8 {
@@ -1895,6 +2070,7 @@ pub const Model = struct {
         if (thread.isArchived() or project.isArchived()) return false;
         model.active_project_id = thread.project_id;
         model.active_thread_id = thread.id;
+        thread.unread = false;
         return true;
     }
 
@@ -2109,6 +2285,73 @@ fn checkConnections(model: *Model, fx: *Effects) void {
 
 pub fn initEffects(model: *Model, fx: *Effects) void {
     checkConnections(model, fx);
+    checkUpdates(model, fx);
+}
+
+fn setUpdateStatus(model: *Model, value: []const u8) void {
+    const len = utf8PrefixLen(value, model.update_status_storage.len);
+    @memcpy(model.update_status_storage[0..len], value[0..len]);
+    model.update_status_len = len;
+}
+
+fn isNewerVersion(latest: []const u8, current: []const u8) ?bool {
+    const normalized = if (latest.len > 0 and (latest[0] == 'v' or latest[0] == 'V')) latest[1..] else latest;
+    const latest_version = std.SemanticVersion.parse(normalized) catch return null;
+    const current_version = std.SemanticVersion.parse(current) catch return null;
+    return latest_version.order(current_version) == .gt;
+}
+
+fn checkUpdates(model: *Model, fx: *Effects) void {
+    if (model.update_state == .checking) return;
+    const headers = [_]std.http.Header{
+        .{ .name = "Accept", .value = "application/vnd.github+json" },
+        .{ .name = "User-Agent", .value = "Superchat" },
+    };
+    fx.fetch(.{
+        .key = updates_request,
+        .method = .GET,
+        .url = updates_url,
+        .headers = &headers,
+        .timeout_ms = 12_000,
+        .on_response = Effects.responseMsg(.response),
+    });
+    model.update_state = .checking;
+    setUpdateStatus(model, "Checking for updates…");
+}
+
+fn receiveUpdateCheck(model: *Model, response: native_sdk.EffectResponse) void {
+    if (response.outcome != .ok or response.status < 200 or response.status >= 300 or response.truncated) {
+        model.update_state = .failed;
+        setUpdateStatus(model, "Could not check GitHub Releases right now");
+        return;
+    }
+    var parsed = std.json.parseFromSlice(UpdateRelease, model.allocator, response.body, .{ .ignore_unknown_fields = true }) catch {
+        model.update_state = .failed;
+        setUpdateStatus(model, "GitHub returned an unreadable release");
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value.tag_name.len == 0) {
+        model.update_state = .failed;
+        setUpdateStatus(model, "No published release found");
+        return;
+    }
+    const newer = isNewerVersion(parsed.value.tag_name, superchat_options.version) orelse {
+        model.update_state = .failed;
+        setUpdateStatus(model, "The latest GitHub tag is not a semantic version");
+        return;
+    };
+    model.update_state = if (newer) .available else .current;
+    if (model.update_state == .current) {
+        setUpdateStatus(model, "Superchat is up to date · " ++ superchat_options.version);
+        return;
+    }
+    const safe_url = if (std.mem.startsWith(u8, parsed.value.html_url, releases_url_prefix)) parsed.value.html_url else releases_url_prefix ++ "latest";
+    model.update_url_len = utf8PrefixLen(safe_url, model.update_url_storage.len);
+    @memcpy(model.update_url_storage[0..model.update_url_len], safe_url[0..model.update_url_len]);
+    var buffer: [120]u8 = undefined;
+    const status = std.fmt.bufPrint(&buffer, "Update {s} is available", .{parsed.value.tag_name}) catch "A Superchat update is available";
+    setUpdateStatus(model, status);
 }
 
 fn connectCodex(model: *Model, fx: *Effects) void {
@@ -2211,6 +2454,9 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, cmd_focus_composer)) return .focus_composer;
     if (std.mem.eql(u8, name, cmd_attach_files)) return .open_file_picker;
     if (std.mem.eql(u8, name, cmd_model_picker)) return .open_model_picker;
+    if (std.mem.eql(u8, name, cmd_search)) return .open_search;
+    if (std.mem.eql(u8, name, cmd_retry_latest)) return .retry_latest;
+    if (std.mem.eql(u8, name, cmd_stop)) return .stop;
     if (std.mem.eql(u8, name, cmd_auto_model)) return .select_auto_model;
     if (std.mem.eql(u8, name, cmd_codex_subscription)) return .{ .select_model = .codex_subscription };
     if (std.mem.eql(u8, name, cmd_top_level_chats)) return .select_top_level_chats;
@@ -2237,10 +2483,10 @@ fn attachmentKindForPath(path: []const u8) ?AttachmentKind {
         std.ascii.eqlIgnoreCase(extension, ".gif")) return .image;
     if (std.ascii.eqlIgnoreCase(extension, ".pdf")) return .pdf;
     const text_extensions = [_][]const u8{
-        ".txt", ".md", ".markdown", ".json", ".jsonl", ".csv", ".tsv", ".xml", ".yaml", ".yml",
-        ".html", ".css", ".js", ".jsx", ".ts", ".tsx", ".zig", ".py", ".rb", ".go", ".rs", ".java",
-        ".c", ".h", ".cpp", ".hpp", ".swift", ".kt", ".kts", ".sh", ".zsh", ".sql", ".toml", ".ini",
-        ".log", ".rtf",
+        ".txt",  ".md",   ".markdown", ".json", ".jsonl", ".csv", ".tsv",   ".xml", ".yaml", ".yml",
+        ".html", ".css",  ".js",       ".jsx",  ".ts",    ".tsx", ".zig",   ".py",  ".rb",   ".go",
+        ".rs",   ".java", ".c",        ".h",    ".cpp",   ".hpp", ".swift", ".kt",  ".kts",  ".sh",
+        ".zsh",  ".sql",  ".toml",     ".ini",  ".log",   ".rtf",
     };
     for (text_extensions) |candidate| if (std.ascii.eqlIgnoreCase(extension, candidate)) return .text;
     return null;
@@ -2343,6 +2589,27 @@ fn receiveAttachment(model: *Model, result: native_sdk.EffectFileResult, fx: *Ef
     model.showToast("Attachment added", fx);
 }
 
+fn closeSearch(model: *Model, fx: *Effects) void {
+    model.search_open = false;
+    model.search_buffer.clear();
+    model.search_generation +%= 1;
+    model.search_result_count = 0;
+    model.search_loading = false;
+    model.search_request_pending = false;
+    fx.cancelTimer(search_timer_key);
+}
+
+fn databaseReadPending(model: *const Model) bool {
+    if (model.search_loading) return true;
+    for (model.threads[0..model.thread_count]) |thread| if (thread.history_loading) return true;
+    return false;
+}
+
+fn pollDatabaseReads(model: *const Model, fx: *Effects) void {
+    if (!databaseReadPending(model)) return;
+    fx.startTimer(.{ .key = database_poll_key, .interval_ms = 50, .on_fire = Effects.timerMsg(.database_poll) });
+}
+
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
         .draft_edit => |edit| {
@@ -2402,6 +2669,54 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             fx.startTimer(.{ .key = model_search_timer, .interval_ms = 250, .on_fire = Effects.timerMsg(.model_search) });
         },
         .model_search => searchModels(model, fx),
+        .search_edit => |edit| {
+            model.search_buffer.apply(edit);
+            model.search_generation +%= 1;
+            model.search_result_count = 0;
+            model.search_loading = false;
+            fx.startTimer(.{ .key = search_timer_key, .interval_ms = 180, .on_fire = Effects.timerMsg(.search_timer) });
+        },
+        .search_timer => |timer| {
+            if (timer.key != search_timer_key) return;
+            const query = std.mem.trim(u8, model.search_buffer.text(), " \t\r\n");
+            if (query.len < 2) return;
+            model.search_request_pending = true;
+            model.search_loading = true;
+            pollDatabaseReads(model, fx);
+        },
+        .database_poll => |timer| {
+            if (timer.key != database_poll_key) return;
+            pollDatabaseReads(model, fx);
+        },
+        .open_search => {
+            model.model_picker_open = false;
+            model.settings_open = false;
+            model.fork_open = false;
+            model.rename_open = false;
+            model.archive_open = false;
+            model.search_open = true;
+        },
+        .close_search => closeSearch(model, fx),
+        .select_search_result => |index| {
+            if (index >= model.search_result_count) return;
+            const thread_id = model.search_results[index].thread_id;
+            if (model.activateThread(thread_id)) {
+                closeSearch(model, fx);
+                model.markMetaDirty();
+                model.showToast("Opened matching chat", fx);
+            }
+        },
+        .palette_action => |action| {
+            model.model_picker_open = false;
+            switch (action) {
+                .search => update(model, .open_search, fx),
+                .new_thread => update(model, .new_thread, fx),
+                .new_project_thread => update(model, .new_project_thread, fx),
+                .attach => update(model, .open_file_picker, fx),
+                .archive => update(model, .open_archive, fx),
+                .settings => update(model, .open_settings, fx),
+            }
+        },
         .toggle_model_picker => {
             model.model_picker_open = !model.model_picker_open;
             if (model.model_picker_open and model.model_catalog_count == 0) model.setModelCatalogStatus("Search OpenRouter by model or provider");
@@ -2442,6 +2757,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .open_settings => {
             model.model_picker_open = false;
+            closeSearch(model, fx);
             model.fork_open = false;
             model.rename_open = false;
             model.archive_open = false;
@@ -2513,7 +2829,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .create_forks => {
             const first_new_thread = model.thread_count;
             createForks(model, fx);
-            for (model.threads[first_new_thread..model.thread_count]) |thread| model.markMessagesDirty(thread.id);
+            for (model.threads[first_new_thread..model.thread_count]) |thread| model.markThreadMessagesDirty(thread.id);
         },
         .open_rename_thread => model.openRename(.thread),
         .open_rename_project => model.openRename(.project),
@@ -2542,6 +2858,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.purgeExpired(fx);
             model.markStructureDirty();
             model.model_picker_open = false;
+            closeSearch(model, fx);
             model.settings_open = false;
             model.fork_open = false;
             model.rename_open = false;
@@ -2658,6 +2975,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .focus_composer => model.focusComposer(),
         .open_model_picker => {
             model.settings_open = false;
+            closeSearch(model, fx);
             model.fork_open = false;
             model.rename_open = false;
             model.archive_open = false;
@@ -2672,6 +2990,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.rename_open = false;
             model.archive_open = false;
             model.model_picker_open = false;
+            closeSearch(model, fx);
             model.clear_confirm_thread_id = 0;
             model.clearApiKeyInput();
             model.fork_seed_buffer.clear();
@@ -2682,20 +3001,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (!thread.has_older_messages or thread.history_loading or thread.message_count == 0) return;
             thread.history_loading = true;
             model.history_request_thread_id = thread.id;
-            fx.startTimer(.{
-                .key = history_poll_key,
-                .interval_ms = 50,
-                .on_fire = Effects.timerMsg(.history_poll),
-            });
-        },
-        .history_poll => {
-            const thread = model.activeThread() orelse return;
-            if (!thread.history_loading) return;
-            fx.startTimer(.{
-                .key = history_poll_key,
-                .interval_ms = 50,
-                .on_fire = Effects.timerMsg(.history_poll),
-            });
+            pollDatabaseReads(model, fx);
         },
         .clear => {
             if (model.cannotClear()) return;
@@ -2729,17 +3035,26 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.showToast("Chat cleared", fx);
         },
         .send => submitDraft(model, fx),
+        .stop => stopActiveRequest(model, fx),
+        .edit_message => |message_id| editMessage(model, message_id, fx),
+        .retry_message => |message_id| retryMessage(model, message_id, fx),
+        .retry_latest => {
+            const message_id = model.latestAssistantMessageId() orelse return;
+            retryMessage(model, message_id, fx);
+        },
         .stream_line => |line| receiveStreamLine(model, line, fx),
         .harness_line => |line| receiveHarnessLine(model, line, fx),
         .harness_exit => |exit_event| {
             const thread_id = requestThreadId(exit_event.key) orelse return;
-            receiveHarnessExit(model, exit_event, fx);
-            model.markMessagesDirty(thread_id);
+            const completed = receiveHarnessExit(model, exit_event, fx);
+            if (completed) if (model.threadById(thread_id)) |thread| completeThreadResponse(model, thread);
+            markLatestAssistantDirty(model, thread_id);
         },
         .openrouter_exit => |exit_event| {
             const thread_id = requestThreadId(exit_event.key) orelse return;
-            receiveOpenRouterExit(model, exit_event, fx);
-            model.markMessagesDirty(thread_id);
+            const completed = receiveOpenRouterExit(model, exit_event, fx);
+            if (completed) if (model.threadById(thread_id)) |thread| completeThreadResponse(model, thread);
+            markLatestAssistantDirty(model, thread_id);
         },
         .connection_exit => |exit_event| receiveConnectionExit(model, exit_event),
         .stream_flush => |timer| {
@@ -2761,6 +3076,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.clear_confirm_thread_id = 0;
             }
         },
+        .toggle_notifications => {
+            model.notifications_enabled = !model.notifications_enabled;
+            model.markMetaDirty();
+        },
+        .check_updates => checkUpdates(model, fx),
+        .open_update => {
+            if (model.update_state == .available and model.update_url_len > 0) model.open_update_requested = true else checkUpdates(model, fx);
+        },
         .response => |response| {
             if (response.key == key_validation_request) {
                 receiveKeyValidation(model, response);
@@ -2770,9 +3093,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 receiveModels(model, response);
                 return;
             }
+            if (response.key == updates_request) {
+                receiveUpdateCheck(model, response);
+                return;
+            }
             const thread_id = requestThreadId(response.key) orelse return;
-            receive(model, response, fx);
-            model.markMessagesDirty(thread_id);
+            const completed = receive(model, response, fx);
+            if (completed) if (model.threadById(thread_id)) |thread| completeThreadResponse(model, thread);
+            markLatestAssistantDirty(model, thread_id);
         },
         .chrome_changed => |chrome| {
             model.chrome_leading = chrome.insets.left;
@@ -2780,6 +3108,85 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.header_height = @max(header_natural_height, chrome.insets.top);
         },
     }
+}
+
+fn stopActiveRequest(model: *Model, fx: *Effects) void {
+    const thread = model.activeThread() orelse return;
+    if (!thread.sending) return;
+    fx.cancel(requestKey(thread.id));
+    fx.cancel(requestBodyKey(thread.id));
+    thread.setStatus("Stopping…");
+}
+
+fn restoreUserMessageToDraft(model: *Model, thread: *Thread, user_index: usize) bool {
+    if (thread.sending or user_index >= thread.message_count or thread.messages[user_index].role != .user) return false;
+    const from_message_id = thread.messages[user_index].id;
+    for (thread.draft_attachments[0..thread.draft_attachment_count]) |*attachment| attachment.deinit(model.allocator);
+    thread.draft_attachment_count = 0;
+    thread.draft_buffer.set(thread.messages[user_index].content());
+    const attachment_count = thread.messages[user_index].attachment_count;
+    for (thread.messages[user_index].attachments[0..attachment_count], 0..) |attachment, index| {
+        thread.draft_attachments[index] = attachment;
+        thread.messages[user_index].attachments[index] = .{};
+    }
+    thread.draft_attachment_count = attachment_count;
+    thread.messages[user_index].attachment_count = 0;
+    for (thread.messages[user_index..thread.message_count]) |*message| message.deinit(model.allocator);
+    thread.message_count = user_index;
+    thread.stream_message_index = null;
+    thread.stream_pending_len = 0;
+    thread.stream_flush_scheduled = false;
+    thread.stream_failed = false;
+    thread.clearStatus();
+    model.markMessagesTruncated(thread.id, from_message_id);
+    return true;
+}
+
+fn editMessage(model: *Model, message_id: u32, fx: *Effects) void {
+    const thread = model.activeThread() orelse return;
+    for (thread.messages[0..thread.message_count], 0..) |message, index| {
+        if (message.id != message_id or message.role != .user) continue;
+        if (restoreUserMessageToDraft(model, thread, index)) {
+            model.focusComposer();
+            model.showToast("Message ready to edit", fx);
+        }
+        return;
+    }
+}
+
+fn retryMessage(model: *Model, assistant_message_id: u32, fx: *Effects) void {
+    const thread = model.activeThread() orelse return;
+    if (thread.sending) {
+        thread.setStatus("Stop the current response before retrying");
+        return;
+    }
+    var assistant_index: ?usize = null;
+    for (thread.messages[0..thread.message_count], 0..) |message, index| {
+        if (message.id == assistant_message_id and message.role == .assistant) assistant_index = index;
+    }
+    var index = assistant_index orelse return;
+    while (index > 0) {
+        index -= 1;
+        if (thread.messages[index].role != .user) continue;
+        if (!restoreUserMessageToDraft(model, thread, index)) return;
+        const before = model.next_message_id;
+        sendThread(model, thread, fx);
+        if (model.next_message_id != before) model.markMessageDirty(thread.id, before);
+        return;
+    }
+}
+
+fn completeThreadResponse(model: *Model, thread: *Thread) void {
+    if (thread.id == model.active_thread_id) return;
+    thread.unread = true;
+    if (model.notifications_enabled) model.pending_notification_thread_id = thread.id;
+}
+
+fn markLatestAssistantDirty(model: *Model, thread_id: u32) void {
+    const thread = model.threadByIdConst(thread_id) orelse return;
+    if (thread.message_count == 0) return;
+    const message = thread.messages[thread.message_count - 1];
+    if (message.role == .assistant) model.markMessageDirty(thread_id, message.id);
 }
 
 fn copyMessage(model: *Model, message_id: u32, fx: *Effects) void {
@@ -2926,7 +3333,7 @@ fn submitDraft(model: *Model, fx: *Effects) void {
     const thread_id = model.active_thread_id;
     const before = model.next_message_id;
     send(model, fx);
-    if (model.next_message_id != before) model.markMessagesDirty(thread_id);
+    if (model.next_message_id != before) model.markMessageDirty(thread_id, before);
 }
 
 fn searchModels(model: *Model, fx: *Effects) void {
@@ -3355,9 +3762,9 @@ fn receiveHarnessLine(model: *Model, line: native_sdk.EffectLine, fx: *Effects) 
     }
 }
 
-fn receiveHarnessExit(model: *Model, exit_event: native_sdk.EffectExit, fx: *Effects) void {
-    const thread_id = requestThreadId(exit_event.key) orelse return;
-    const thread = model.threadById(thread_id) orelse return;
+fn receiveHarnessExit(model: *Model, exit_event: native_sdk.EffectExit, fx: *Effects) bool {
+    const thread_id = requestThreadId(exit_event.key) orelse return false;
+    const thread = model.threadById(thread_id) orelse return false;
     const unavailable = exit_event.reason == .spawn_failed or exit_event.code == 127;
     const succeeded = exit_event.reason == .exited and exit_event.code == 0;
     if (exit_event.reason != .cancelled) switch (thread.model_choice) {
@@ -3375,33 +3782,34 @@ fn receiveHarnessExit(model: *Model, exit_event: native_sdk.EffectExit, fx: *Eff
     thread.stream_message_index = null;
     if (exit_event.reason == .cancelled) {
         thread.setStatus("Request cancelled");
-        return;
+        return false;
     }
     if (exit_event.dropped_lines > 0) {
         thread.stream_failed = true;
         thread.setStatus("Provider output was incomplete");
-        return;
+        return false;
     }
     if (exit_event.reason != .exited or exit_event.code != 0) {
-        if (thread.stream_failed) return;
+        if (thread.stream_failed) return false;
         thread.setStatus(switch (thread.model_choice) {
             .codex_subscription => if (unavailable) "Codex CLI not found; install Codex or the ChatGPT app" else "Codex request failed; reconnect it in Settings",
             .claude_subscription => if (unavailable) "Claude CLI not found; install it, then retry" else "Claude request failed; reconnect it in Settings",
             else => "Provider request failed",
         });
-        return;
+        return false;
     }
-    if (thread.stream_failed) return;
+    if (thread.stream_failed) return false;
     if (!received_content) {
         thread.setStatus("The provider returned no text");
-        return;
+        return false;
     }
     thread.clearStatus();
+    return true;
 }
 
-fn receiveOpenRouterExit(model: *Model, exit_event: native_sdk.EffectExit, fx: *Effects) void {
-    const thread_id = requestThreadId(exit_event.key) orelse return;
-    const thread = model.threadById(thread_id) orelse return;
+fn receiveOpenRouterExit(model: *Model, exit_event: native_sdk.EffectExit, fx: *Effects) bool {
+    const thread_id = requestThreadId(exit_event.key) orelse return false;
+    const thread = model.threadById(thread_id) orelse return false;
     thread.request_path_len = 0;
     if (thread.stream_flush_scheduled) fx.cancelTimer(streamFlushKey(thread.id));
     if (thread.stream_pending_len > 0 and !thread.flushStreamDelta(model.allocator, &model.next_message_id)) {
@@ -3411,38 +3819,39 @@ fn receiveOpenRouterExit(model: *Model, exit_event: native_sdk.EffectExit, fx: *
     const received_content = thread.stream_message_index != null;
     thread.sending = false;
     thread.stream_message_index = null;
-    if (thread.stream_failed) return;
+    if (thread.stream_failed) return false;
     if (exit_event.reason == .cancelled) {
         thread.setStatus("Request cancelled");
-        return;
+        return false;
     }
     if (exit_event.dropped_lines > 0) {
         thread.setStatus("OpenRouter output was incomplete");
-        return;
+        return false;
     }
     if (exit_event.reason != .exited or exit_event.code != 0) {
         thread.setStatus("OpenRouter could not complete the attachment request");
-        return;
+        return false;
     }
     if (!received_content) {
         thread.setStatus("OpenRouter returned no text");
-        return;
+        return false;
     }
     thread.clearStatus();
+    return true;
 }
 
-fn receive(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
-    const target_thread_id = requestThreadId(response.key) orelse return;
-    const thread = model.threadById(target_thread_id) orelse return;
+fn receive(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) bool {
+    const target_thread_id = requestThreadId(response.key) orelse return false;
+    const thread = model.threadById(target_thread_id) orelse return false;
     if (thread.stream_flush_scheduled) fx.cancelTimer(streamFlushKey(thread.id));
     if (thread.stream_pending_len > 0 and !thread.flushStreamDelta(model.allocator, &model.next_message_id)) {
         thread.stream_failed = true;
         thread.setStatus("Response exceeded the 64 KiB safety limit");
     }
-    receiveThread(thread, response);
+    return receiveThread(thread, response);
 }
 
-fn receiveThread(thread: *Thread, response: native_sdk.EffectResponse) void {
+fn receiveThread(thread: *Thread, response: native_sdk.EffectResponse) bool {
     thread.sending = false;
     const received_content = thread.stream_message_index != null;
     thread.stream_message_index = null;
@@ -3451,7 +3860,7 @@ fn receiveThread(thread: *Thread, response: native_sdk.EffectResponse) void {
         thread.setStatus("Streaming response was incomplete");
     }
     if (response.outcome != .ok) {
-        if (thread.stream_failed) return;
+        if (thread.stream_failed) return false;
         thread.setStatus(switch (response.outcome) {
             .rejected => "The request was rejected before it started",
             .connect_failed => "Could not connect to OpenRouter",
@@ -3461,10 +3870,10 @@ fn receiveThread(thread: *Thread, response: native_sdk.EffectResponse) void {
             .cancelled => "Request cancelled",
             .ok => unreachable,
         });
-        return;
+        return false;
     }
     if (response.status < 200 or response.status >= 300) {
-        if (thread.stream_failed) return;
+        if (thread.stream_failed) return false;
         const friendly = switch (response.status) {
             400 => "OpenRouter rejected this request; the model name or request may be invalid",
             401, 403 => "OpenRouter rejected the API key; reconnect it in Settings",
@@ -3477,19 +3886,20 @@ fn receiveThread(thread: *Thread, response: native_sdk.EffectResponse) void {
         };
         if (friendly.len > 0) {
             thread.setStatus(friendly);
-            return;
+            return false;
         }
         var status_buffer: [64]u8 = undefined;
         const text = std.fmt.bufPrint(&status_buffer, "OpenRouter returned HTTP {d}", .{response.status}) catch "OpenRouter request failed";
         thread.setStatus(text);
-        return;
+        return false;
     }
-    if (thread.stream_failed) return;
+    if (thread.stream_failed) return false;
     if (!received_content) {
         thread.setStatus("OpenRouter returned no text");
-        return;
+        return false;
     }
     thread.clearStatus();
+    return true;
 }
 
 pub fn onChrome(chrome: native_sdk.WindowChrome) ?Msg {
@@ -3586,16 +3996,51 @@ const SecureChatApp = struct {
                 }
             }
         }
+        if (self.chat.model.search_request_pending) {
+            self.chat.model.search_request_pending = false;
+            const query = std.mem.trim(u8, self.chat.model.search_buffer.text(), " \t\r\n");
+            if (query.len >= 2) {
+                var request = persistence.SearchRequest{
+                    .generation = self.chat.model.search_generation,
+                    .query_len = @min(query.len, persistence.max_search_query_bytes),
+                    .limit = max_search_results,
+                };
+                @memcpy(request.query[0..request.query_len], query[0..request.query_len]);
+                if (!self.persistence_worker.enqueue(.{ .search = request })) self.chat.model.search_loading = false;
+            }
+        }
+        if (self.persistence_worker.takeSearchResult()) |result_value| {
+            var result = result_value;
+            const model = &self.chat.model;
+            if (result.generation == model.search_generation) {
+                model.search_result_count = @min(result.page.hits.len, model.search_results.len);
+                for (result.page.hits[0..model.search_result_count], 0..) |hit, index| {
+                    var entry = SearchEntry{ .thread_id = hit.thread_id };
+                    entry.title_len = utf8PrefixLen(hit.title, entry.title_storage.len);
+                    @memcpy(entry.title_storage[0..entry.title_len], hit.title[0..entry.title_len]);
+                    entry.snippet_len = utf8PrefixLen(hit.snippet, entry.snippet_storage.len);
+                    @memcpy(entry.snippet_storage[0..entry.snippet_len], hit.snippet[0..entry.snippet_len]);
+                    model.search_results[index] = entry;
+                }
+                model.search_loading = false;
+            }
+            result.page.deinit(model.allocator);
+            if (self.chat.installed) try self.chat.rebuild(runtime, self.chat.canvas_window_id);
+        }
         if (self.chat.model.history_request_thread_id != 0) {
             const thread_id = self.chat.model.history_request_thread_id;
             self.chat.model.history_request_thread_id = 0;
             if (self.chat.model.threadByIdConst(thread_id)) |thread| {
                 if (thread.message_count > 0) {
-                    _ = self.persistence_worker.enqueue(.{ .load_history = .{
+                    const queued = self.persistence_worker.enqueue(.{ .load_history = .{
                         .thread_id = thread_id,
                         .before_id = thread.messages[0].id,
                         .limit = history_page_size,
                     } });
+                    if (!queued) {
+                        if (self.chat.model.threadById(thread_id)) |mutable_thread| mutable_thread.history_loading = false;
+                        self.chat.model.setStatus("Local history is busy; try again in a moment");
+                    }
                 }
             }
         }
@@ -3633,6 +4078,24 @@ const SecureChatApp = struct {
             }
             result.page.deinit(model.allocator);
             if (self.chat.installed) try self.chat.rebuild(runtime, self.chat.canvas_window_id);
+        }
+        if (self.chat.model.pending_notification_thread_id != 0) {
+            const thread_id = self.chat.model.pending_notification_thread_id;
+            self.chat.model.pending_notification_thread_id = 0;
+            if (self.chat.model.threadByIdConst(thread_id)) |thread| {
+                runtime.showNotification(.{
+                    .title = "Response ready",
+                    .subtitle = "Superchat",
+                    .body = thread.title(),
+                }) catch {};
+            }
+        }
+        if (self.chat.model.open_update_requested) {
+            self.chat.model.open_update_requested = false;
+            runtime.openExternalUrl(self.chat.model.update_url_storage[0..self.chat.model.update_url_len]) catch {
+                self.chat.model.setStatus("Could not open the GitHub release page");
+                if (self.chat.installed) try self.chat.rebuild(runtime, self.chat.canvas_window_id);
+            };
         }
         if (self.chat.model.model_catalog_dirty_mask != 0) {
             const now = self.chat.model.clock.wallMs();
@@ -3688,7 +4151,10 @@ const SecureChatApp = struct {
         self.flushPersistence();
         if (self.persistence_worker.hasFailed() and !self.persistence_error_shown) {
             self.persistence_error_shown = true;
-            self.chat.model.setStatus("Workspace changes could not be saved locally");
+            self.chat.model.search_loading = false;
+            self.chat.model.search_request_pending = false;
+            for (self.chat.model.threads[0..self.chat.model.thread_count]) |*thread| thread.history_loading = false;
+            self.chat.model.setStatus("The local database stopped responding");
             if (self.chat.installed) try self.chat.rebuild(runtime, self.chat.canvas_window_id);
         }
     }
@@ -3698,7 +4164,7 @@ const SecureChatApp = struct {
         for (self.chat.model.threads[0..self.chat.model.thread_count]) |*thread| {
             if (thread.stream_pending_len > 0) {
                 _ = thread.flushStreamDelta(self.chat.model.allocator, &self.chat.model.next_message_id);
-                self.chat.model.markMessagesDirty(thread.id);
+                markLatestAssistantDirty(&self.chat.model, thread.id);
             } else {
                 self.chat.model.markThreadDirty(thread.id);
             }
@@ -3709,35 +4175,43 @@ const SecureChatApp = struct {
         try self.inner.stop(runtime);
     }
 
+    fn enqueueDirtyMessages(self: *SecureChatApp, model: *const Model) void {
+        for (model.persistence_messages[0..model.persistence_message_count]) |dirty| {
+            const thread = model.threadByIdConst(dirty.thread_id) orelse continue;
+            for (thread.messages[0..thread.message_count]) |message| {
+                if (message.id != dirty.message_id) continue;
+                _ = self.persistence_worker.enqueueMessage(persistence.MessageRecord.from(thread.id, &message));
+                break;
+            }
+        }
+    }
+
     fn flushPersistence(self: *SecureChatApp) void {
         const model = &self.chat.model;
         var required: usize = 0;
         if (model.persistence_structure_dirty) {
-            required = model.project_count + model.thread_count + 2;
-            if (model.persistence_workspace_dirty) {
-                for (model.threads[0..model.thread_count]) |thread| required += thread.message_count;
-            }
+            required = model.persistence_truncate_count + model.project_count + model.thread_count + model.persistence_message_count + 2;
         } else {
-            required = model.persistence_clear_thread_count + model.persistence_thread_count + @intFromBool(model.persistence_meta_dirty);
-            for (model.persistence_message_thread_ids[0..model.persistence_message_thread_count]) |thread_id| {
-                const thread = model.threadByIdConst(thread_id) orelse continue;
-                required += thread.message_count;
-            }
+            required = model.persistence_truncate_count + model.persistence_clear_thread_count + model.persistence_thread_count + model.persistence_message_count + @intFromBool(model.persistence_meta_dirty);
         }
         if (required == 0 or !self.persistence_worker.canEnqueue(required)) return;
+
+        for (0..model.persistence_truncate_count) |index| {
+            const truncation = model.persistence_truncations[index];
+            _ = self.persistence_worker.enqueue(.{ .truncate_messages = .{
+                .thread_id = truncation.thread_id,
+                .from_message_id = truncation.from_message_id,
+            } });
+        }
 
         if (model.persistence_structure_dirty) {
             for (model.projects[0..model.project_count], 0..) |project, position| {
                 _ = self.persistence_worker.enqueue(.{ .upsert_project = persistence.ProjectRecord.from(&project, position) });
             }
             for (model.threads[0..model.thread_count], 0..) |thread, position| {
-                _ = self.persistence_worker.enqueue(.{ .upsert_thread = persistence.ThreadRecord.from(&thread, position) });
-                if (model.persistence_workspace_dirty) {
-                    for (thread.messages[0..thread.message_count]) |message| {
-                        _ = self.persistence_worker.enqueue(.{ .upsert_message = persistence.MessageRecord.from(thread.id, &message) });
-                    }
-                }
+                _ = self.persistence_worker.enqueueThread(persistence.ThreadRecord.from(&thread, position));
             }
+            self.enqueueDirtyMessages(model);
             var reconcile = persistence.ReconcileRecord{};
             for (model.projects[0..model.project_count]) |project| {
                 reconcile.project_ids[reconcile.project_count] = project.id;
@@ -3747,7 +4221,7 @@ const SecureChatApp = struct {
                 reconcile.thread_ids[reconcile.thread_count] = thread.id;
                 reconcile.thread_count += 1;
             }
-            _ = self.persistence_worker.enqueue(.{ .reconcile = reconcile });
+            _ = self.persistence_worker.enqueueReconcile(reconcile);
         } else {
             for (model.persistence_clear_thread_ids[0..model.persistence_clear_thread_count]) |thread_id| {
                 _ = self.persistence_worker.enqueue(.{ .clear_messages = thread_id });
@@ -3755,16 +4229,11 @@ const SecureChatApp = struct {
             for (model.persistence_thread_ids[0..model.persistence_thread_count]) |thread_id| {
                 for (model.threads[0..model.thread_count], 0..) |thread, position| {
                     if (thread.id != thread_id) continue;
-                    _ = self.persistence_worker.enqueue(.{ .upsert_thread = persistence.ThreadRecord.from(&thread, position) });
+                    _ = self.persistence_worker.enqueueThread(persistence.ThreadRecord.from(&thread, position));
                     break;
                 }
             }
-            for (model.persistence_message_thread_ids[0..model.persistence_message_thread_count]) |thread_id| {
-                const thread = model.threadByIdConst(thread_id) orelse continue;
-                for (thread.messages[0..thread.message_count]) |message| {
-                    _ = self.persistence_worker.enqueue(.{ .upsert_message = persistence.MessageRecord.from(thread.id, &message) });
-                }
-            }
+            self.enqueueDirtyMessages(model);
         }
         if (model.persistence_meta_dirty) {
             _ = self.persistence_worker.enqueue(.{ .meta = .{
@@ -3773,14 +4242,15 @@ const SecureChatApp = struct {
                 .next_project_id = model.next_project_id,
                 .next_thread_id = model.next_thread_id,
                 .next_message_id = model.next_message_id,
+                .notifications_enabled = model.notifications_enabled,
             } });
         }
-        model.persistence_workspace_dirty = false;
         model.persistence_structure_dirty = false;
         model.persistence_meta_dirty = false;
         model.persistence_thread_count = 0;
-        model.persistence_message_thread_count = 0;
+        model.persistence_message_count = 0;
         model.persistence_clear_thread_count = 0;
+        model.persistence_truncate_count = 0;
     }
 };
 
@@ -3844,8 +4314,6 @@ pub fn main(init: std.process.Init) !void {
     const persistence_worker = try persistence.Worker.create(std.heap.page_allocator, database, init.io);
     database_owned = false;
     var secure_app = SecureChatApp{ .inner = app_state.app(), .chat = app_state, .persistence_worker = persistence_worker };
-    app_state.model.markWorkspaceDirty();
-    secure_app.flushPersistence();
 
     try runner.runWithOptions(secure_app.app(), .{
         .app_name = "superchat",
@@ -3857,7 +4325,10 @@ pub fn main(init: std.process.Init) !void {
         .js_window_api = false,
         .security = .{
             .permissions = &app_permissions,
-            .navigation = .{ .allowed_origins = &.{ "zero://inline", "zero://app" } },
+            .navigation = .{
+                .allowed_origins = &.{ "zero://inline", "zero://app" },
+                .external_links = .{ .action = .open_system_browser, .allowed_urls = &allowed_external_urls },
+            },
         },
     }, init);
 }

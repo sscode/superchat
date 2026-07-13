@@ -44,6 +44,26 @@ pub const HistoryPage = struct {
     }
 };
 
+pub const SearchHit = struct {
+    thread_id: u32,
+    message_id: u32,
+    title: []u8,
+    snippet: []u8,
+};
+
+pub const SearchPage = struct {
+    hits: []SearchHit,
+
+    pub fn deinit(page: *SearchPage, allocator: std.mem.Allocator) void {
+        for (page.hits) |hit| {
+            allocator.free(hit.title);
+            allocator.free(hit.snippet);
+        }
+        if (page.hits.len > 0) allocator.free(page.hits);
+        page.hits = &.{};
+    }
+};
+
 pub const Database = struct {
     handle: *c.sqlite3,
 
@@ -118,6 +138,10 @@ pub const Database = struct {
             \\  label TEXT NOT NULL,
             \\  favorite INTEGER NOT NULL DEFAULT 0,
             \\  updated_at_ms INTEGER NOT NULL DEFAULT 0
+            \\);
+            \\CREATE TABLE IF NOT EXISTS app_preferences (
+            \\  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            \\  notifications_enabled INTEGER NOT NULL DEFAULT 1
             \\);
             \\CREATE TABLE IF NOT EXISTS attachments (
             \\  thread_id INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
@@ -269,6 +293,47 @@ pub const Database = struct {
         return .{ .messages = try messages.toOwnedSlice(allocator), .has_more = has_more };
     }
 
+    pub fn search(database: *Database, allocator: std.mem.Allocator, query: []const u8, limit: usize) (Error || std.mem.Allocator.Error)!SearchPage {
+        const statement = try database.prepare(
+            "SELECT thread_id,message_id,title,snippet FROM (" ++
+                "SELECT t.id AS thread_id,m.id AS message_id,t.title AS title,substr(replace(m.content,char(10),' '),1,180) AS snippet " ++
+                "FROM messages AS m JOIN threads AS t ON t.id=m.thread_id JOIN projects AS p ON p.id=t.project_id " ++
+                "WHERE t.archived_at_ms=0 AND p.archived_at_ms=0 AND instr(lower(m.content),lower(?1))>0 " ++
+                "UNION ALL " ++
+                "SELECT t.id AS thread_id,0 AS message_id,t.title AS title,'Chat title' AS snippet " ++
+                "FROM threads AS t JOIN projects AS p ON p.id=t.project_id " ++
+                "WHERE t.archived_at_ms=0 AND p.archived_at_ms=0 AND instr(lower(t.title),lower(?1))>0" ++
+                ") ORDER BY message_id DESC LIMIT ?2;",
+        );
+        defer _ = c.sqlite3_finalize(statement);
+        try bindText(statement, 1, query);
+        try bindInt(statement, 2, limit);
+        var hits: std.ArrayList(SearchHit) = .empty;
+        errdefer {
+            for (hits.items) |hit| {
+                allocator.free(hit.title);
+                allocator.free(hit.snippet);
+            }
+            hits.deinit(allocator);
+        }
+        while (true) {
+            const result = c.sqlite3_step(statement);
+            if (result == c.SQLITE_DONE) break;
+            if (result != c.SQLITE_ROW) return error.SqlFailed;
+            const title = try allocator.dupe(u8, textColumn(statement, 2));
+            errdefer allocator.free(title);
+            const snippet = try allocator.dupe(u8, textColumn(statement, 3));
+            errdefer allocator.free(snippet);
+            try hits.append(allocator, .{
+                .thread_id = intColumn(u32, statement, 0),
+                .message_id = intColumn(u32, statement, 1),
+                .title = title,
+                .snippet = snippet,
+            });
+        }
+        return .{ .hits = try hits.toOwnedSlice(allocator) };
+    }
+
     pub fn begin(database: *Database) Error!void {
         try database.exec("BEGIN IMMEDIATE;");
     }
@@ -369,6 +434,19 @@ pub const Database = struct {
         try stepDone(statement);
     }
 
+    pub fn truncateMessages(database: *Database, thread_id: u32, from_message_id: u32) Error!void {
+        const attachments = try database.prepare("DELETE FROM attachments WHERE thread_id=?1 AND message_id>=?2;");
+        defer _ = c.sqlite3_finalize(attachments);
+        try bindInt(attachments, 1, thread_id);
+        try bindInt(attachments, 2, from_message_id);
+        try stepDone(attachments);
+        const messages = try database.prepare("DELETE FROM messages WHERE thread_id=?1 AND id>=?2;");
+        defer _ = c.sqlite3_finalize(messages);
+        try bindInt(messages, 1, thread_id);
+        try bindInt(messages, 2, from_message_id);
+        try stepDone(messages);
+    }
+
     pub fn saveMeta(database: *Database, active_project_id: u32, active_thread_id: u32, next_project_id: u32, next_thread_id: u32, next_message_id: u32) Error!void {
         const statement = try database.prepare(
             "INSERT INTO workspace_meta(singleton,active_project_id,active_thread_id,next_project_id,next_thread_id,next_message_id) VALUES(1,?1,?2,?3,?4,?5) " ++
@@ -380,6 +458,16 @@ pub const Database = struct {
         try bindInt(statement, 3, next_project_id);
         try bindInt(statement, 4, next_thread_id);
         try bindInt(statement, 5, next_message_id);
+        try stepDone(statement);
+    }
+
+    pub fn savePreferences(database: *Database, notifications_enabled: bool) Error!void {
+        const statement = try database.prepare(
+            "INSERT INTO app_preferences(singleton,notifications_enabled) VALUES(1,?1) " ++
+                "ON CONFLICT(singleton) DO UPDATE SET notifications_enabled=excluded.notifications_enabled;",
+        );
+        defer _ = c.sqlite3_finalize(statement);
+        try bindInt(statement, 1, @intFromBool(notifications_enabled));
         try stepDone(statement);
     }
 
@@ -480,6 +568,7 @@ pub const Database = struct {
         try bindInt(meta, 4, model.next_thread_id);
         try bindInt(meta, 5, model.next_message_id);
         try stepDone(meta);
+        try database.savePreferences(model.notifications_enabled);
         try database.exec("COMMIT;");
     }
 
@@ -604,6 +693,9 @@ pub const Database = struct {
             model.next_thread_id = intColumn(u32, meta, 3);
             model.next_message_id = intColumn(u32, meta, 4);
         }
+        const preferences = try database.prepare("SELECT notifications_enabled FROM app_preferences WHERE singleton=1;");
+        defer _ = c.sqlite3_finalize(preferences);
+        if (c.sqlite3_step(preferences) == c.SQLITE_ROW) model.notifications_enabled = c.sqlite3_column_int(preferences, 0) != 0;
         return true;
     }
 

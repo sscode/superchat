@@ -12,6 +12,7 @@ pub const max_attachment_name_bytes = 128;
 pub const max_projects = 4096;
 pub const max_threads = 4096;
 pub const max_visible_messages = 50;
+pub const max_search_query_bytes = 160;
 const queue_capacity = 512;
 
 pub const ProjectRecord = struct {
@@ -102,6 +103,7 @@ pub const MetaRecord = struct {
     next_project_id: u32,
     next_thread_id: u32,
     next_message_id: u32,
+    notifications_enabled: bool,
 };
 
 pub const CachedModelRecord = struct {
@@ -127,21 +129,40 @@ pub const ReconcileRecord = struct {
     thread_count: usize = 0,
 };
 
+pub const TruncateMessages = struct {
+    thread_id: u32,
+    from_message_id: u32,
+};
+
+pub const SearchRequest = struct {
+    generation: u32,
+    query: [max_search_query_bytes]u8 = undefined,
+    query_len: usize,
+    limit: usize,
+};
+
 pub const Command = union(enum) {
     upsert_project: ProjectRecord,
-    upsert_thread: ThreadRecord,
-    upsert_message: MessageRecord,
+    upsert_thread: *ThreadRecord,
+    upsert_message: *MessageRecord,
     clear_messages: u32,
-    reconcile: ReconcileRecord,
+    truncate_messages: TruncateMessages,
+    reconcile: *ReconcileRecord,
     meta: MetaRecord,
     purge_expired: i64,
     load_history: struct { thread_id: u32, before_id: u32, limit: usize },
+    search: SearchRequest,
     upsert_cached_model: CachedModelRecord,
 };
 
 pub const HistoryResult = struct {
     thread_id: u32,
     page: storage.HistoryPage,
+};
+
+pub const SearchResult = struct {
+    generation: u32,
+    page: storage.SearchPage,
 };
 
 const SpinMutex = struct {
@@ -169,6 +190,7 @@ pub const Worker = struct {
     wake: std.Io.Event = .unset,
     thread: ?std.Thread = null,
     history_result: ?HistoryResult = null,
+    search_result: ?SearchResult = null,
 
     pub fn create(allocator: std.mem.Allocator, database: storage.Database, io: std.Io) !*Worker {
         const worker = try allocator.create(Worker);
@@ -186,6 +208,30 @@ pub const Worker = struct {
         worker.count += 1;
         worker.wake.set(worker.io);
         return true;
+    }
+
+    pub fn enqueueMessage(worker: *Worker, record: MessageRecord) bool {
+        return worker.enqueueOwned(record, .upsert_message);
+    }
+
+    pub fn enqueueThread(worker: *Worker, record: ThreadRecord) bool {
+        return worker.enqueueOwned(record, .upsert_thread);
+    }
+
+    pub fn enqueueReconcile(worker: *Worker, record: ReconcileRecord) bool {
+        return worker.enqueueOwned(record, .reconcile);
+    }
+
+    fn enqueueOwned(worker: *Worker, record: anytype, comptime tag: std.meta.Tag(Command)) bool {
+        const Record = @TypeOf(record);
+        const owned = worker.allocator.create(Record) catch {
+            worker.failed.store(true, .release);
+            return false;
+        };
+        owned.* = record;
+        if (worker.enqueue(@unionInit(Command, @tagName(tag), owned))) return true;
+        worker.allocator.destroy(owned);
+        return false;
     }
 
     pub fn canEnqueue(worker: *Worker, command_count: usize) bool {
@@ -206,11 +252,20 @@ pub const Worker = struct {
         return result;
     }
 
+    pub fn takeSearchResult(worker: *Worker) ?SearchResult {
+        worker.mutex.lock();
+        defer worker.mutex.unlock();
+        const result = worker.search_result;
+        worker.search_result = null;
+        return result;
+    }
+
     pub fn stopAndDestroy(worker: *Worker) void {
         worker.stopping.store(true, .release);
         worker.wake.set(worker.io);
         if (worker.thread) |thread| thread.join();
         if (worker.history_result) |*result| result.page.deinit(worker.allocator);
+        if (worker.search_result) |*result| result.page.deinit(worker.allocator);
         worker.database.close();
         const allocator = worker.allocator;
         allocator.destroy(worker);
@@ -241,7 +296,12 @@ pub const Worker = struct {
                 worker.wake.waitUncancelable(worker.io);
                 continue;
             };
+            if (isReadCommand(first)) {
+                worker.apply(first) catch worker.failed.store(true, .release);
+                continue;
+            }
             worker.database.begin() catch {
+                worker.deinitCommand(first);
                 worker.failed.store(true, .release);
                 continue;
             };
@@ -271,6 +331,7 @@ pub const Worker = struct {
         switch (command) {
             .upsert_project => |record| try worker.database.upsertProject(record.id, record.name[0..record.name_len], record.archived_at_ms, record.position),
             .upsert_thread => |record| {
+                defer worker.allocator.destroy(record);
                 try worker.database.upsertThread(
                     record.id,
                     record.project_id,
@@ -285,12 +346,20 @@ pub const Worker = struct {
                 try worker.database.replaceAttachments(record.id, 0, record.attachments[0..record.attachment_count]);
             },
             .upsert_message => |record| {
+                defer worker.allocator.destroy(record);
                 try worker.database.upsertMessage(record.id, record.thread_id, record.role, record.content[0..record.content_len]);
                 try worker.database.replaceAttachments(record.thread_id, record.id, record.attachments[0..record.attachment_count]);
             },
             .clear_messages => |thread_id| try worker.database.clearMessages(thread_id),
-            .reconcile => |record| try worker.database.reconcile(record.project_ids[0..record.project_count], record.thread_ids[0..record.thread_count]),
-            .meta => |record| try worker.database.saveMeta(record.active_project_id, record.active_thread_id, record.next_project_id, record.next_thread_id, record.next_message_id),
+            .truncate_messages => |request| try worker.database.truncateMessages(request.thread_id, request.from_message_id),
+            .reconcile => |record| {
+                defer worker.allocator.destroy(record);
+                try worker.database.reconcile(record.project_ids[0..record.project_count], record.thread_ids[0..record.thread_count]);
+            },
+            .meta => |record| {
+                try worker.database.saveMeta(record.active_project_id, record.active_thread_id, record.next_project_id, record.next_thread_id, record.next_message_id);
+                try worker.database.savePreferences(record.notifications_enabled);
+            },
             .purge_expired => |cutoff_ms| try worker.database.purgeExpired(cutoff_ms),
             .load_history => |request| {
                 const page = try worker.database.loadHistoryBefore(worker.allocator, request.thread_id, request.before_id, request.limit);
@@ -298,6 +367,13 @@ pub const Worker = struct {
                 defer worker.mutex.unlock();
                 if (worker.history_result) |*previous| previous.page.deinit(worker.allocator);
                 worker.history_result = .{ .thread_id = request.thread_id, .page = page };
+            },
+            .search => |request| {
+                const page = try worker.database.search(worker.allocator, request.query[0..request.query_len], request.limit);
+                worker.mutex.lock();
+                defer worker.mutex.unlock();
+                if (worker.search_result) |*previous| previous.page.deinit(worker.allocator);
+                worker.search_result = .{ .generation = request.generation, .page = page };
             },
             .upsert_cached_model => |record| try worker.database.upsertCachedModel(
                 record.slug[0..record.slug_len],
@@ -307,7 +383,23 @@ pub const Worker = struct {
             ),
         }
     }
+
+    fn deinitCommand(worker: *Worker, command: Command) void {
+        switch (command) {
+            .upsert_thread => |record| worker.allocator.destroy(record),
+            .upsert_message => |record| worker.allocator.destroy(record),
+            .reconcile => |record| worker.allocator.destroy(record),
+            else => {},
+        }
+    }
 };
+
+fn isReadCommand(command: Command) bool {
+    return switch (command) {
+        .load_history, .search => true,
+        else => false,
+    };
+}
 
 fn copyText(destination: []u8, source: []const u8) usize {
     const len = @min(destination.len, source.len);

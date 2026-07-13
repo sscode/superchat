@@ -801,6 +801,7 @@ test "SQLite restores the workspace after reopening and purges expired archives"
     const model = try testing.allocator.create(main.Model);
     defer testing.allocator.destroy(model);
     model.* = main.initialModelWithClock("test-key", test_clock.clock());
+    model.notifications_enabled = false;
     var fx = main.Effects.init(testing.allocator);
     defer fx.deinit();
     fx.executor = .fake;
@@ -844,6 +845,7 @@ test "SQLite restores the workspace after reopening and purges expired archives"
         try testing.expectEqual(main.ModelChoice.gemini, thread.model_choice);
         try testing.expectEqual(@as(usize, 2), thread.message_count);
         try testing.expectEqualStrings("Stored locally in SQLite.", thread.messages[1].content());
+        try testing.expect(!restored.notifications_enabled);
         try testing.expect(projectWithId(restored, archived_project_id).isArchived());
 
         // At exactly 30 days, the archived project and its chats cascade away.
@@ -915,12 +917,16 @@ test "background persistence worker owns and flushes SQLite writes" {
 
     try testing.expect(model.appendMessage(.user, "written off the UI thread"));
     const thread = threadWithId(&model, thread_id);
-    try testing.expect(worker.enqueue(.{ .upsert_message = persistence.MessageRecord.from(thread_id, &thread.messages[0]) }));
+    try testing.expect(worker.enqueueMessage(persistence.MessageRecord.from(thread_id, &thread.messages[0])));
     worker.stopAndDestroy();
 
     var reopened = try main.workspace_storage.Database.open(path);
     defer reopened.close();
     try testing.expectEqual(@as(usize, 1), try reopened.messageCount(thread_id));
+}
+
+test "background persistence commands stay compact" {
+    try testing.expect(@sizeOf(persistence.Command) < 1024);
 }
 
 test "draft persistence is debounced per thread" {
@@ -937,6 +943,135 @@ test "draft persistence is debounced per thread" {
     main.update(&model, .{ .persist_draft = .{ .key = timer.key } }, &fx);
     try testing.expectEqual(@as(usize, 1), model.persistence_thread_count);
     try testing.expectEqual(model.active_thread_id, model.persistence_thread_ids[0]);
+}
+
+test "sending dirties only the new message in a long chat" {
+    var model = main.initialModel("test-key");
+    defer model.deinit();
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    for (0..200) |index| {
+        const role: main.Role = if (index % 2 == 0) .user else .assistant;
+        try testing.expect(model.appendMessage(role, "Existing history"));
+    }
+    const new_message_id = model.next_message_id;
+    activeThread(&model).draft_buffer.set("Persist only this turn");
+    main.update(&model, .send, &fx);
+    try testing.expectEqual(@as(usize, 1), model.persistence_message_count);
+    try testing.expectEqual(new_message_id, model.persistence_messages[0].message_id);
+}
+
+test "database polling follows history work across navigation" {
+    var model = main.initialModel("test-key");
+    defer model.deinit();
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    try testing.expect(model.appendMessage(.user, "Newest loaded message"));
+    const loading_thread_id = model.active_thread_id;
+    activeThread(&model).has_older_messages = true;
+    main.update(&model, .load_older, &fx);
+    const poll = fx.pendingTimerAt(0) orelse return error.TestExpectedTimer;
+    try testing.expectEqual(@as(u64, 1 << 52), poll.key);
+
+    main.update(&model, .new_thread, &fx);
+    main.update(&model, .{ .database_poll = .{ .key = poll.key } }, &fx);
+    try testing.expect(threadWithId(&model, loading_thread_id).history_loading);
+    try testing.expectEqual(@as(usize, 1), fx.pendingTimerCount());
+}
+
+test "edit and retry safely rewrite a transcript from the selected turn" {
+    var model = main.initialModel("test-key");
+    defer model.deinit();
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    try testing.expect(model.appendMessage(.user, "First question"));
+    try testing.expect(model.appendMessage(.assistant, "First answer"));
+    try testing.expect(model.appendMessage(.user, "Follow-up"));
+    try testing.expect(model.appendMessage(.assistant, "Second answer"));
+    const thread = activeThread(&model);
+    const follow_up_id = thread.messages[2].id;
+    main.update(&model, .{ .edit_message = follow_up_id }, &fx);
+    try testing.expectEqualStrings("Follow-up", thread.draft());
+    try testing.expectEqual(@as(usize, 2), thread.message_count);
+    try testing.expectEqual(@as(usize, 1), model.persistence_truncate_count);
+    try testing.expectEqual(follow_up_id, model.persistence_truncations[0].from_message_id);
+
+    thread.draft_buffer.set("Edited follow-up");
+    main.update(&model, .send, &fx);
+    const edited_user_id = thread.messages[2].id;
+    streamLine(&model, &fx, 1001, "data: {\"choices\":[{\"delta\":{\"content\":\"Edited answer\"}}]}");
+    main.update(&model, .{ .response = .{ .key = 1001, .status = 200 } }, &fx);
+    const answer_id = thread.messages[3].id;
+    main.update(&model, .{ .retry_message = answer_id }, &fx);
+    try testing.expect(thread.sending);
+    try testing.expectEqual(@as(usize, 3), thread.message_count);
+    try testing.expect(thread.messages[2].id != edited_user_id);
+    try testing.expectEqualStrings("Edited follow-up", thread.messages[2].content());
+}
+
+test "background completions become unread until their chat is opened" {
+    var model = main.initialModel("test-key");
+    defer model.deinit();
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    const background_id = model.active_thread_id;
+    activeThread(&model).draft_buffer.set("Work in the background");
+    main.update(&model, .send, &fx);
+    main.update(&model, .new_thread, &fx);
+    streamLine(&model, &fx, 1000 + background_id, "data: {\"choices\":[{\"delta\":{\"content\":\"Finished\"}}]}");
+    main.update(&model, .{ .response = .{ .key = 1000 + background_id, .status = 200 } }, &fx);
+    try testing.expect(threadWithId(&model, background_id).unread);
+    try testing.expectEqual(background_id, model.pending_notification_thread_id);
+
+    main.update(&model, .{ .select_thread = background_id }, &fx);
+    try testing.expect(!threadWithId(&model, background_id).unread);
+}
+
+test "SQLite search covers messages outside the hydrated UI window" {
+    const path = "/tmp/superchat-search.sqlite3";
+    removeTestDatabase(path);
+    defer removeTestDatabase(path);
+    var model = main.initialModel("");
+    defer model.deinit();
+    var database = try main.workspace_storage.Database.open(path);
+    defer database.close();
+    try database.save(&model);
+    try database.upsertMessage(900, model.active_thread_id, @intFromEnum(main.Role.user), "A uniquely searchable archived thought");
+    var page = try database.search(testing.allocator, "uniquely searchable", 10);
+    defer page.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), page.hits.len);
+    try testing.expectEqual(model.active_thread_id, page.hits[0].thread_id);
+    try testing.expect(std.mem.indexOf(u8, page.hits[0].snippet, "uniquely searchable") != null);
+    var literal = try database.search(testing.allocator, "%_", 10);
+    defer literal.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), literal.hits.len);
+}
+
+test "GitHub release responses expose a newer version in Settings" {
+    var model = main.initialModel("");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    main.update(&model, .{ .response = .{
+        .key = (1 << 61) + 6,
+        .status = 200,
+        .body = "{\"tag_name\":\"v0.2.0\",\"html_url\":\"https://github.com/sscode/superchat/releases/tag/v0.2.0\"}",
+    } }, &fx);
+    try testing.expectEqual(main.UpdateState.available, model.update_state);
+    try testing.expectEqualStrings("https://github.com/sscode/superchat/releases/tag/v0.2.0", model.update_url_storage[0..model.update_url_len]);
+    main.update(&model, .{ .response = .{
+        .key = (1 << 61) + 6,
+        .status = 200,
+        .body = "{\"tag_name\":\"latest\",\"html_url\":\"https://github.com/sscode/superchat/releases/latest\"}",
+    } }, &fx);
+    try testing.expectEqual(main.UpdateState.failed, model.update_state);
 }
 
 test "background responses return to their owning thread while navigation stays live" {

@@ -6,7 +6,7 @@
     .version = "0.1.0",
     .icons = .{"assets/icon.png"},
     .platforms = .{"macos"},
-    .permissions = .{ "command", "view", "network", "credentials", "clipboard", "filesystem", "dialog" },
+    .permissions = .{ "command", "view", "network", "credentials", "clipboard", "filesystem", "dialog", "notifications" },
     .capabilities = .{ "native_views", "gpu_surfaces", "shortcuts", "file_drops" },
     .shortcuts = .{
         .{ .id = "workspace.new-thread", .key = "n", .modifiers = .{"primary"} },
@@ -19,6 +19,9 @@
         .{ .id = "workspace.focus-composer", .key = "l", .modifiers = .{"primary"} },
         .{ .id = "workspace.attach-files", .key = "u", .modifiers = .{"primary"} },
         .{ .id = "workspace.model-picker", .key = "k", .modifiers = .{"primary"} },
+        .{ .id = "workspace.search", .key = "f", .modifiers = .{"primary"} },
+        .{ .id = "workspace.retry-latest", .key = "t", .modifiers = .{ "primary", "shift" } },
+        .{ .id = "workspace.stop", .key = ".", .modifiers = .{"primary"} },
         .{ .id = "workspace.top-level-chats", .key = "0", .modifiers = .{"primary"} },
         .{ .id = "workspace.project-1", .key = "1", .modifiers = .{"primary"} },
         .{ .id = "workspace.project-2", .key = "2", .modifiers = .{"primary"} },
@@ -82,7 +85,7 @@
     .security = .{
         .navigation = .{
             .allowed_origins = .{ "zero://app", "zero://inline" },
-            .external_links = .{ .action = "deny" },
+            .external_links = .{ .action = "open_system_browser", .allowed_urls = .{"https://github.com/sscode/superchat/releases/*"} },
         },
     },
     .web_engine = "system",
