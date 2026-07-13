@@ -2,12 +2,10 @@
 <stack>
   <column background="background">
     <row height="{header_height}" padding="12" gap="10" cross="center" background="surface" label="Superchat toolbar">
-      <spacer width="{chrome_leading}" />
       <text size="heading">{brandLabel}</text>
       <spacer grow="1" />
       <select size="sm" width="210" on-press="toggle_model_picker" label="Model selector">{selectedModelLabel}</select>
       <button size="sm" variant="ghost" icon="trash" on-press="clear" disabled="{cannotClear}" label="{clearButtonLabel}"></button>
-      <spacer width="{chrome_trailing}" />
     </row>
     <row grow="1">
       <column width="226" background="surface">
@@ -64,7 +62,7 @@
                       <markdown source="{m.content}" />
                     </bubble>
                     <row gap="4">
-                      <button size="sm" variant="ghost" icon="copy" on-press="copy_message:{m.id}" label="Copy full response">Copy</button>
+                      <button size="sm" variant="ghost" icon="copy" on-press="copy_message:{m.id}" label="Copy full response">{m.responseActionLabel}</button>
                       <button variant="ghost" on-press="retry_message:{m.id}">Retry</button>
                       <button size="sm" variant="ghost" icon="git-branch" on-press="open_fork:{m.id}" label="Fork from this response">Fork</button>
                     </row>
@@ -99,26 +97,47 @@
   </column>
 
   <if test="{model_picker_open}">
-    <panel background="scrim" on-press="close_model_picker" label="Model picker backdrop">
+    <panel background="scrim" on-press="close_overlay" label="Command palette backdrop">
       <column main="center" cross="center">
-        <dialog width="620" height="440" label="Choose a model">
+        <dialog width="680" height="440" label="Command palette">
           <column padding="20" gap="10">
-            <text size="heading">Command palette</text>
-            <grid columns="2">
-              <for each="paletteActionRows" as="a">
-                <button variant="ghost" on-press="palette_action:{a.id}">{a.label} · {a.shortcut}</button>
-              </for>
-            </grid>
-            <grid columns="3" gap="6">
-              <for each="quickModels" as="q">
-                <button variant="outline" on-press="select_quick_model:{q.number}" label="{q.slug}">{q.number} · {q.label}</button>
-              </for>
-              <button variant="outline" on-press="select_codex_subscription">Codex · ChatGPT</button>
-              <button variant="outline" on-press="select_claude_subscription" disabled="{claudeSubscriptionDisabled}">Claude · Experimental</button>
-            </grid>
-            <text-field text="{modelSearch}" on-input="model_search_edit" placeholder="Search models or providers…" autofocus="true" label="Search OpenRouter models" />
-            <scroll grow="1" label="OpenRouter model results">
-              <column gap="4">
+            <if test="{search_open}">
+              <text-field text="{searchText}" on-input="search_edit" placeholder="Search every chat…" autofocus="true" />
+              <scroll grow="1" label="Search results">
+                <for each="searchRows" key="index" as="r">
+                  <button on-press="select_search_result:{r.index}">{r.title} · {r.snippet}</button>
+                </for>
+              </scroll>
+            </if>
+            <else>
+            <if test="{move_open}">
+              <text size="heading">Move this chat</text>
+              <scroll grow="1" label="Project destinations">
+                <for each="moveProjectRows" as="p">
+                  <list-item on-press="move_thread_to:{p.id}" selected="{p.selected}">{p.name}</list-item>
+                </for>
+              </scroll>
+            </if>
+            <else>
+            <text size="heading">Go anywhere</text>
+            <text-field text="{modelSearch}" on-input="model_search_edit" placeholder="Search chats, projects, or models…" autofocus="true" label="Universal search" />
+            <scroll grow="1" label="Commands, chats, projects, and models">
+              <column gap="8">
+                <for each="paletteWorkspaceRows" as="w">
+                  <button on-press="select_palette_workspace:{w.key}">{w.title} · {w.detail}</button>
+                </for>
+                <grid columns="2" gap="4">
+                  <for each="paletteActionRows" as="a">
+                    <button variant="ghost" on-press="palette_action:{a.id}">{a.label} · {a.shortcut}</button>
+                  </for>
+                </grid>
+                <grid columns="3" gap="6">
+                  <for each="quickModels" as="q">
+                    <button variant="outline" on-press="select_quick_model:{q.number}" label="{q.slug}">{q.number} · {q.label}</button>
+                  </for>
+                  <button variant="outline" on-press="select_codex_subscription">Codex · ChatGPT</button>
+                  <button variant="outline" on-press="select_claude_subscription" disabled="{claudeSubscriptionDisabled}">Claude · Experimental</button>
+                </grid>
                 <for each="catalogRows" key="index" as="m">
                   <row>
                     <button grow="1" on-press="select_catalog_model:{m.index}">{m.label} · {m.slug}</button>
@@ -130,27 +149,9 @@
             <row gap="8" main="end">
               <button variant="outline" on-press="select_auto_model">OpenRouter Auto</button>
               <button variant="ghost" on-press="select_custom_model">Enter model ID manually</button>
-              <button variant="primary" on-press="close_model_picker">Done</button>
             </row>
-          </column>
-        </dialog>
-      </column>
-    </panel>
-  </if>
-
-  <if test="{search_open}">
-    <panel background="scrim" on-press="close_search" label="Search chats backdrop">
-      <column main="center" cross="center">
-        <dialog width="620" height="430" label="Search every chat">
-          <column padding="20" gap="10">
-            <text-field text="{searchText}" on-input="search_edit" placeholder="Search every chat…" autofocus="true" />
-            <scroll grow="1" label="Search results">
-              <column gap="4">
-                <for each="searchRows" key="index" as="r">
-                  <button on-press="select_search_result:{r.index}">{r.title} · {r.snippet}</button>
-                </for>
-              </column>
-            </scroll>
+            </else>
+            </else>
           </column>
         </dialog>
       </column>
@@ -163,14 +164,26 @@
         <dialog width="600" height="480" label="Settings">
           <column padding="20" gap="10">
             <text size="heading">Settings</text>
-            <button variant="outline" on-press="connect_codex" disabled="{codexConnectionBusy}">{codexConnectionButtonText}</button>
-            <button variant="outline" on-press="connect_claude" disabled="{claudeSubscriptionDisabled}">{claudeConnectionButtonText}</button>
-            <text-field text="{apiKeyField}" on-input="api_key_edit" on-submit="save_settings" placeholder="{apiKeyPlaceholder}" label="OpenRouter API key" />
-            <text-field text="{modelName}" on-input="model_edit" on-submit="save_settings" placeholder="provider/model" label="Custom OpenRouter model" />
-            <checkbox checked="{notifications_enabled}" on-toggle="toggle_notifications" text="Notify when a background response finishes" />
-            <button variant="outline" on-press="open_update" disabled="{updateButtonDisabled}">{updateStatus} · {updateButtonText}</button>
-            <scroll grow="1" label="Keyboard shortcuts">
-              <column gap="2">
+            <scroll grow="1" label="Settings and keyboard shortcuts">
+              <column gap="8">
+                <button variant="outline" on-press="connect_codex" disabled="{codexConnectionBusy}">{codexConnectionButtonText}</button>
+                <button variant="outline" on-press="connect_claude" disabled="{claudeSubscriptionDisabled}">{claudeConnectionButtonText}</button>
+                <text-field text="{apiKeyField}" on-input="api_key_edit" on-submit="save_settings" placeholder="{apiKeyPlaceholder}" label="OpenRouter API key" />
+                <text-field text="{modelName}" on-input="model_edit" on-submit="save_settings" placeholder="provider/model" label="Custom OpenRouter model" />
+                <checkbox checked="{notifications_enabled}" on-toggle="toggle_notifications" text="Notify when a background response finishes" />
+                <text size="heading">Prompt snippets</text>
+                <for each="snippetRows" as="s">
+                  <row>
+                    <button grow="1" on-press="use_snippet:{s.id}">{s.command} · {s.preview}</button>
+                    <button on-press="delete_snippet:{s.id}">Delete</button>
+                  </row>
+                </for>
+                <row>
+                  <text-field grow="1" text="{snippetName}" on-input="snippet_name_edit" placeholder="name" />
+                  <text-field grow="2" text="{snippetBody}" on-input="snippet_body_edit" on-submit="save_snippet" placeholder="Reusable prompt…" />
+                  <button on-press="save_snippet" disabled="{cannotSaveSnippet}">Save</button>
+                </row>
+                <button variant="outline" on-press="open_update" disabled="{updateButtonDisabled}">{updateStatus} · {updateButtonText}</button>
                 <for each="shortcutHints" as="h">
                   <text>{h.action} · {h.keys}</text>
                 </for>
@@ -193,18 +206,12 @@
         <dialog width="620" height="430" label="Fork conversation">
           <column padding="24" gap="10">
             <text size="heading">Fork this response</text>
-            <text size="sm" foreground="text_muted">Clone its history into one chat per selected model. Cmd + Shift + F</text>
-            <text wrap="true" foreground="text_muted">{forkSourcePreview}</text>
             <textarea text="{forkSeed}" on-input="fork_seed_edit" on-submit="create_forks" height="84" placeholder="Optional follow-up for every selected model…" label="Fork follow-up message" />
-            <text size="heading">Models</text>
             <grid columns="3" gap="8">
               <for each="forkModelRows" as="m">
                 <checkbox checked="{m.selected}" on-toggle="toggle_fork_model:{m.choice}" text="{m.label}" label="{m.label}" />
               </for>
             </grid>
-            <if test="{forkNeedsOpenRouterKey}">
-              <text size="sm" foreground="text_muted">Without an API key, the follow-up remains a draft.</text>
-            </if>
             <row gap="8" main="end">
               <button size="sm" variant="ghost" on-press="close_fork">Cancel</button>
               <button size="sm" variant="primary" on-press="create_forks" disabled="{cannotCreateForks}">{forkCountLabel}</button>
@@ -236,12 +243,8 @@
         <dialog width="680" height="440" label="Archive">
           <column padding="24" gap="10">
             <text size="heading">Archive</text>
-            <text foreground="text_muted">Items are permanently deleted 30 days after they are archived.</text>
             <scroll grow="1" label="Archived items">
               <column gap="8">
-                <if test="{archiveEmpty}">
-                  <text foreground="text_muted">Nothing is archived.</text>
-                </if>
                 <for each="archivedProjectRows" as="p">
                   <row gap="8" cross="center">
                     <text grow="1">{p.name} · {p.expiry}</text>
@@ -284,10 +287,7 @@
             <text foreground="text_muted" wrap="true">{statusLine}</text>
             <text-field text="{apiKeyField}" on-input="api_key_edit" on-submit="finish_onboarding" placeholder="sk-or-v1-…" autofocus="true" label="OpenRouter API key" />
             <button variant="primary" on-press="finish_onboarding" disabled="{cannotFinishOnboarding}">Connect OpenRouter</button>
-            <spacer grow="1" />
-            <row main="end">
-              <button size="sm" variant="ghost" on-press="skip_onboarding">Set up later</button>
-            </row>
+            <button size="sm" variant="ghost" on-press="skip_onboarding">Set up later</button>
           </column>
         </dialog>
       </column>

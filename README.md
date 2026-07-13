@@ -14,12 +14,17 @@ Superchat keeps projects, conversations, drafts, and model choices on your Mac. 
 - Stream several responses at once and move between chats while they finish.
 - See unread completion markers and optionally receive a native notification when a background response finishes.
 - Search the complete local message history, including messages older than the currently loaded page.
+- Jump directly to chats, projects, actions, and models from the `⌘K` command palette.
+- Move a chat between projects—or back to the top level—without interrupting a response.
 - Drop images, PDFs, and text/code files into a message, or attach them without leaving the keyboard.
+- Save reusable prompt snippets and invoke them as slash commands such as `/summarize`.
 - Fork an assistant response into one or several new chats, each with a different model.
 - Copy complete responses or select and copy text from a rendered paragraph.
 - Stop a response, retry it, or edit an earlier user turn and resend from that point.
 - Rename, archive, restore, and permanently delete projects and chats.
 - Navigate the entire app with keyboard shortcuts.
+- Export a complete chat as Markdown or save a portable JSON workspace backup.
+- Compare responses using their routed model, elapsed time, token usage, and OpenRouter cost when available.
 - Keep chat data in a local SQLite database and your API key in macOS Keychain.
 
 ## Quick start
@@ -72,6 +77,8 @@ Choose a model with `⌘K`, write a message, and press `↩` to send. Use `⌘�
 4. Move to another chat while the answer streams; the original request continues in the background.
 5. On an assistant response, choose **Copy**, **Retry**, or **Fork**. Use **Edit** beside one of your messages to rewrite the conversation from that point. Forking can create several model-specific chats at once and optionally start each with the same follow-up message.
 
+Use `⌘K` whenever you know where you want to go but not which shortcut reaches it. The same palette searches local chats and projects, lists common actions, and searches OpenRouter models. Prompt snippets are managed in Settings; entering a saved slash command as the complete message expands it before sending.
+
 ## Keyboard shortcuts
 
 Superchat is designed to be usable without reaching for the mouse. The same reference is available inside **Settings → Shortcuts**.
@@ -106,6 +113,10 @@ Superchat is designed to be usable without reaching for the mouse. The same refe
 | Open archive | `⌘⇧H` |
 | Clear current chat | `⌘⇧⌫` |
 | Load earlier messages | `⌘⌥L` |
+| Move current chat | `⌘⇧M` |
+| Prompt snippets | `⌘⌥P` |
+| Export current chat | `⌘⇧S` |
+| Export workspace backup | `⌘⌥⇧S` |
 | Open settings | `⌘,` |
 | Close the current panel | `Esc` |
 
@@ -115,11 +126,13 @@ For dynamic controls—model search results, archive items, fork model choices, 
 
 Superchat does not require an account or run a local database server.
 
-- Projects, chats, messages, drafts, model choices, archive state, and the notification preference are stored in SQLite at `~/Library/Application Support/superchat/superchat.sqlite3`.
+- Projects, chats, messages, drafts, model choices, response statistics, prompt snippets, archive state, and the notification preference are stored in SQLite at `~/Library/Application Support/superchat/superchat.sqlite3`.
 - Attachment names, types, and user-selected paths are stored with the chat. File contents are not copied into SQLite. A private, randomly named temporary request file is created only when OpenRouter needs a larger multimodal payload and is removed when that request exits.
 - Your OpenRouter API key is stored separately in macOS Keychain. Codex and the development-only Claude harness leave authentication in each provider's own CLI credential store.
 - Requests and a bounded recent conversation context are sent only through the selected connection. Check provider privacy policies before sending sensitive information.
 - There is currently no cloud sync, telemetry service, or remote Superchat backend.
+
+Chat exports read the complete transcript from SQLite rather than only the currently visible page. Workspace backups are versioned JSON containing projects, chats, messages, attachment metadata, response statistics, and prompt snippets; attached file contents remain in their original local files.
 
 Archived items disappear from the main workspace immediately. You can restore them or choose **Delete forever** from the archive. Anything left archived is permanently removed after 30 days.
 
@@ -168,6 +181,7 @@ The intentionally small first version has a few boundaries worth knowing:
 - Anthropic's current [authentication guidance](https://code.claude.com/docs/en/legal-and-compliance) does not allow unapproved third-party products to offer Claude.ai login or route Pro/Max credentials. The Claude harness is therefore disabled outside development builds; obtain approval or switch it to user-supplied API authentication before release.
 - Authentication and sync are not in the app's critical path. See [AUTH_PLAN.md](AUTH_PLAN.md) for the proposed optional architecture.
 - SQLite retains the complete transcript. The UI opens the latest 50 messages and loads earlier pages on demand; provider requests independently use a bounded recent context. Native SDK currently caps CLI-harness prompt input at 4 KiB.
+- OpenRouter includes usage accounting in the final streaming event. Superchat stores its model, token counts, cost, and elapsed time with the response; CLI connections currently show model and elapsed time because they do not expose equivalent billing data.
 - Projects and chats grow dynamically instead of stopping at prototype-era 8/24 limits. Individual responses have a 64 KiB safety ceiling.
 - A message accepts up to four attachments totaling 640 KB: PNG, JPEG, WebP, GIF, PDF, UTF-8 text, Markdown, JSON, CSV, and common source-code formats. OpenRouter receives images, PDFs, and text files; Codex receives images plus bounded text-file content; the development-only Claude adapter currently accepts text files. Saved draft attachment metadata survives a restart, but the file must be removed and reattached before sending so Superchat never re-reads a local file without a fresh user action.
 - Tagged GitHub releases build a clean universal app, sign it with Developer ID, submit it for Apple notarization, staple the result, and publish the `.dmg` to GitHub Releases.

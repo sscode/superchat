@@ -20,6 +20,10 @@ fn buildTree(arena: std.mem.Allocator, model: *const main.Model) !main.AppUi.Tre
 }
 
 fn buildCompiledTree(arena: std.mem.Allocator, model: *const main.Model) !main.AppUi.Tree {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        _ = main.CompiledAppView.document;
+    }
     var ui = main.AppUi.init(arena);
     return ui.finalize(main.CompiledAppView.build(&ui, model));
 }
@@ -60,7 +64,7 @@ fn streamLine(model: *main.Model, fx: *main.Effects, key: u64, line: []const u8)
 fn removeTestDatabase(path: []const u8) void {
     std.Io.Dir.deleteFileAbsolute(testing.io, path) catch {};
     var buffer: [256]u8 = undefined;
-    for ([_][]const u8{ "-wal", "-shm", ".backup-v1", ".backup-v2" }) |suffix| {
+    for ([_][]const u8{ "-wal", "-shm", ".backup-v1", ".backup-v2", ".backup-v3", ".backup-v4" }) |suffix| {
         const sidecar = std.fmt.bufPrint(&buffer, "{s}{s}", .{ path, suffix }) catch continue;
         std.Io.Dir.deleteFileAbsolute(testing.io, sidecar) catch {};
     }
@@ -78,7 +82,7 @@ test "schema migrations create a recoverable pre-migration backup" {
     {
         var migrated = try main.workspace_storage.Database.open(path);
         defer migrated.close();
-        try testing.expectEqual(@as(i64, 3), try migrated.schemaVersion());
+        try testing.expectEqual(@as(i64, 5), try migrated.schemaVersion());
     }
     var backup = try std.Io.Dir.openFileAbsolute(testing.io, path ++ ".backup-v1", .{});
     backup.close(testing.io);
@@ -826,7 +830,7 @@ test "SQLite restores the workspace after reopening and purges expired archives"
     {
         var database = try main.workspace_storage.Database.open(path);
         defer database.close();
-        try testing.expectEqual(@as(i64, 3), try database.schemaVersion());
+        try testing.expectEqual(@as(i64, 5), try database.schemaVersion());
         try database.save(model);
     }
 
@@ -927,6 +931,49 @@ test "background persistence worker owns and flushes SQLite writes" {
 
 test "background persistence commands stay compact" {
     try testing.expect(@sizeOf(persistence.Command) < 1024);
+}
+
+test "complete SQLite exports include full chat history and a portable workspace" {
+    const database_path = "/tmp/superchat-export.sqlite3";
+    const markdown_path = "/tmp/superchat-export.md";
+    const json_path = "/tmp/superchat-export.json";
+    removeTestDatabase(database_path);
+    std.Io.Dir.deleteFileAbsolute(testing.io, markdown_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(testing.io, json_path) catch {};
+    defer {
+        removeTestDatabase(database_path);
+        std.Io.Dir.deleteFileAbsolute(testing.io, markdown_path) catch {};
+        std.Io.Dir.deleteFileAbsolute(testing.io, json_path) catch {};
+    }
+
+    var model = main.initialModel("test-key");
+    defer model.deinit();
+    try testing.expect(model.appendMessage(.user, "Export this question"));
+    try testing.expect(model.appendMessage(.assistant, "Export this answer"));
+    const assistant = &activeThread(&model).messages[1];
+    assistant.response_model_len = "openai/example".len;
+    @memcpy(assistant.response_model_storage[0..assistant.response_model_len], "openai/example");
+    assistant.latency_ms = 1250;
+    assistant.prompt_tokens = 12;
+    assistant.completion_tokens = 34;
+    assistant.cost_micros = 456;
+
+    var database = try main.workspace_storage.Database.open(database_path);
+    defer database.close();
+    try database.save(&model);
+    try database.exportThreadMarkdown(testing.allocator, testing.io, model.active_thread_id, markdown_path);
+    try database.exportWorkspaceJson(testing.allocator, testing.io, json_path);
+
+    const markdown = try std.Io.Dir.cwd().readFileAlloc(testing.io, markdown_path, testing.allocator, .limited(64 * 1024));
+    defer testing.allocator.free(markdown);
+    try testing.expect(std.mem.indexOf(u8, markdown, "Export this answer") != null);
+    try testing.expect(std.mem.indexOf(u8, markdown, "openai/example") != null);
+
+    const json = try std.Io.Dir.cwd().readFileAlloc(testing.io, json_path, testing.allocator, .limited(256 * 1024));
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.indexOf(u8, json, "\"format\":\"superchat-workspace\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"snippets\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "Export this question") != null);
 }
 
 test "draft persistence is debounced per thread" {
@@ -1315,6 +1362,10 @@ test "the global shortcut map reaches creation navigation focus and settings" {
         main.cmd_auto_model,
         main.cmd_top_level_chats,
         main.cmd_load_older,
+        main.cmd_move_thread,
+        main.cmd_snippets,
+        main.cmd_export_thread,
+        main.cmd_export_workspace,
         main.cmd_settings,
         main.cmd_fork_latest,
         main.cmd_copy_latest,
@@ -1396,6 +1447,87 @@ test "number shortcuts select top-level chats projects threads and models" {
     try testing.expectEqualStrings("openrouter/auto", activeThread(&model).modelName());
 }
 
+test "the command palette finds chats and projects and moves chats between them" {
+    var model = main.initialModel("test-key");
+    defer model.deinit();
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    const top_level_thread = model.active_thread_id;
+    main.update(&model, .new_project, &fx);
+    const project_id = model.active_project_id;
+    projectWithId(&model, project_id).name_len = "Research".len;
+    @memcpy(projectWithId(&model, project_id).name_storage[0.."Research".len], "Research");
+    activeThread(&model).title_len = "Market notes".len;
+    @memcpy(activeThread(&model).title_storage[0.."Market notes".len], "Market notes");
+
+    model.model_search_buffer.set("market");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const rows = model.paletteWorkspaceRows(arena_state.allocator());
+    try testing.expect(rows.len > 0);
+    try testing.expectEqualStrings("Market notes", rows[0].title);
+
+    main.update(&model, .{ .select_thread = top_level_thread }, &fx);
+    main.update(&model, .open_move_thread, &fx);
+    try testing.expect(model.model_picker_open and model.move_open);
+    main.update(&model, .{ .move_thread_to = project_id }, &fx);
+    try testing.expectEqual(project_id, threadWithId(&model, top_level_thread).project_id);
+    try testing.expectEqualStrings("Chat moved", model.toastText());
+}
+
+test "prompt snippets can be saved inserted deleted and expanded from slash commands" {
+    var model = main.initialModel("test-key");
+    defer model.deinit();
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    try testing.expectEqual(@as(usize, 3), model.snippet_count);
+    main.update(&model, .open_snippets, &fx);
+    try testing.expect(model.settings_open);
+    const first_id = model.snippets[0].id;
+    main.update(&model, .{ .use_snippet = first_id }, &fx);
+    try testing.expectEqualStrings(model.snippets[0].body(), activeThread(&model).draft());
+
+    activeThread(&model).draft_buffer.set("/summarize");
+    main.update(&model, .send, &fx);
+    try testing.expectEqualStrings(model.snippets[0].body(), activeThread(&model).messages[0].content());
+
+    main.update(&model, .{ .snippet_name_edit = .{ .insert_text = "explain" } }, &fx);
+    main.update(&model, .{ .snippet_body_edit = .{ .insert_text = "Explain this with one concrete example." } }, &fx);
+    main.update(&model, .save_snippet, &fx);
+    try testing.expectEqual(@as(usize, 4), model.snippet_count);
+    const new_id = model.snippets[3].id;
+    main.update(&model, .{ .delete_snippet = new_id }, &fx);
+    try testing.expectEqual(@as(usize, 3), model.snippet_count);
+}
+
+test "OpenRouter usage and timing are attached to the assistant response" {
+    var test_clock: native_sdk.TestClock = .{};
+    test_clock.setWallMs(10_000);
+    var model = main.initialModelWithClock("test-key", test_clock.clock());
+    defer model.deinit();
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    activeThread(&model).draft_buffer.set("Measure this response");
+    main.update(&model, .send, &fx);
+    test_clock.advanceMs(1450);
+    streamLine(&model, &fx, 1001, "data: {\"model\":\"openai/measured\",\"choices\":[{\"delta\":{\"content\":\"Measured answer\"}}]}");
+    streamLine(&model, &fx, 1001, "data: {\"model\":\"openai/measured\",\"choices\":[],\"usage\":{\"prompt_tokens\":21,\"completion_tokens\":8,\"cost\":0.00125}}");
+    main.update(&model, .{ .response = .{ .key = 1001, .status = 200 } }, &fx);
+
+    const assistant = activeThread(&model).messages[1];
+    try testing.expectEqualStrings("openai/measured", assistant.responseModel());
+    try testing.expectEqual(@as(u32, 1450), assistant.latency_ms);
+    try testing.expectEqual(@as(u32, 21), assistant.prompt_tokens);
+    try testing.expectEqual(@as(u32, 8), assistant.completion_tokens);
+    try testing.expectEqual(@as(u64, 1250), assistant.cost_micros);
+}
+
 test "modal forms can submit without a mouse" {
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "on-submit=\"save_settings\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "on-submit=\"save_rename\"") != null);
@@ -1409,7 +1541,7 @@ test "modal layouts fit the minimum window and long archives scroll" {
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"500\"") == null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"530\"") == null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Archived items\"") != null);
-    try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Choose a model\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Command palette\"") != null);
 }
 
 test "first-run onboarding is bypassed by credentials completion or dev mode" {

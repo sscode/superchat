@@ -23,6 +23,11 @@ pub const HistoryMessage = struct {
     id: u32,
     role: u8,
     content: []u8,
+    response_model: []u8 = @constCast(&[_]u8{}),
+    latency_ms: u32 = 0,
+    prompt_tokens: u32 = 0,
+    completion_tokens: u32 = 0,
+    cost_micros: u64 = 0,
     attachments: [max_history_attachments]HistoryAttachment = [_]HistoryAttachment{.{}} ** max_history_attachments,
     attachment_count: usize = 0,
 };
@@ -34,6 +39,7 @@ pub const HistoryPage = struct {
     pub fn deinit(page: *HistoryPage, allocator: std.mem.Allocator) void {
         for (page.messages) |message| {
             if (message.content.len > 0) allocator.free(message.content);
+            if (message.response_model.len > 0) allocator.free(message.response_model);
             for (message.attachments[0..message.attachment_count]) |attachment| {
                 if (attachment.path.len > 0) allocator.free(attachment.path);
                 if (attachment.name.len > 0) allocator.free(attachment.name);
@@ -82,8 +88,8 @@ pub const Database = struct {
         errdefer database.close();
         try database.configure();
         const version = try database.schemaVersion();
-        if (version > 0 and version < 3) try database.backup(path, version);
-        try database.migrate();
+        if (version > 0 and version < 5) try database.backup(path, version);
+        try database.migrate(version);
         return database;
     }
 
@@ -98,7 +104,7 @@ pub const Database = struct {
         try database.exec("PRAGMA synchronous = NORMAL;");
     }
 
-    fn migrate(database: *Database) Error!void {
+    fn migrate(database: *Database, previous_version: i64) Error!void {
         try database.exec(
             \\BEGIN IMMEDIATE;
             \\CREATE TABLE IF NOT EXISTS projects (
@@ -123,6 +129,11 @@ pub const Database = struct {
             \\  thread_id INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
             \\  role INTEGER NOT NULL,
             \\  content TEXT NOT NULL,
+            \\  response_model TEXT NOT NULL DEFAULT '',
+            \\  latency_ms INTEGER NOT NULL DEFAULT 0,
+            \\  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            \\  completion_tokens INTEGER NOT NULL DEFAULT 0,
+            \\  cost_micros INTEGER NOT NULL DEFAULT 0,
             \\  position INTEGER NOT NULL
             \\);
             \\CREATE TABLE IF NOT EXISTS workspace_meta (
@@ -152,9 +163,22 @@ pub const Database = struct {
             \\  name TEXT NOT NULL,
             \\  PRIMARY KEY(thread_id,message_id,position)
             \\);
-            \\PRAGMA user_version = 3;
+            \\CREATE TABLE IF NOT EXISTS prompt_snippets (
+            \\  id INTEGER PRIMARY KEY,
+            \\  name TEXT NOT NULL UNIQUE,
+            \\  body TEXT NOT NULL,
+            \\  position INTEGER NOT NULL
+            \\);
             \\COMMIT;
         );
+        if (previous_version > 0 and previous_version < 4) {
+            if (!try database.hasColumn("messages", "response_model")) try database.exec("ALTER TABLE messages ADD COLUMN response_model TEXT NOT NULL DEFAULT '';");
+            if (!try database.hasColumn("messages", "latency_ms")) try database.exec("ALTER TABLE messages ADD COLUMN latency_ms INTEGER NOT NULL DEFAULT 0;");
+            if (!try database.hasColumn("messages", "prompt_tokens")) try database.exec("ALTER TABLE messages ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0;");
+            if (!try database.hasColumn("messages", "completion_tokens")) try database.exec("ALTER TABLE messages ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0;");
+            if (!try database.hasColumn("messages", "cost_micros")) try database.exec("ALTER TABLE messages ADD COLUMN cost_micros INTEGER NOT NULL DEFAULT 0;");
+        }
+        try database.exec("PRAGMA user_version = 5;");
     }
 
     fn backup(database: *Database, path: []const u8, version: i64) Error!void {
@@ -216,6 +240,20 @@ pub const Database = struct {
         return c.sqlite3_column_int64(statement, 0);
     }
 
+    fn hasColumn(database: *Database, table: []const u8, column: []const u8) Error!bool {
+        var sql: [96:0]u8 = undefined;
+        const rendered = std.fmt.bufPrint(sql[0 .. sql.len - 1], "PRAGMA table_info({s});", .{table}) catch return error.SqlFailed;
+        sql[rendered.len] = 0;
+        const statement = try database.prepare(&sql);
+        defer _ = c.sqlite3_finalize(statement);
+        while (true) {
+            const result = c.sqlite3_step(statement);
+            if (result == c.SQLITE_DONE) return false;
+            if (result != c.SQLITE_ROW) return error.SqlFailed;
+            if (std.mem.eql(u8, textColumn(statement, 1), column)) return true;
+        }
+    }
+
     pub fn messageCount(database: *Database, thread_id: u32) Error!usize {
         const statement = try database.prepare("SELECT COUNT(*) FROM messages WHERE thread_id=?1;");
         defer _ = c.sqlite3_finalize(statement);
@@ -226,7 +264,7 @@ pub const Database = struct {
 
     pub fn loadHistoryBefore(database: *Database, allocator: std.mem.Allocator, thread_id: u32, before_id: u32, limit: usize) (Error || std.mem.Allocator.Error)!HistoryPage {
         const statement = try database.prepare(
-            "SELECT id,role,content FROM messages WHERE thread_id=?1 AND id<?2 ORDER BY id DESC LIMIT ?3;",
+            "SELECT id,role,content,response_model,latency_ms,prompt_tokens,completion_tokens,cost_micros FROM messages WHERE thread_id=?1 AND id<?2 ORDER BY id DESC LIMIT ?3;",
         );
         defer _ = c.sqlite3_finalize(statement);
         const attachment_statement = try database.prepare("SELECT kind,path,name FROM attachments WHERE thread_id=?1 AND message_id=?2 ORDER BY position LIMIT 4;");
@@ -238,6 +276,7 @@ pub const Database = struct {
         errdefer {
             for (messages.items) |message| {
                 allocator.free(message.content);
+                if (message.response_model.len > 0) allocator.free(message.response_model);
                 for (message.attachments[0..message.attachment_count]) |attachment| {
                     allocator.free(attachment.path);
                     allocator.free(attachment.name);
@@ -251,10 +290,17 @@ pub const Database = struct {
             if (result != c.SQLITE_ROW) return error.SqlFailed;
             const content = try allocator.dupe(u8, textColumn(statement, 2));
             errdefer allocator.free(content);
+            const response_model = try allocator.dupe(u8, textColumn(statement, 3));
+            errdefer allocator.free(response_model);
             var message = HistoryMessage{
                 .id = intColumn(u32, statement, 0),
                 .role = intColumn(u8, statement, 1),
                 .content = content,
+                .response_model = response_model,
+                .latency_ms = intColumn(u32, statement, 4),
+                .prompt_tokens = intColumn(u32, statement, 5),
+                .completion_tokens = intColumn(u32, statement, 6),
+                .cost_micros = intColumn(u64, statement, 7),
             };
             errdefer for (message.attachments[0..message.attachment_count]) |attachment| {
                 allocator.free(attachment.path);
@@ -284,6 +330,7 @@ pub const Database = struct {
         if (has_more) {
             const removed = messages.pop().?;
             allocator.free(removed.content);
+            if (removed.response_model.len > 0) allocator.free(removed.response_model);
             for (removed.attachments[0..removed.attachment_count]) |attachment| {
                 allocator.free(attachment.path);
                 allocator.free(attachment.name);
@@ -390,16 +437,39 @@ pub const Database = struct {
     }
 
     pub fn upsertMessage(database: *Database, id: u32, thread_id: u32, role: u8, content: []const u8) Error!void {
+        try database.upsertMessageWithMetrics(id, thread_id, role, content, "", 0, 0, 0, 0);
+    }
+
+    pub fn upsertMessageWithMetrics(database: *Database, id: u32, thread_id: u32, role: u8, content: []const u8, response_model: []const u8, latency_ms: u32, prompt_tokens: u32, completion_tokens: u32, cost_micros: u64) Error!void {
         const statement = try database.prepare(
-            "INSERT INTO messages(id,thread_id,role,content,position) VALUES(?1,?2,?3,?4,?1) " ++
-                "ON CONFLICT(id) DO UPDATE SET thread_id=excluded.thread_id,role=excluded.role,content=excluded.content;",
+            "INSERT INTO messages(id,thread_id,role,content,response_model,latency_ms,prompt_tokens,completion_tokens,cost_micros,position) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?1) " ++
+                "ON CONFLICT(id) DO UPDATE SET thread_id=excluded.thread_id,role=excluded.role,content=excluded.content,response_model=excluded.response_model,latency_ms=excluded.latency_ms,prompt_tokens=excluded.prompt_tokens,completion_tokens=excluded.completion_tokens,cost_micros=excluded.cost_micros;",
         );
         defer _ = c.sqlite3_finalize(statement);
         try bindInt(statement, 1, id);
         try bindInt(statement, 2, thread_id);
         try bindInt(statement, 3, role);
         try bindText(statement, 4, content);
+        try bindText(statement, 5, response_model);
+        try bindInt(statement, 6, latency_ms);
+        try bindInt(statement, 7, prompt_tokens);
+        try bindInt(statement, 8, completion_tokens);
+        try bindInt(statement, 9, cost_micros);
         try stepDone(statement);
+    }
+
+    pub fn replaceSnippets(database: *Database, snippets: anytype) Error!void {
+        try database.exec("DELETE FROM prompt_snippets;");
+        const statement = try database.prepare("INSERT INTO prompt_snippets(id,name,body,position) VALUES(?1,?2,?3,?4);");
+        defer _ = c.sqlite3_finalize(statement);
+        for (snippets, 0..) |*snippet, position| {
+            try bindInt(statement, 1, snippet.id);
+            try bindText(statement, 2, snippet.name());
+            try bindText(statement, 3, snippet.body());
+            try bindInt(statement, 4, position);
+            try stepDone(statement);
+            reset(statement);
+        }
     }
 
     pub fn replaceAttachments(database: *Database, thread_id: u32, message_id: u32, attachments: anytype) Error!void {
@@ -545,7 +615,7 @@ pub const Database = struct {
             try database.replaceAttachments(thread.id, 0, thread.draft_attachments[0..thread.draft_attachment_count]);
         }
 
-        const message_statement = try database.prepare("INSERT INTO messages(id,thread_id,role,content,position) VALUES(?1,?2,?3,?4,?5);");
+        const message_statement = try database.prepare("INSERT INTO messages(id,thread_id,role,content,response_model,latency_ms,prompt_tokens,completion_tokens,cost_micros,position) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10);");
         defer _ = c.sqlite3_finalize(message_statement);
         for (model.threads[0..model.thread_count]) |*thread| {
             for (thread.messages[0..thread.message_count], 0..) |*message, position| {
@@ -553,7 +623,12 @@ pub const Database = struct {
                 try bindInt(message_statement, 2, thread.id);
                 try bindInt(message_statement, 3, @intFromEnum(message.role));
                 try bindText(message_statement, 4, message.content());
-                try bindInt(message_statement, 5, position);
+                try bindText(message_statement, 5, message.responseModel());
+                try bindInt(message_statement, 6, message.latency_ms);
+                try bindInt(message_statement, 7, message.prompt_tokens);
+                try bindInt(message_statement, 8, message.completion_tokens);
+                try bindInt(message_statement, 9, message.cost_micros);
+                try bindInt(message_statement, 10, position);
                 try stepDone(message_statement);
                 reset(message_statement);
                 try database.replaceAttachments(thread.id, message.id, message.attachments[0..message.attachment_count]);
@@ -569,6 +644,7 @@ pub const Database = struct {
         try bindInt(meta, 5, model.next_message_id);
         try stepDone(meta);
         try database.savePreferences(model.notifications_enabled);
+        try database.replaceSnippets(model.snippets[0..model.snippet_count]);
         try database.exec("COMMIT;");
     }
 
@@ -619,7 +695,7 @@ pub const Database = struct {
         // page. Older pages are queried on demand, independently of the
         // provider's small context window.
         const messages = try database.prepare(
-            "SELECT m.id,m.thread_id,m.role,m.content FROM messages AS m " ++
+            "SELECT m.id,m.thread_id,m.role,m.content,m.response_model,m.latency_ms,m.prompt_tokens,m.completion_tokens,m.cost_micros FROM messages AS m " ++
                 "WHERE m.id IN (SELECT recent.id FROM messages AS recent WHERE recent.thread_id=m.thread_id ORDER BY recent.id DESC LIMIT 50) " ++
                 "ORDER BY m.thread_id,m.id;",
         );
@@ -644,6 +720,11 @@ pub const Database = struct {
             const content = textColumn(messages, 3);
             message.content_storage = model.allocator.dupe(u8, content) catch return error.InvalidData;
             message.content_len = content.len;
+            setFixed(&message.response_model_storage, &message.response_model_len, textColumn(messages, 4));
+            message.latency_ms = intColumn(u32, messages, 5);
+            message.prompt_tokens = intColumn(u32, messages, 6);
+            message.completion_tokens = intColumn(u32, messages, 7);
+            message.cost_micros = intColumn(u64, messages, 8);
             thread.messages[thread.message_count] = message;
             thread.message_count += 1;
         }
@@ -696,7 +777,199 @@ pub const Database = struct {
         const preferences = try database.prepare("SELECT notifications_enabled FROM app_preferences WHERE singleton=1;");
         defer _ = c.sqlite3_finalize(preferences);
         if (c.sqlite3_step(preferences) == c.SQLITE_ROW) model.notifications_enabled = c.sqlite3_column_int(preferences, 0) != 0;
+        const snippets = try database.prepare("SELECT id,name,body FROM prompt_snippets ORDER BY position,id;");
+        defer _ = c.sqlite3_finalize(snippets);
+        model.snippet_count = 0;
+        model.next_snippet_id = 1;
+        while (model.snippet_count < model.snippets.len) {
+            const result = c.sqlite3_step(snippets);
+            if (result == c.SQLITE_DONE) break;
+            if (result != c.SQLITE_ROW) return error.SqlFailed;
+            var snippet: @TypeOf(model.snippets[0]) = .{ .id = intColumn(u32, snippets, 0) };
+            setFixed(&snippet.name_storage, &snippet.name_len, textColumn(snippets, 1));
+            setFixed(&snippet.body_storage, &snippet.body_len, textColumn(snippets, 2));
+            model.snippets[model.snippet_count] = snippet;
+            model.snippet_count += 1;
+            model.next_snippet_id = @max(model.next_snippet_id, snippet.id +| 1);
+        }
+        model.ensureDefaultSnippets();
         return true;
+    }
+
+    pub fn exportThreadMarkdown(database: *Database, allocator: std.mem.Allocator, io: std.Io, thread_id: u32, path: []const u8) !void {
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        defer output.deinit();
+        const writer = &output.writer;
+        const thread = try database.prepare("SELECT title,model_slug FROM threads WHERE id=?1;");
+        defer _ = c.sqlite3_finalize(thread);
+        try bindInt(thread, 1, thread_id);
+        if (c.sqlite3_step(thread) != c.SQLITE_ROW) return error.InvalidData;
+        try writer.print("# {s}\n\nModel: `{s}`\n\n", .{ textColumn(thread, 0), textColumn(thread, 1) });
+
+        const messages = try database.prepare("SELECT role,content,response_model,latency_ms,prompt_tokens,completion_tokens,cost_micros FROM messages WHERE thread_id=?1 ORDER BY position,id;");
+        defer _ = c.sqlite3_finalize(messages);
+        try bindInt(messages, 1, thread_id);
+        while (true) {
+            const result = c.sqlite3_step(messages);
+            if (result == c.SQLITE_DONE) break;
+            if (result != c.SQLITE_ROW) return error.SqlFailed;
+            const assistant = intColumn(u8, messages, 0) == 1;
+            try writer.print("## {s}\n\n{s}\n\n", .{ if (assistant) "Assistant" else "You", textColumn(messages, 1) });
+            if (assistant) {
+                const response_model = textColumn(messages, 2);
+                const latency_ms = intColumn(u32, messages, 3);
+                const prompt_tokens = intColumn(u32, messages, 4);
+                const completion_tokens = intColumn(u32, messages, 5);
+                const cost_micros = intColumn(u64, messages, 6);
+                if (response_model.len > 0 or latency_ms > 0 or prompt_tokens + completion_tokens > 0 or cost_micros > 0) {
+                    try writer.writeByte('*');
+                    var wrote_detail = false;
+                    if (response_model.len > 0) {
+                        try writer.writeAll(response_model);
+                        wrote_detail = true;
+                    }
+                    if (latency_ms > 0) {
+                        if (wrote_detail) try writer.writeAll(" · ");
+                        try writer.print("{d:.1}s", .{@as(f64, @floatFromInt(latency_ms)) / 1000.0});
+                        wrote_detail = true;
+                    }
+                    if (prompt_tokens > 0 or completion_tokens > 0) {
+                        if (wrote_detail) try writer.writeAll(" · ");
+                        try writer.print("{d} in / {d} out", .{ prompt_tokens, completion_tokens });
+                        wrote_detail = true;
+                    }
+                    if (cost_micros > 0) {
+                        if (wrote_detail) try writer.writeAll(" · ");
+                        try writer.print("${d:.6}", .{@as(f64, @floatFromInt(cost_micros)) / 1_000_000.0});
+                    }
+                    try writer.writeAll("*\n\n");
+                }
+            }
+        }
+        try writeExport(io, path, output.written());
+    }
+
+    pub fn exportWorkspaceJson(database: *Database, allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        defer output.deinit();
+        const writer = &output.writer;
+        try writer.writeAll("{\"format\":\"superchat-workspace\",\"version\":1,\"meta\":");
+        const meta = try database.prepare("SELECT active_project_id,active_thread_id,next_project_id,next_thread_id,next_message_id FROM workspace_meta WHERE singleton=1;");
+        defer _ = c.sqlite3_finalize(meta);
+        if (c.sqlite3_step(meta) == c.SQLITE_ROW) {
+            try writer.print("{{\"active_project_id\":{d},\"active_thread_id\":{d},\"next_project_id\":{d},\"next_thread_id\":{d},\"next_message_id\":{d}}}", .{
+                intColumn(u32, meta, 0), intColumn(u32, meta, 1), intColumn(u32, meta, 2), intColumn(u32, meta, 3), intColumn(u32, meta, 4),
+            });
+        } else {
+            try writer.writeAll("null");
+        }
+        const preferences = try database.prepare("SELECT notifications_enabled FROM app_preferences WHERE singleton=1;");
+        defer _ = c.sqlite3_finalize(preferences);
+        const notifications_enabled = c.sqlite3_step(preferences) != c.SQLITE_ROW or c.sqlite3_column_int(preferences, 0) != 0;
+        try writer.print(",\"preferences\":{{\"notifications_enabled\":{s}}},\"cached_models\":[", .{if (notifications_enabled) "true" else "false"});
+        const cached_models = try database.prepare("SELECT slug,label,favorite,updated_at_ms FROM model_cache ORDER BY updated_at_ms DESC,slug;");
+        defer _ = c.sqlite3_finalize(cached_models);
+        var first = true;
+        while (true) {
+            const result = c.sqlite3_step(cached_models);
+            if (result == c.SQLITE_DONE) break;
+            if (result != c.SQLITE_ROW) return error.SqlFailed;
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.writeAll("{\"slug\":");
+            try std.json.Stringify.value(textColumn(cached_models, 0), .{}, writer);
+            try writer.writeAll(",\"label\":");
+            try std.json.Stringify.value(textColumn(cached_models, 1), .{}, writer);
+            try writer.print(",\"favorite\":{s},\"updated_at_ms\":{d}}}", .{ if (c.sqlite3_column_int(cached_models, 2) != 0) "true" else "false", intColumn(i64, cached_models, 3) });
+        }
+        try writer.writeAll("],\"projects\":[");
+        const projects = try database.prepare("SELECT id,name,archived_at_ms,position FROM projects ORDER BY position,id;");
+        defer _ = c.sqlite3_finalize(projects);
+        first = true;
+        while (true) {
+            const result = c.sqlite3_step(projects);
+            if (result == c.SQLITE_DONE) break;
+            if (result != c.SQLITE_ROW) return error.SqlFailed;
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.print("{{\"id\":{d},\"name\":", .{intColumn(u32, projects, 0)});
+            try std.json.Stringify.value(textColumn(projects, 1), .{}, writer);
+            try writer.print(",\"archived_at_ms\":{d},\"position\":{d}}}", .{ intColumn(i64, projects, 2), intColumn(usize, projects, 3) });
+        }
+        try writer.writeAll("],\"threads\":[");
+        const threads = try database.prepare("SELECT id,project_id,title,archived_at_ms,position,draft,model_choice,model_slug,active_model FROM threads ORDER BY position,id;");
+        defer _ = c.sqlite3_finalize(threads);
+        first = true;
+        while (true) {
+            const result = c.sqlite3_step(threads);
+            if (result == c.SQLITE_DONE) break;
+            if (result != c.SQLITE_ROW) return error.SqlFailed;
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.print("{{\"id\":{d},\"project_id\":{d},\"title\":", .{ intColumn(u32, threads, 0), intColumn(u32, threads, 1) });
+            try std.json.Stringify.value(textColumn(threads, 2), .{}, writer);
+            try writer.print(",\"archived_at_ms\":{d},\"position\":{d},\"draft\":", .{ intColumn(i64, threads, 3), intColumn(usize, threads, 4) });
+            try std.json.Stringify.value(textColumn(threads, 5), .{}, writer);
+            try writer.print(",\"model_choice\":{d},\"model_slug\":", .{intColumn(u8, threads, 6)});
+            try std.json.Stringify.value(textColumn(threads, 7), .{}, writer);
+            try writer.writeAll(",\"active_model\":");
+            try std.json.Stringify.value(textColumn(threads, 8), .{}, writer);
+            try writer.writeByte('}');
+        }
+        try writer.writeAll("],\"messages\":[");
+        const messages = try database.prepare("SELECT id,thread_id,role,content,response_model,latency_ms,prompt_tokens,completion_tokens,cost_micros,position FROM messages ORDER BY thread_id,position,id;");
+        defer _ = c.sqlite3_finalize(messages);
+        first = true;
+        while (true) {
+            const result = c.sqlite3_step(messages);
+            if (result == c.SQLITE_DONE) break;
+            if (result != c.SQLITE_ROW) return error.SqlFailed;
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.print("{{\"id\":{d},\"thread_id\":{d},\"role\":{d},\"content\":", .{ intColumn(u32, messages, 0), intColumn(u32, messages, 1), intColumn(u8, messages, 2) });
+            try std.json.Stringify.value(textColumn(messages, 3), .{}, writer);
+            try writer.writeAll(",\"response_model\":");
+            try std.json.Stringify.value(textColumn(messages, 4), .{}, writer);
+            try writer.print(",\"latency_ms\":{d},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"cost_micros\":{d},\"position\":{d}}}", .{
+                intColumn(u32, messages, 5), intColumn(u32, messages, 6), intColumn(u32, messages, 7), intColumn(u64, messages, 8), intColumn(usize, messages, 9),
+            });
+        }
+        try writer.writeAll("],\"attachments\":[");
+        const attachments = try database.prepare("SELECT thread_id,message_id,position,kind,path,name FROM attachments ORDER BY thread_id,message_id,position;");
+        defer _ = c.sqlite3_finalize(attachments);
+        first = true;
+        while (true) {
+            const result = c.sqlite3_step(attachments);
+            if (result == c.SQLITE_DONE) break;
+            if (result != c.SQLITE_ROW) return error.SqlFailed;
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.print("{{\"thread_id\":{d},\"message_id\":{d},\"position\":{d},\"kind\":{d},\"path\":", .{
+                intColumn(u32, attachments, 0), intColumn(u32, attachments, 1), intColumn(usize, attachments, 2), intColumn(u8, attachments, 3),
+            });
+            try std.json.Stringify.value(textColumn(attachments, 4), .{}, writer);
+            try writer.writeAll(",\"name\":");
+            try std.json.Stringify.value(textColumn(attachments, 5), .{}, writer);
+            try writer.writeByte('}');
+        }
+        try writer.writeAll("],\"snippets\":[");
+        const snippets = try database.prepare("SELECT id,name,body,position FROM prompt_snippets ORDER BY position,id;");
+        defer _ = c.sqlite3_finalize(snippets);
+        first = true;
+        while (true) {
+            const result = c.sqlite3_step(snippets);
+            if (result == c.SQLITE_DONE) break;
+            if (result != c.SQLITE_ROW) return error.SqlFailed;
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.print("{{\"id\":{d},\"name\":", .{intColumn(u32, snippets, 0)});
+            try std.json.Stringify.value(textColumn(snippets, 1), .{}, writer);
+            try writer.writeAll(",\"body\":");
+            try std.json.Stringify.value(textColumn(snippets, 2), .{}, writer);
+            try writer.print(",\"position\":{d}}}", .{intColumn(usize, snippets, 3)});
+        }
+        try writer.writeAll("]}");
+        try writeExport(io, path, output.written());
     }
 
     fn exec(database: *Database, sql: [*:0]const u8) Error!void {
@@ -713,6 +986,12 @@ pub const Database = struct {
         return statement.?;
     }
 };
+
+fn writeExport(io: std.Io, path: []const u8, bytes: []const u8) !void {
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    try file.writePositionalAll(io, bytes, 0);
+}
 
 fn bindInt(statement: *c.sqlite3_stmt, index: c_int, value: anytype) Error!void {
     if (c.sqlite3_bind_int64(statement, index, @intCast(value)) != c.SQLITE_OK) return error.SqlFailed;

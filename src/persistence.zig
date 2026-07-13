@@ -13,6 +13,9 @@ pub const max_projects = 4096;
 pub const max_threads = 4096;
 pub const max_visible_messages = 50;
 pub const max_search_query_bytes = 160;
+pub const max_snippets = 16;
+pub const max_snippet_name_bytes = 32;
+pub const max_snippet_body_bytes = 1200;
 const queue_capacity = 512;
 
 pub const ProjectRecord = struct {
@@ -85,16 +88,64 @@ pub const MessageRecord = struct {
     role: u8,
     content: [max_message_bytes]u8 = undefined,
     content_len: usize = 0,
+    response_model: [max_model_bytes]u8 = undefined,
+    response_model_len: usize = 0,
+    latency_ms: u32 = 0,
+    prompt_tokens: u32 = 0,
+    completion_tokens: u32 = 0,
+    cost_micros: u64 = 0,
     attachments: [max_attachments_per_message]AttachmentRecord = [_]AttachmentRecord{.{}} ** max_attachments_per_message,
     attachment_count: usize = 0,
 
     pub fn from(thread_id: u32, message: anytype) MessageRecord {
         var record = MessageRecord{ .id = message.id, .thread_id = thread_id, .role = @intFromEnum(message.role) };
         record.content_len = copyText(&record.content, message.content());
+        record.response_model_len = copyText(&record.response_model, message.responseModel());
+        record.latency_ms = message.latency_ms;
+        record.prompt_tokens = message.prompt_tokens;
+        record.completion_tokens = message.completion_tokens;
+        record.cost_micros = message.cost_micros;
         record.attachment_count = message.attachment_count;
         for (message.attachments[0..message.attachment_count], 0..) |*attachment, index| record.attachments[index] = AttachmentRecord.from(attachment);
         return record;
     }
+};
+
+pub const SnippetRecord = struct {
+    id: u32 = 0,
+    name_storage: [max_snippet_name_bytes]u8 = undefined,
+    name_len: usize = 0,
+    body_storage: [max_snippet_body_bytes]u8 = undefined,
+    body_len: usize = 0,
+
+    pub fn from(snippet: anytype) SnippetRecord {
+        var record = SnippetRecord{ .id = snippet.id };
+        record.name_len = copyText(&record.name_storage, snippet.name());
+        record.body_len = copyText(&record.body_storage, snippet.body());
+        return record;
+    }
+
+    pub fn name(record: *const SnippetRecord) []const u8 {
+        return record.name_storage[0..record.name_len];
+    }
+
+    pub fn body(record: *const SnippetRecord) []const u8 {
+        return record.body_storage[0..record.body_len];
+    }
+};
+
+pub const SnippetSet = struct {
+    snippets: [max_snippets]SnippetRecord = undefined,
+    count: usize = 0,
+};
+
+pub const ExportKind = enum { thread_markdown, workspace_json };
+
+pub const ExportRecord = struct {
+    kind: ExportKind,
+    thread_id: u32 = 0,
+    path: [1024]u8 = undefined,
+    path_len: usize = 0,
 };
 
 pub const MetaRecord = struct {
@@ -153,6 +204,8 @@ pub const Command = union(enum) {
     load_history: struct { thread_id: u32, before_id: u32, limit: usize },
     search: SearchRequest,
     upsert_cached_model: CachedModelRecord,
+    save_snippets: *SnippetSet,
+    export_file: *ExportRecord,
 };
 
 pub const HistoryResult = struct {
@@ -191,6 +244,7 @@ pub const Worker = struct {
     thread: ?std.Thread = null,
     history_result: ?HistoryResult = null,
     search_result: ?SearchResult = null,
+    export_result: ?bool = null,
 
     pub fn create(allocator: std.mem.Allocator, database: storage.Database, io: std.Io) !*Worker {
         const worker = try allocator.create(Worker);
@@ -220,6 +274,14 @@ pub const Worker = struct {
 
     pub fn enqueueReconcile(worker: *Worker, record: ReconcileRecord) bool {
         return worker.enqueueOwned(record, .reconcile);
+    }
+
+    pub fn enqueueSnippets(worker: *Worker, record: SnippetSet) bool {
+        return worker.enqueueOwned(record, .save_snippets);
+    }
+
+    pub fn enqueueExport(worker: *Worker, record: ExportRecord) bool {
+        return worker.enqueueOwned(record, .export_file);
     }
 
     fn enqueueOwned(worker: *Worker, record: anytype, comptime tag: std.meta.Tag(Command)) bool {
@@ -257,6 +319,14 @@ pub const Worker = struct {
         defer worker.mutex.unlock();
         const result = worker.search_result;
         worker.search_result = null;
+        return result;
+    }
+
+    pub fn takeExportResult(worker: *Worker) ?bool {
+        worker.mutex.lock();
+        defer worker.mutex.unlock();
+        const result = worker.export_result;
+        worker.export_result = null;
         return result;
     }
 
@@ -347,7 +417,7 @@ pub const Worker = struct {
             },
             .upsert_message => |record| {
                 defer worker.allocator.destroy(record);
-                try worker.database.upsertMessage(record.id, record.thread_id, record.role, record.content[0..record.content_len]);
+                try worker.database.upsertMessageWithMetrics(record.id, record.thread_id, record.role, record.content[0..record.content_len], record.response_model[0..record.response_model_len], record.latency_ms, record.prompt_tokens, record.completion_tokens, record.cost_micros);
                 try worker.database.replaceAttachments(record.thread_id, record.id, record.attachments[0..record.attachment_count]);
             },
             .clear_messages => |thread_id| try worker.database.clearMessages(thread_id),
@@ -381,6 +451,24 @@ pub const Worker = struct {
                 record.favorite,
                 record.updated_at_ms,
             ),
+            .save_snippets => |record| {
+                defer worker.allocator.destroy(record);
+                try worker.database.replaceSnippets(record.snippets[0..record.count]);
+            },
+            .export_file => |record| {
+                defer worker.allocator.destroy(record);
+                const success = blk: {
+                    const path = record.path[0..record.path_len];
+                    switch (record.kind) {
+                        .thread_markdown => worker.database.exportThreadMarkdown(worker.allocator, worker.io, record.thread_id, path) catch break :blk false,
+                        .workspace_json => worker.database.exportWorkspaceJson(worker.allocator, worker.io, path) catch break :blk false,
+                    }
+                    break :blk true;
+                };
+                worker.mutex.lock();
+                defer worker.mutex.unlock();
+                worker.export_result = success;
+            },
         }
     }
 
@@ -389,6 +477,8 @@ pub const Worker = struct {
             .upsert_thread => |record| worker.allocator.destroy(record),
             .upsert_message => |record| worker.allocator.destroy(record),
             .reconcile => |record| worker.allocator.destroy(record),
+            .save_snippets => |record| worker.allocator.destroy(record),
+            .export_file => |record| worker.allocator.destroy(record),
             else => {},
         }
     }
@@ -396,7 +486,7 @@ pub const Worker = struct {
 
 fn isReadCommand(command: Command) bool {
     return switch (command) {
-        .load_history, .search => true,
+        .load_history, .search, .export_file => true,
         else => false,
     };
 }

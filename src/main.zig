@@ -66,6 +66,10 @@ const max_api_key_bytes = 256;
 const max_status_bytes = 240;
 const max_toast_bytes = 96;
 const max_search_results = 24;
+const max_palette_workspace_results = 12;
+const max_snippets = persistence.max_snippets;
+const max_snippet_name_bytes = persistence.max_snippet_name_bytes;
+const max_snippet_body_bytes = persistence.max_snippet_body_bytes;
 const max_stream_line_bytes = 32 * 1024;
 const max_request_bytes = native_sdk.max_effect_fetch_payload_bytes;
 const max_attachments_per_message = 4;
@@ -131,7 +135,8 @@ pub const RenameKind = enum { project, thread };
 pub const ConnectionState = enum { disabled, checking, connected, disconnected, connecting, unavailable, failed };
 pub const UpdateState = enum { idle, checking, current, available, failed };
 pub const AttachmentKind = enum { image, pdf, text };
-pub const PaletteAction = enum { search, new_thread, new_project_thread, attach, archive, settings };
+pub const PaletteAction = enum { search, new_thread, new_project_thread, move_thread, attach, snippets, export_thread, export_workspace, archive, settings };
+pub const ExportKind = enum { none, thread_markdown, workspace_json };
 
 pub const Attachment = struct {
     kind: AttachmentKind = .text,
@@ -196,6 +201,12 @@ pub const Message = struct {
     role: Role = .user,
     content_storage: []u8 = @constCast(&[_]u8{}),
     content_len: usize = 0,
+    response_model_storage: [max_model_bytes]u8 = undefined,
+    response_model_len: usize = 0,
+    latency_ms: u32 = 0,
+    prompt_tokens: u32 = 0,
+    completion_tokens: u32 = 0,
+    cost_micros: u64 = 0,
     attachments: [max_attachments_per_message]Attachment = [_]Attachment{.{}} ** max_attachments_per_message,
     attachment_count: usize = 0,
 
@@ -209,6 +220,38 @@ pub const Message = struct {
 
     pub fn isAssistant(message: *const Message) bool {
         return message.role == .assistant;
+    }
+
+    pub fn responseModel(message: *const Message) []const u8 {
+        return message.response_model_storage[0..message.response_model_len];
+    }
+
+    pub fn hasMetrics(message: *const Message) bool {
+        return message.role == .assistant and (message.response_model_len > 0 or message.latency_ms > 0 or message.prompt_tokens > 0 or message.completion_tokens > 0 or message.cost_micros > 0);
+    }
+
+    pub fn metricsLabel(message: *const Message, arena: std.mem.Allocator) []const u8 {
+        if (!message.hasMetrics()) return "";
+        var writer: std.Io.Writer.Allocating = .init(arena);
+        if (message.response_model_len > 0) writer.writer.writeAll(message.responseModel()) catch return "Response details";
+        if (message.latency_ms > 0) {
+            if (writer.written().len > 0) writer.writer.writeAll("  ·  ") catch return "Response details";
+            writer.writer.print("{d:.1}s", .{@as(f64, @floatFromInt(message.latency_ms)) / 1000.0}) catch return "Response details";
+        }
+        if (message.prompt_tokens > 0 or message.completion_tokens > 0) {
+            if (writer.written().len > 0) writer.writer.writeAll("  ·  ") catch return "Response details";
+            writer.writer.print("{d} in / {d} out", .{ message.prompt_tokens, message.completion_tokens }) catch return "Response details";
+        }
+        if (message.cost_micros > 0) {
+            if (writer.written().len > 0) writer.writer.writeAll("  ·  ") catch return "Response details";
+            writer.writer.print("${d:.4}", .{@as(f64, @floatFromInt(message.cost_micros)) / 1_000_000.0}) catch return "Response details";
+        }
+        return writer.written();
+    }
+
+    pub fn responseActionLabel(message: *const Message, arena: std.mem.Allocator) []const u8 {
+        if (!message.hasMetrics()) return "Copy";
+        return std.fmt.allocPrint(arena, "Copy  ·  {s}", .{message.metricsLabel(arena)}) catch "Copy";
     }
 
     pub fn hasAttachments(message: *const Message) bool {
@@ -251,6 +294,22 @@ pub const Project = struct {
     }
 };
 
+pub const PromptSnippet = struct {
+    id: u32 = 0,
+    name_storage: [max_snippet_name_bytes]u8 = undefined,
+    name_len: usize = 0,
+    body_storage: [max_snippet_body_bytes]u8 = undefined,
+    body_len: usize = 0,
+
+    pub fn name(snippet: *const PromptSnippet) []const u8 {
+        return snippet.name_storage[0..snippet.name_len];
+    }
+
+    pub fn body(snippet: *const PromptSnippet) []const u8 {
+        return snippet.body_storage[0..snippet.body_len];
+    }
+};
+
 pub const Thread = struct {
     id: u32 = 0,
     project_id: u32 = 0,
@@ -279,6 +338,10 @@ pub const Thread = struct {
     request_path_len: usize = 0,
     draft_attachments: [max_attachments_per_message]Attachment = [_]Attachment{.{}} ** max_attachments_per_message,
     draft_attachment_count: usize = 0,
+    request_started_ms: i64 = 0,
+    request_prompt_tokens: u32 = 0,
+    request_completion_tokens: u32 = 0,
+    request_cost_micros: u64 = 0,
 
     pub fn title(thread: *const Thread) []const u8 {
         return thread.title_storage[0..thread.title_len];
@@ -478,6 +541,24 @@ pub const SearchRow = struct {
     snippet: []const u8,
 };
 
+pub const PaletteWorkspaceRow = struct {
+    key: u64,
+    title: []const u8,
+    detail: []const u8,
+};
+
+pub const MoveProjectRow = struct {
+    id: u32,
+    name: []const u8,
+    selected: bool,
+};
+
+pub const SnippetRow = struct {
+    id: u32,
+    command: []const u8,
+    preview: []const u8,
+};
+
 const SearchEntry = struct {
     thread_id: u32 = 0,
     title_storage: [max_thread_title_bytes]u8 = undefined,
@@ -549,6 +630,10 @@ pub const cmd_clear_thread = "workspace.clear-thread";
 pub const cmd_close_overlay = "workspace.close-overlay";
 pub const cmd_top_level_chats = "workspace.top-level-chats";
 pub const cmd_load_older = "workspace.load-older";
+pub const cmd_move_thread = "workspace.move-thread";
+pub const cmd_export_thread = "workspace.export-thread";
+pub const cmd_export_workspace = "workspace.export-workspace";
+pub const cmd_snippets = "workspace.snippets";
 pub const project_slot_commands = [_][]const u8{
     "workspace.project-1",
     "workspace.project-2",
@@ -657,9 +742,16 @@ const ApiStreamChoice = struct {
     delta: ApiStreamDelta = .{},
 };
 
+const ApiUsage = struct {
+    prompt_tokens: u32 = 0,
+    completion_tokens: u32 = 0,
+    cost: f64 = 0,
+};
+
 const ApiStreamChunk = struct {
     choices: []const ApiStreamChoice = &.{},
     model: []const u8 = "",
+    usage: ?ApiUsage = null,
     @"error": ?ApiError = null,
 };
 
@@ -707,7 +799,6 @@ pub const Msg = union(enum) {
     search_edit: canvas.TextInputEvent,
     fork_seed_edit: canvas.TextInputEvent,
     toggle_model_picker,
-    close_model_picker,
     select_model: ModelChoice,
     select_quick_model: u8,
     select_auto_model,
@@ -720,8 +811,8 @@ pub const Msg = union(enum) {
     search_timer: native_sdk.EffectTimer,
     database_poll: native_sdk.EffectTimer,
     open_search,
-    close_search,
     select_search_result: u8,
+    select_palette_workspace: u64,
     palette_action: PaletteAction,
     open_settings,
     close_settings,
@@ -748,6 +839,18 @@ pub const Msg = union(enum) {
     rename_edit: canvas.TextInputEvent,
     save_rename,
     close_rename,
+    open_move_thread,
+    move_thread_to: u32,
+    open_snippets,
+    snippet_name_edit: canvas.TextInputEvent,
+    snippet_body_edit: canvas.TextInputEvent,
+    save_snippet,
+    use_snippet: u32,
+    delete_snippet: u32,
+    export_thread,
+    export_workspace,
+    export_started,
+    export_finished: bool,
     archive_thread,
     archive_project,
     open_archive,
@@ -831,6 +934,12 @@ pub const Msg = union(enum) {
         "select_project_slot",
         "select_thread_slot",
         "open_file_picker",
+        "open_move_thread",
+        "open_snippets",
+        "export_thread",
+        "export_workspace",
+        "export_started",
+        "export_finished",
     };
 };
 
@@ -880,6 +989,17 @@ pub const Model = struct {
     rename_kind: RenameKind = .thread,
     rename_id: u32 = 0,
     rename_buffer: canvas.TextBuffer(max_thread_title_bytes) = .{},
+    move_open: bool = false,
+    move_thread_id: u32 = 0,
+    snippets: [max_snippets]PromptSnippet = undefined,
+    snippet_count: usize = 0,
+    next_snippet_id: u32 = 1,
+    snippet_name_buffer: canvas.TextBuffer(max_snippet_name_bytes) = .{},
+    snippet_body_buffer: canvas.TextBuffer(max_snippet_body_bytes) = .{},
+    snippets_dirty: bool = false,
+    export_request: ExportKind = .none,
+    export_thread_id: u32 = 0,
+    export_pending: bool = false,
     archive_open: bool = false,
     clear_confirm_thread_id: u32 = 0,
     delete_confirm_open: bool = false,
@@ -888,8 +1008,6 @@ pub const Model = struct {
     clock: native_sdk.Clock = .system,
     composer_focus_flip: bool = false,
     credential_action: CredentialAction = .none,
-    chrome_leading: f32 = 0,
-    chrome_trailing: f32 = 0,
     header_height: f32 = header_natural_height,
     toast_storage: [max_toast_bytes]u8 = undefined,
     toast_len: usize = 0,
@@ -970,6 +1088,16 @@ pub const Model = struct {
         "rename_kind",
         "rename_id",
         "rename_buffer",
+        "move_thread_id",
+        "snippets",
+        "snippet_count",
+        "next_snippet_id",
+        "snippet_name_buffer",
+        "snippet_body_buffer",
+        "snippets_dirty",
+        "export_request",
+        "export_thread_id",
+        "export_pending",
         "clock",
         "toast_storage",
         "toast_len",
@@ -1008,6 +1136,7 @@ pub const Model = struct {
         "active_thread_id",
         "modelOptions",
         "activeModelChoice",
+        "archiveEmpty",
     };
 
     pub const quickModels = [_]QuickModel{
@@ -1074,6 +1203,10 @@ pub const Model = struct {
         .{ .action = "Open archive", .keys = "Cmd + Shift + H" },
         .{ .action = "Clear current chat", .keys = "Cmd + Shift + Backspace" },
         .{ .action = "Load earlier messages", .keys = "Cmd + Option + L" },
+        .{ .action = "Move chat", .keys = "Cmd + Shift + M" },
+        .{ .action = "Prompt snippets", .keys = "Cmd + Option + P" },
+        .{ .action = "Export current chat", .keys = "Cmd + Shift + S" },
+        .{ .action = "Export workspace backup", .keys = "Cmd + Option + Shift + S" },
         .{ .action = "Send message", .keys = "Enter" },
         .{ .action = "New line in message", .keys = "Cmd + Enter" },
         .{ .action = "Close overlay", .keys = "Escape" },
@@ -1083,10 +1216,81 @@ pub const Model = struct {
         .{ .id = .search, .label = "Search every chat", .shortcut = "Cmd + F" },
         .{ .id = .new_thread, .label = "New top-level chat", .shortcut = "Cmd + N" },
         .{ .id = .new_project_thread, .label = "New chat in project", .shortcut = "Cmd + Opt + N" },
+        .{ .id = .move_thread, .label = "Move current chat", .shortcut = "Cmd + Shift + M" },
         .{ .id = .attach, .label = "Attach files", .shortcut = "Cmd + U" },
+        .{ .id = .snippets, .label = "Prompt snippets", .shortcut = "Cmd + Opt + P" },
+        .{ .id = .export_thread, .label = "Export current chat", .shortcut = "Cmd + Shift + S" },
+        .{ .id = .export_workspace, .label = "Export workspace backup", .shortcut = "Cmd + Opt + Shift + S" },
         .{ .id = .archive, .label = "Open archive", .shortcut = "Cmd + Shift + H" },
         .{ .id = .settings, .label = "Settings and shortcuts", .shortcut = "Cmd + ," },
     };
+
+    pub fn paletteWorkspaceRows(model: *const Model, arena: std.mem.Allocator) []const PaletteWorkspaceRow {
+        const rows = arena.alloc(PaletteWorkspaceRow, max_palette_workspace_results) catch return &.{};
+        const query = std.mem.trim(u8, model.model_search_buffer.text(), " \t\r\n");
+        var count: usize = 0;
+        for (model.threads[0..model.thread_count]) |*thread| {
+            if (count == rows.len or thread.isArchived()) break;
+            const project = model.projectByIdConst(thread.project_id) orelse continue;
+            if (project.isArchived()) continue;
+            if (query.len > 0 and std.ascii.indexOfIgnoreCase(thread.title(), query) == null and std.ascii.indexOfIgnoreCase(project.name(), query) == null) continue;
+            rows[count] = .{
+                .key = (@as(u64, 1) << 32) | thread.id,
+                .title = thread.title(),
+                .detail = if (thread.project_id == chats_project_id) "Chat" else project.name(),
+            };
+            count += 1;
+        }
+        if (count < rows.len) for (model.projects[0..model.project_count]) |*project| {
+            if (count == rows.len) break;
+            if (project.id == chats_project_id or project.isArchived()) continue;
+            if (query.len > 0 and std.ascii.indexOfIgnoreCase(project.name(), query) == null) continue;
+            rows[count] = .{ .key = project.id, .title = project.name(), .detail = "Project" };
+            count += 1;
+        };
+        return rows[0..count];
+    }
+
+    pub fn moveProjectRows(model: *const Model, arena: std.mem.Allocator) []const MoveProjectRow {
+        const rows = arena.alloc(MoveProjectRow, model.project_count) catch return &.{};
+        const thread = model.threadByIdConst(model.move_thread_id);
+        var count: usize = 0;
+        for (model.projects[0..model.project_count]) |*project| {
+            if (project.isArchived()) continue;
+            rows[count] = .{
+                .id = project.id,
+                .name = if (project.id == chats_project_id) "Top-level chats" else project.name(),
+                .selected = thread != null and thread.?.project_id == project.id,
+            };
+            count += 1;
+        }
+        return rows[0..count];
+    }
+
+    pub fn snippetRows(model: *const Model, arena: std.mem.Allocator) []const SnippetRow {
+        const rows = arena.alloc(SnippetRow, model.snippet_count) catch return &.{};
+        for (model.snippets[0..model.snippet_count], 0..) |*snippet, index| {
+            rows[index] = .{
+                .id = snippet.id,
+                .command = std.fmt.allocPrint(arena, "/{s}", .{snippet.name()}) catch snippet.name(),
+                .preview = snippet.body()[0..utf8PrefixLen(snippet.body(), 120)],
+            };
+        }
+        return rows;
+    }
+
+    pub fn snippetName(model: *const Model) []const u8 {
+        return model.snippet_name_buffer.text();
+    }
+
+    pub fn snippetBody(model: *const Model) []const u8 {
+        return model.snippet_body_buffer.text();
+    }
+
+    pub fn cannotSaveSnippet(model: *const Model) bool {
+        const name = std.mem.trim(u8, model.snippet_name_buffer.text(), " /\t\r\n");
+        return name.len == 0 or model.snippet_body_buffer.isEmpty() or model.snippet_count == model.snippets.len;
+    }
 
     pub fn searchText(model: *const Model) []const u8 {
         return model.search_buffer.text();
@@ -1440,22 +1644,125 @@ pub const Model = struct {
         model.markThreadDirty(thread.id);
     }
 
+    fn openMoveThread(model: *Model) void {
+        model.model_picker_open = false;
+        model.settings_open = false;
+        model.move_thread_id = model.active_thread_id;
+        model.move_open = model.move_thread_id != 0;
+        model.model_picker_open = model.move_open;
+    }
+
+    fn moveThread(model: *Model, project_id: u32) bool {
+        const project = model.projectByIdConst(project_id) orelse return false;
+        if (project.isArchived()) return false;
+        const thread = model.threadById(model.move_thread_id) orelse return false;
+        if (thread.project_id == project_id) {
+            model.move_open = false;
+            model.model_picker_open = false;
+            model.move_thread_id = 0;
+            return false;
+        }
+        thread.project_id = project_id;
+        model.active_project_id = project_id;
+        model.active_thread_id = thread.id;
+        model.move_open = false;
+        model.model_picker_open = false;
+        model.move_thread_id = 0;
+        model.markStructureDirty();
+        return true;
+    }
+
+    fn snippetById(model: *Model, id: u32) ?*PromptSnippet {
+        for (model.snippets[0..model.snippet_count]) |*snippet| if (snippet.id == id) return snippet;
+        return null;
+    }
+
+    fn saveSnippet(model: *Model) bool {
+        const raw_name = std.mem.trim(u8, model.snippet_name_buffer.text(), " /\t\r\n");
+        const raw_body = std.mem.trim(u8, model.snippet_body_buffer.text(), " \t\r\n");
+        if (raw_name.len == 0 or raw_body.len == 0) return false;
+        var target: ?*PromptSnippet = null;
+        for (model.snippets[0..model.snippet_count]) |*snippet| {
+            if (std.ascii.eqlIgnoreCase(snippet.name(), raw_name)) target = snippet;
+        }
+        if (target == null) {
+            if (model.snippet_count == model.snippets.len) return false;
+            model.snippets[model.snippet_count] = .{ .id = model.next_snippet_id };
+            model.next_snippet_id += 1;
+            target = &model.snippets[model.snippet_count];
+            model.snippet_count += 1;
+        }
+        const snippet = target.?;
+        snippet.name_len = utf8PrefixLen(raw_name, snippet.name_storage.len);
+        @memcpy(snippet.name_storage[0..snippet.name_len], raw_name[0..snippet.name_len]);
+        snippet.body_len = utf8PrefixLen(raw_body, snippet.body_storage.len);
+        @memcpy(snippet.body_storage[0..snippet.body_len], raw_body[0..snippet.body_len]);
+        model.snippet_name_buffer.clear();
+        model.snippet_body_buffer.clear();
+        model.snippets_dirty = true;
+        return true;
+    }
+
+    fn deleteSnippet(model: *Model, id: u32) bool {
+        for (model.snippets[0..model.snippet_count], 0..) |snippet, index| {
+            if (snippet.id != id) continue;
+            std.mem.copyForwards(PromptSnippet, model.snippets[index .. model.snippet_count - 1], model.snippets[index + 1 .. model.snippet_count]);
+            model.snippet_count -= 1;
+            model.snippets_dirty = true;
+            return true;
+        }
+        return false;
+    }
+
+    fn insertSnippet(model: *Model, id: u32) bool {
+        const snippet = model.snippetById(id) orelse return false;
+        const thread = model.activeThread() orelse return false;
+        thread.draft_buffer.set(snippet.body());
+        model.model_picker_open = false;
+        model.settings_open = false;
+        model.focusComposer();
+        model.markThreadDirty(thread.id);
+        return true;
+    }
+
+    fn expandSnippetDraft(model: *Model, thread: *Thread) void {
+        const draft_text = std.mem.trim(u8, thread.draft(), " \t\r\n");
+        if (draft_text.len < 2 or draft_text[0] != '/') return;
+        const command = draft_text[1..];
+        for (model.snippets[0..model.snippet_count]) |*snippet| {
+            if (!std.ascii.eqlIgnoreCase(snippet.name(), command)) continue;
+            thread.draft_buffer.set(snippet.body());
+            return;
+        }
+    }
+
     pub fn activeModelChoice(model: *const Model) ModelChoice {
         const thread = model.activeThreadConst() orelse return .auto;
         return thread.model_choice;
     }
 
-    pub fn forkSeed(model: *const Model) []const u8 {
-        return model.fork_seed_buffer.text();
+    pub fn ensureDefaultSnippets(model: *Model) void {
+        if (model.snippet_count > 0) return;
+        const defaults = [_]struct { name: []const u8, body: []const u8 }{
+            .{ .name = "summarize", .body = "Summarize this clearly. Lead with the key conclusion, then list the most important supporting points." },
+            .{ .name = "rewrite", .body = "Rewrite the following so it is concise, natural, and easy to understand while preserving the original meaning:\n\n" },
+            .{ .name = "review", .body = "Review the following critically. Identify the highest-impact problems first, explain why they matter, and recommend concrete improvements:\n\n" },
+        };
+        for (defaults) |item| {
+            var snippet = PromptSnippet{ .id = model.next_snippet_id };
+            model.next_snippet_id += 1;
+            snippet.name_len = utf8PrefixLen(item.name, snippet.name_storage.len);
+            @memcpy(snippet.name_storage[0..snippet.name_len], item.name[0..snippet.name_len]);
+            snippet.body_len = utf8PrefixLen(item.body, snippet.body_storage.len);
+            @memcpy(snippet.body_storage[0..snippet.body_len], item.body[0..snippet.body_len]);
+            model.snippets[model.snippet_count] = snippet;
+            model.snippet_count += 1;
+        }
+        model.snippets_dirty = true;
     }
 
-    pub fn forkSourcePreview(model: *const Model) []const u8 {
-        const thread = model.threadByIdConst(model.fork_source_thread_id) orelse return "Response unavailable";
-        for (thread.messages[0..thread.message_count]) |*message| {
-            if (message.id != model.fork_source_message_id) continue;
-            return message.content()[0..utf8PrefixLen(message.content(), 320)];
-        }
-        return "Response unavailable";
+    pub fn forkSeed(model: *const Model) []const u8 {
+        return model.fork_seed_buffer.text();
     }
 
     pub fn forkModelRows(model: *const Model, arena: std.mem.Allocator) []const ForkModelRow {
@@ -1612,15 +1919,6 @@ pub const Model = struct {
             .codex_subscription, .claude_subscription => false,
             else => model.api_key_len == 0,
         };
-    }
-
-    pub fn forkNeedsOpenRouterKey(model: *const Model) bool {
-        if (model.api_key_len > 0) return false;
-        for (modelOptions) |option| {
-            if (option.choice == .codex_subscription or option.choice == .claude_subscription) continue;
-            if (model.fork_model_mask & forkChoiceBit(option.choice) != 0) return true;
-        }
-        return false;
     }
 
     pub fn sending(model: *const Model) bool {
@@ -2418,6 +2716,7 @@ pub fn initialModelWithClock(api_key: []const u8, clock: native_sdk.Clock) Model
 
 fn initialModelWithOptionsAndClock(api_key: []const u8, dev_mode: bool, force_onboarding: bool, clock: native_sdk.Clock) Model {
     var model = Model{ .dev_mode = dev_mode, .force_onboarding = force_onboarding, .clock = clock };
+    model.ensureDefaultSnippets();
     model.setApiKey(api_key);
     std.debug.assert(model.ensureChatsProject());
     model.active_project_id = chats_project_id;
@@ -2461,6 +2760,10 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, cmd_codex_subscription)) return .{ .select_model = .codex_subscription };
     if (std.mem.eql(u8, name, cmd_top_level_chats)) return .select_top_level_chats;
     if (std.mem.eql(u8, name, cmd_load_older)) return .load_older;
+    if (std.mem.eql(u8, name, cmd_move_thread)) return .open_move_thread;
+    if (std.mem.eql(u8, name, cmd_export_thread)) return .export_thread;
+    if (std.mem.eql(u8, name, cmd_export_workspace)) return .export_workspace;
+    if (std.mem.eql(u8, name, cmd_snippets)) return .open_snippets;
     if (std.mem.eql(u8, name, cmd_settings)) return .open_settings;
     if (std.mem.eql(u8, name, cmd_fork_latest)) return .fork_latest;
     if (std.mem.eql(u8, name, cmd_copy_latest)) return .copy_latest;
@@ -2591,6 +2894,7 @@ fn receiveAttachment(model: *Model, result: native_sdk.EffectFileResult, fx: *Ef
 
 fn closeSearch(model: *Model, fx: *Effects) void {
     model.search_open = false;
+    model.model_picker_open = false;
     model.search_buffer.clear();
     model.search_generation +%= 1;
     model.search_result_count = 0;
@@ -2601,6 +2905,7 @@ fn closeSearch(model: *Model, fx: *Effects) void {
 
 fn databaseReadPending(model: *const Model) bool {
     if (model.search_loading) return true;
+    if (model.export_pending) return true;
     for (model.threads[0..model.thread_count]) |thread| if (thread.history_loading) return true;
     return false;
 }
@@ -2689,14 +2994,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             pollDatabaseReads(model, fx);
         },
         .open_search => {
-            model.model_picker_open = false;
+            model.model_picker_open = true;
             model.settings_open = false;
             model.fork_open = false;
             model.rename_open = false;
             model.archive_open = false;
+            model.move_open = false;
             model.search_open = true;
         },
-        .close_search => closeSearch(model, fx),
         .select_search_result => |index| {
             if (index >= model.search_result_count) return;
             const thread_id = model.search_results[index].thread_id;
@@ -2706,13 +3011,27 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.showToast("Opened matching chat", fx);
             }
         },
+        .select_palette_workspace => |key| {
+            model.model_picker_open = false;
+            if (key & (@as(u64, 1) << 32) != 0) {
+                const thread_id: u32 = @intCast(key & 0xffff_ffff);
+                if (model.activateThread(thread_id)) model.markMetaDirty();
+            } else {
+                const project_id: u32 = @intCast(key);
+                if (model.activateFirstThreadInProject(project_id)) model.markMetaDirty();
+            }
+        },
         .palette_action => |action| {
             model.model_picker_open = false;
             switch (action) {
                 .search => update(model, .open_search, fx),
                 .new_thread => update(model, .new_thread, fx),
                 .new_project_thread => update(model, .new_project_thread, fx),
+                .move_thread => update(model, .open_move_thread, fx),
                 .attach => update(model, .open_file_picker, fx),
+                .snippets => update(model, .open_snippets, fx),
+                .export_thread => update(model, .export_thread, fx),
+                .export_workspace => update(model, .export_workspace, fx),
                 .archive => update(model, .open_archive, fx),
                 .settings => update(model, .open_settings, fx),
             }
@@ -2721,7 +3040,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.model_picker_open = !model.model_picker_open;
             if (model.model_picker_open and model.model_catalog_count == 0) model.setModelCatalogStatus("Search OpenRouter by model or provider");
         },
-        .close_model_picker => model.model_picker_open = false,
         .select_model => |choice| {
             if (choice == .claude_subscription and !model.dev_mode) {
                 model.setStatus("The experimental Claude connection is disabled in public builds");
@@ -2761,6 +3079,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.fork_open = false;
             model.rename_open = false;
             model.archive_open = false;
+            model.move_open = false;
             model.clear_confirm_thread_id = 0;
             model.clearApiKeyInput();
             model.settings_open = true;
@@ -2841,6 +3160,41 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.rename_open = false;
             model.rename_id = 0;
             model.rename_buffer.clear();
+        },
+        .open_move_thread => {
+            closeSearch(model, fx);
+            model.openMoveThread();
+        },
+        .move_thread_to => |project_id| {
+            if (model.moveThread(project_id)) model.showToast("Chat moved", fx);
+        },
+        .open_snippets => {
+            closeSearch(model, fx);
+            model.model_picker_open = false;
+            model.settings_open = true;
+            model.move_open = false;
+        },
+        .snippet_name_edit => |edit| model.snippet_name_buffer.apply(edit),
+        .snippet_body_edit => |edit| model.snippet_body_buffer.apply(edit),
+        .save_snippet => if (model.saveSnippet()) model.showToast("Prompt snippet saved", fx),
+        .use_snippet => |id| if (model.insertSnippet(id)) model.showToast("Prompt inserted", fx),
+        .delete_snippet => |id| if (model.deleteSnippet(id)) model.showToast("Prompt snippet deleted", fx),
+        .export_thread => {
+            if (model.export_pending) return;
+            model.export_thread_id = model.active_thread_id;
+            model.export_request = .thread_markdown;
+        },
+        .export_workspace => {
+            if (model.export_pending) return;
+            model.export_request = .workspace_json;
+        },
+        .export_started => {
+            model.export_pending = true;
+            pollDatabaseReads(model, fx);
+        },
+        .export_finished => |success| {
+            model.export_pending = false;
+            model.showToast(if (success) "Export saved" else "Export failed", fx);
         },
         .archive_thread => {
             if (model.archiveThread(fx)) {
@@ -2979,6 +3333,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.fork_open = false;
             model.rename_open = false;
             model.archive_open = false;
+            model.move_open = false;
             model.clear_confirm_thread_id = 0;
             model.delete_confirm_open = false;
             model.model_picker_open = true;
@@ -2990,11 +3345,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.rename_open = false;
             model.archive_open = false;
             model.model_picker_open = false;
+            model.move_open = false;
+            model.move_thread_id = 0;
             closeSearch(model, fx);
             model.clear_confirm_thread_id = 0;
             model.clearApiKeyInput();
             model.fork_seed_buffer.clear();
             model.rename_buffer.clear();
+            model.snippet_name_buffer.clear();
+            model.snippet_body_buffer.clear();
         },
         .load_older => {
             const thread = model.activeThread() orelse return;
@@ -3103,8 +3462,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             markLatestAssistantDirty(model, thread_id);
         },
         .chrome_changed => |chrome| {
-            model.chrome_leading = chrome.insets.left;
-            model.chrome_trailing = chrome.insets.right;
             model.header_height = @max(header_natural_height, chrome.insets.top);
         },
     }
@@ -3568,7 +3925,9 @@ fn startHarnessRequest(model: *Model, thread: *Thread, fx: *Effects) bool {
 }
 
 fn sendThread(model: *Model, thread: *Thread, fx: *Effects) void {
-    if (thread.sending or (thread.draft_buffer.isEmpty() and thread.draft_attachment_count == 0) or thread.model_buffer.isEmpty()) return;
+    if (thread.sending) return;
+    model.expandSnippetDraft(thread);
+    if ((thread.draft_buffer.isEmpty() and thread.draft_attachment_count == 0) or thread.model_buffer.isEmpty()) return;
     if (thread.model_choice == .claude_subscription and !model.dev_mode) {
         thread.setStatus("The experimental Claude connection is disabled in public builds");
         return;
@@ -3600,6 +3959,10 @@ fn sendThread(model: *Model, thread: *Thread, fx: *Effects) void {
     }
     if (!thread.appendMessage(model.allocator, &model.next_message_id, .user, thread.draft())) return;
     thread.draft_buffer.clear();
+    thread.request_started_ms = model.clock.wallMs();
+    thread.request_prompt_tokens = 0;
+    thread.request_completion_tokens = 0;
+    thread.request_cost_micros = 0;
 
     if (isSubscriptionChoice(thread.model_choice)) {
         _ = startHarnessRequest(model, thread, fx);
@@ -3683,6 +4046,11 @@ fn receiveStreamLine(model: *Model, line: native_sdk.EffectLine, fx: *Effects) v
         return;
     }
     if (parsed.value.model.len > 0) thread.setActiveModel(parsed.value.model);
+    if (parsed.value.usage) |usage| {
+        thread.request_prompt_tokens = usage.prompt_tokens;
+        thread.request_completion_tokens = usage.completion_tokens;
+        if (usage.cost > 0 and usage.cost < 1_000_000) thread.request_cost_micros = @intFromFloat(@round(usage.cost * 1_000_000.0));
+    }
     if (parsed.value.choices.len == 0) return;
     const content = parsed.value.choices[0].delta.content orelse return;
     if (!thread.queueStreamDelta(model.allocator, content)) {
@@ -3762,6 +4130,20 @@ fn receiveHarnessLine(model: *Model, line: native_sdk.EffectLine, fx: *Effects) 
     }
 }
 
+fn finalizeResponseMetrics(model: *Model, thread: *Thread) void {
+    const index = thread.stream_message_index orelse return;
+    if (index >= thread.message_count) return;
+    const message = &thread.messages[index];
+    const response_model = if (thread.active_model_len > 0) thread.active_model_storage[0..thread.active_model_len] else thread.modelName();
+    message.response_model_len = utf8PrefixLen(response_model, message.response_model_storage.len);
+    @memcpy(message.response_model_storage[0..message.response_model_len], response_model[0..message.response_model_len]);
+    const elapsed = @max(model.clock.wallMs() - thread.request_started_ms, 0);
+    message.latency_ms = @intCast(@min(elapsed, std.math.maxInt(u32)));
+    message.prompt_tokens = thread.request_prompt_tokens;
+    message.completion_tokens = thread.request_completion_tokens;
+    message.cost_micros = thread.request_cost_micros;
+}
+
 fn receiveHarnessExit(model: *Model, exit_event: native_sdk.EffectExit, fx: *Effects) bool {
     const thread_id = requestThreadId(exit_event.key) orelse return false;
     const thread = model.threadById(thread_id) orelse return false;
@@ -3778,6 +4160,7 @@ fn receiveHarnessExit(model: *Model, exit_event: native_sdk.EffectExit, fx: *Eff
         thread.setStatus("Response exceeded the 64 KiB safety limit");
     }
     const received_content = thread.stream_message_index != null;
+    finalizeResponseMetrics(model, thread);
     thread.sending = false;
     thread.stream_message_index = null;
     if (exit_event.reason == .cancelled) {
@@ -3817,6 +4200,7 @@ fn receiveOpenRouterExit(model: *Model, exit_event: native_sdk.EffectExit, fx: *
         thread.setStatus("Response exceeded the 64 KiB safety limit");
     }
     const received_content = thread.stream_message_index != null;
+    finalizeResponseMetrics(model, thread);
     thread.sending = false;
     thread.stream_message_index = null;
     if (thread.stream_failed) return false;
@@ -3848,6 +4232,7 @@ fn receive(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) boo
         thread.stream_failed = true;
         thread.setStatus("Response exceeded the 64 KiB safety limit");
     }
+    finalizeResponseMetrics(model, thread);
     return receiveThread(thread, response);
 }
 
@@ -3911,7 +4296,7 @@ pub fn onChrome(chrome: native_sdk.WindowChrome) ?Msg {
 pub const AppUi = canvas.Ui(Msg);
 pub const app_markup = @embedFile("app.native");
 pub const CompiledAppView = blk: {
-    @setEvalBranchQuota(200_000);
+    @setEvalBranchQuota(1_000_000);
     const View = canvas.CompiledMarkupView(Model, Msg, app_markup);
     _ = View.document;
     break :blk View;
@@ -3996,6 +4381,34 @@ const SecureChatApp = struct {
                 }
             }
         }
+        if (self.chat.model.export_request != .none) {
+            const kind = self.chat.model.export_request;
+            self.chat.model.export_request = .none;
+            const filters = [_]native_sdk.platform.FileFilter{.{
+                .name = if (kind == .thread_markdown) "Markdown" else "JSON",
+                .extensions = if (kind == .thread_markdown) &.{"md"} else &.{"json"},
+            }};
+            var path_buffer: [native_sdk.platform.max_dialog_path_bytes]u8 = undefined;
+            const selected = runtime.showSaveDialog(.{
+                .title = if (kind == .thread_markdown) "Export chat" else "Export Superchat workspace",
+                .default_name = if (kind == .thread_markdown) "superchat-chat.md" else "superchat-workspace.json",
+                .filters = &filters,
+            }, &path_buffer) catch null;
+            if (selected) |path| {
+                self.flushPersistence();
+                var record = persistence.ExportRecord{
+                    .kind = if (kind == .thread_markdown) .thread_markdown else .workspace_json,
+                    .thread_id = self.chat.model.export_thread_id,
+                    .path_len = @min(path.len, 1024),
+                };
+                @memcpy(record.path[0..record.path_len], path[0..record.path_len]);
+                if (self.persistence_worker.enqueueExport(record)) {
+                    try self.chat.dispatch(runtime, 1, .export_started);
+                } else {
+                    try self.chat.dispatch(runtime, 1, .{ .export_finished = false });
+                }
+            }
+        }
         if (self.chat.model.search_request_pending) {
             self.chat.model.search_request_pending = false;
             const query = std.mem.trim(u8, self.chat.model.search_buffer.text(), " \t\r\n");
@@ -4057,7 +4470,13 @@ const SecureChatApp = struct {
                             .role = if (history.role == @intFromEnum(Role.assistant)) .assistant else .user,
                             .content_storage = history.content,
                             .content_len = history.content.len,
+                            .latency_ms = history.latency_ms,
+                            .prompt_tokens = history.prompt_tokens,
+                            .completion_tokens = history.completion_tokens,
+                            .cost_micros = history.cost_micros,
                         };
+                        message.response_model_len = utf8PrefixLen(history.response_model, message.response_model_storage.len);
+                        @memcpy(message.response_model_storage[0..message.response_model_len], history.response_model[0..message.response_model_len]);
                         for (history.attachments[0..history.attachment_count], 0..) |attachment, attachment_index| {
                             if (attachment.kind >= std.meta.fields(AttachmentKind).len) continue;
                             var restored = Attachment{ .kind = @enumFromInt(attachment.kind) };
@@ -4070,6 +4489,8 @@ const SecureChatApp = struct {
                         }
                         thread.messages[index] = message;
                         result.page.messages[index].content = @constCast(&[_]u8{});
+                        if (result.page.messages[index].response_model.len > 0) model.allocator.free(result.page.messages[index].response_model);
+                        result.page.messages[index].response_model = @constCast(&[_]u8{});
                     }
                     thread.message_count += count;
                     thread.has_older_messages = result.page.has_more;
@@ -4078,6 +4499,9 @@ const SecureChatApp = struct {
             }
             result.page.deinit(model.allocator);
             if (self.chat.installed) try self.chat.rebuild(runtime, self.chat.canvas_window_id);
+        }
+        if (self.persistence_worker.takeExportResult()) |success| {
+            try self.chat.dispatch(runtime, 1, .{ .export_finished = success });
         }
         if (self.chat.model.pending_notification_thread_id != 0) {
             const thread_id = self.chat.model.pending_notification_thread_id;
@@ -4105,6 +4529,12 @@ const SecureChatApp = struct {
                 if (!self.persistence_worker.enqueue(.{ .upsert_cached_model = persistence.CachedModelRecord.from(entry, now) })) break;
                 self.chat.model.model_catalog_dirty_mask &= ~bit;
             }
+        }
+        if (self.chat.model.snippets_dirty) {
+            var set = persistence.SnippetSet{};
+            set.count = self.chat.model.snippet_count;
+            for (self.chat.model.snippets[0..self.chat.model.snippet_count], 0..) |*snippet, index| set.snippets[index] = persistence.SnippetRecord.from(snippet);
+            if (self.persistence_worker.enqueueSnippets(set)) self.chat.model.snippets_dirty = false;
         }
         const action = self.chat.model.credential_action;
         self.chat.model.credential_action = .none;

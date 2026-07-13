@@ -62,6 +62,10 @@
         .{ .id = "workspace.archive", .key = "h", .modifiers = .{ "primary", "shift" } },
         .{ .id = "workspace.clear-thread", .key = "backspace", .modifiers = .{ "primary", "shift" } },
         .{ .id = "workspace.load-older", .key = "l", .modifiers = .{ "primary", "option" } },
+        .{ .id = "workspace.move-thread", .key = "m", .modifiers = .{ "primary", "shift" } },
+        .{ .id = "workspace.snippets", .key = "p", .modifiers = .{ "primary", "option" } },
+        .{ .id = "workspace.export-thread", .key = "s", .modifiers = .{ "primary", "shift" } },
+        .{ .id = "workspace.export-workspace", .key = "s", .modifiers = .{ "primary", "option", "shift" } },
         .{ .id = "workspace.close-overlay", .key = "escape" },
     },
     .shell = .{
