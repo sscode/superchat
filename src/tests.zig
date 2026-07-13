@@ -1,6 +1,7 @@
 const std = @import("std");
 const native_sdk = @import("native_sdk");
 const main = @import("main.zig");
+const persistence = @import("persistence.zig");
 
 const canvas = native_sdk.canvas;
 const testing = std.testing;
@@ -54,10 +55,28 @@ fn streamLine(model: *main.Model, fx: *main.Effects, key: u64, line: []const u8)
 fn removeTestDatabase(path: []const u8) void {
     std.Io.Dir.deleteFileAbsolute(testing.io, path) catch {};
     var buffer: [256]u8 = undefined;
-    for ([_][]const u8{ "-wal", "-shm" }) |suffix| {
+    for ([_][]const u8{ "-wal", "-shm", ".backup-v1" }) |suffix| {
         const sidecar = std.fmt.bufPrint(&buffer, "{s}{s}", .{ path, suffix }) catch continue;
         std.Io.Dir.deleteFileAbsolute(testing.io, sidecar) catch {};
     }
+}
+
+test "schema migrations create a recoverable pre-migration backup" {
+    const path = "/tmp/superchat-migration-backup.sqlite3";
+    removeTestDatabase(path);
+    defer removeTestDatabase(path);
+    {
+        var database = try main.workspace_storage.Database.open(path);
+        try database.setSchemaVersionForTest(1);
+        database.close();
+    }
+    {
+        var migrated = try main.workspace_storage.Database.open(path);
+        defer migrated.close();
+        try testing.expectEqual(@as(i64, 2), try migrated.schemaVersion());
+    }
+    var backup = try std.Io.Dir.openFileAbsolute(testing.io, path ++ ".backup-v1", .{});
+    backup.close(testing.io);
 }
 
 test "send creates a typed OpenRouter fetch and preserves the user turn" {
@@ -97,7 +116,8 @@ test "a completion appends assistant text and records the routed model" {
 
     streamLine(&model, &fx, 1001, ": OPENROUTER PROCESSING");
     streamLine(&model, &fx, 1001, "data: {\"model\":\"anthropic/claude-sonnet-4.6\",\"choices\":[{\"delta\":{\"content\":\"Hi \"}}]}");
-    try testing.expectEqualStrings("Hi ", activeThread(&model).messages[1].content());
+    try testing.expectEqual(@as(usize, 1), activeThread(&model).message_count);
+    try testing.expectEqualStrings("Hi ", activeThread(&model).stream_pending_storage[0..activeThread(&model).stream_pending_len]);
     try testing.expect(activeThread(&model).sending);
     streamLine(&model, &fx, 1001, "data: {\"choices\":[{\"delta\":{\"content\":\"there!\"}}]}");
     streamLine(&model, &fx, 1001, "data: [DONE]");
@@ -166,6 +186,9 @@ test "API key can be entered and replaced inside settings without rendering the 
     for (masked) |byte| try testing.expectEqual(@as(u8, '*'), byte);
 
     main.update(&model, .save_settings, &fx);
+    try testing.expect(model.settings_open and model.missingKey());
+    const validation = fx.pendingFetchAt(0) orelse return error.TestExpectedFetch;
+    main.update(&model, .{ .response = .{ .key = validation.key, .status = 200 } }, &fx);
     try testing.expect(!model.settings_open);
     try testing.expect(!model.missingKey());
     try testing.expect(model.api_key_buffer.isEmpty());
@@ -173,7 +196,7 @@ test "API key can be entered and replaced inside settings without rendering the 
 
     activeThread(&model).draft_buffer.set("Use the in-app credential");
     main.update(&model, .send, &fx);
-    const request = fx.pendingFetchAt(0) orelse return error.TestExpectedFetch;
+    const request = fx.pendingFetchAt(1) orelse return error.TestExpectedFetch;
     try testing.expect(std.mem.indexOf(u8, request.body, "sk-or-v1-in-app") == null);
 }
 
@@ -201,6 +224,50 @@ test "model selector applies quick picks and custom slugs" {
     main.update(&model, .{ .select_thread = first_thread }, &fx);
     try testing.expectEqual(main.ModelChoice.custom, activeThread(&model).model_choice);
     try testing.expectEqualStrings("mistralai/custom-model", model.selectedModelLabel());
+}
+
+test "model picker searches OpenRouter catalog and keeps favorites" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    main.update(&model, .{ .model_search_edit = .{ .insert_text = "claude" } }, &fx);
+    main.update(&model, .{ .model_search = .{ .key = 1 } }, &fx);
+    const request = fx.pendingFetchAt(0) orelse return error.TestExpectedFetch;
+    try testing.expect(std.mem.indexOf(u8, request.url, "/api/v1/models") != null);
+    main.update(&model, .{ .response = .{
+        .key = request.key,
+        .status = 200,
+        .body = "{\"data\":[{\"id\":\"anthropic/claude-test\",\"name\":\"Claude Test\"}]}",
+    } }, &fx);
+    try testing.expectEqual(@as(usize, 1), model.model_catalog_count);
+    try testing.expectEqualStrings("anthropic/claude-test", model.model_catalog[0].slug());
+    main.update(&model, .{ .toggle_model_favorite = 0 }, &fx);
+    try testing.expect(model.model_catalog[0].favorite);
+    main.update(&model, .{ .select_catalog_model = 0 }, &fx);
+    try testing.expectEqualStrings("anthropic/claude-test", activeThread(&model).modelName());
+}
+
+test "workspace grows past prototype project and chat limits" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    var index: usize = 0;
+    while (index < 12) : (index += 1) main.update(&model, .new_project, &fx);
+    while (index < 48) : (index += 1) main.update(&model, .new_thread, &fx);
+    try testing.expect(model.project_count > 8);
+    try testing.expect(model.thread_count > 24);
+    try testing.expect(!model.cannotAddProject());
+    try testing.expect(!model.cannotAddThread());
+}
+
+test "provider status errors are actionable" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    activeThread(&model).sending = true;
+    main.update(&model, .{ .response = .{ .key = 1001, .status = 429 } }, &fx);
+    try testing.expectEqualStrings("OpenRouter is rate limiting requests; wait a moment and retry", activeThread(&model).status_storage[0..activeThread(&model).status_len]);
 }
 
 test "projects and threads preserve independent conversations" {
@@ -391,7 +458,7 @@ test "SQLite restores the workspace after reopening and purges expired archives"
     {
         var database = try main.workspace_storage.Database.open(path);
         defer database.close();
-        try testing.expectEqual(@as(i64, 1), try database.schemaVersion());
+        try testing.expectEqual(@as(i64, 2), try database.schemaVersion());
         try database.save(model);
     }
 
@@ -425,6 +492,84 @@ test "SQLite restores the workspace after reopening and purges expired archives"
         try testing.expect(try database.load(purged));
     }
     for (purged.projects[0..purged.project_count]) |project| try testing.expect(project.id != archived_project_id);
+}
+
+test "SQLite retains complete history while hydration stays bounded" {
+    const path = "/tmp/superchat-complete-history.sqlite3";
+    removeTestDatabase(path);
+    defer removeTestDatabase(path);
+
+    var source = main.initialModel("test-key");
+    const thread_id = source.active_thread_id;
+    {
+        var database = try main.workspace_storage.Database.open(path);
+        defer database.close();
+        try database.save(&source);
+        var id: u32 = 1;
+        while (id <= 64) : (id += 1) {
+            var content: [32]u8 = undefined;
+            const text = try std.fmt.bufPrint(&content, "message {d}", .{id});
+            try database.upsertMessage(id, thread_id, @intFromEnum(main.Role.user), text);
+        }
+        try testing.expectEqual(@as(usize, 64), try database.messageCount(thread_id));
+    }
+
+    var restored = main.initialModel("");
+    {
+        var database = try main.workspace_storage.Database.open(path);
+        defer database.close();
+        try testing.expect(try database.load(&restored));
+        try testing.expectEqual(@as(usize, 64), try database.messageCount(thread_id));
+    }
+    const thread = threadWithId(&restored, thread_id);
+    try testing.expectEqual(@as(usize, 50), thread.message_count);
+    try testing.expectEqual(@as(u32, 15), thread.messages[0].id);
+    try testing.expectEqual(@as(u32, 64), thread.messages[49].id);
+    try testing.expect(thread.has_older_messages);
+    var database = try main.workspace_storage.Database.open(path);
+    defer database.close();
+    var older = try database.loadHistoryBefore(testing.allocator, thread_id, thread.messages[0].id, 50);
+    defer older.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 14), older.messages.len);
+    try testing.expectEqual(@as(u32, 1), older.messages[0].id);
+    try testing.expect(!older.has_more);
+}
+
+test "background persistence worker owns and flushes SQLite writes" {
+    const path = "/tmp/superchat-background-persistence.sqlite3";
+    removeTestDatabase(path);
+    defer removeTestDatabase(path);
+
+    var model = main.initialModel("test-key");
+    const thread_id = model.active_thread_id;
+    var database = try main.workspace_storage.Database.open(path);
+    try database.save(&model);
+    const worker = try persistence.Worker.create(testing.allocator, database, testing.io);
+
+    try testing.expect(model.appendMessage(.user, "written off the UI thread"));
+    const thread = threadWithId(&model, thread_id);
+    try testing.expect(worker.enqueue(.{ .upsert_message = persistence.MessageRecord.from(thread_id, &thread.messages[0]) }));
+    worker.stopAndDestroy();
+
+    var reopened = try main.workspace_storage.Database.open(path);
+    defer reopened.close();
+    try testing.expectEqual(@as(usize, 1), try reopened.messageCount(thread_id));
+}
+
+test "draft persistence is debounced per thread" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .{ .draft_edit = .{ .insert_text = "typing" } }, &fx);
+    try testing.expectEqual(@as(usize, 0), model.persistence_thread_count);
+    const timer = fx.pendingTimerAt(0) orelse return error.TestExpectedTimer;
+    try testing.expectEqual(@as(u64, 300), timer.interval_ms);
+
+    main.update(&model, .{ .persist_draft = .{ .key = timer.key } }, &fx);
+    try testing.expectEqual(@as(usize, 1), model.persistence_thread_count);
+    try testing.expectEqual(model.active_thread_id, model.persistence_thread_ids[0]);
 }
 
 test "background responses return to their owning thread while navigation stays live" {
@@ -641,7 +786,6 @@ test "the global shortcut map reaches creation navigation focus and settings" {
         main.cmd_focus_composer,
         main.cmd_model_picker,
         main.cmd_settings,
-        main.cmd_account,
         main.cmd_fork_latest,
         main.cmd_copy_latest,
         main.cmd_rename_thread,
@@ -680,24 +824,8 @@ test "the global shortcut map reaches creation navigation focus and settings" {
     try testing.expect(model.model_picker_open);
     main.update(&model, main.onCommand(main.cmd_settings).?, &fx);
     try testing.expect(model.settings_open);
-    main.update(&model, main.onCommand(main.cmd_account).?, &fx);
-    try testing.expect(model.account_open and !model.settings_open);
     main.update(&model, main.onCommand(main.cmd_close_overlay).?, &fx);
-    try testing.expect(!model.settings_open and !model.model_picker_open and !model.account_open);
-}
-
-test "account scaffold remains optional and never starts network work" {
-    var model = main.initialModel("test-key");
-    var fx = main.Effects.init(testing.allocator);
-    defer fx.deinit();
-    fx.executor = .fake;
-
-    main.update(&model, .open_account, &fx);
-    try testing.expect(model.account_open);
-    try testing.expect(fx.pendingFetchAt(0) == null);
-
-    main.update(&model, .close_account, &fx);
-    try testing.expect(!model.account_open);
+    try testing.expect(!model.settings_open and !model.model_picker_open);
 }
 
 test "first-run onboarding is bypassed by credentials completion or dev mode" {
@@ -711,7 +839,7 @@ test "first-run onboarding is bypassed by credentials completion or dev mode" {
     try testing.expect(dev_model.dev_mode);
 }
 
-test "onboarding exposes connection paths without faking unavailable adapters" {
+test "onboarding verifies OpenRouter without exposing unavailable adapters" {
     var model = main.initialModel("");
     model.onboarding_open = true;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -725,20 +853,15 @@ test "onboarding exposes connection paths without faking unavailable adapters" {
     defer fx.deinit();
     fx.executor = .fake;
 
-    main.update(&model, .onboarding_claude, &fx);
-    try testing.expectEqual(main.ConnectionChoice.claude_code, model.onboarding_choice);
-    try testing.expect(model.onboarding_open and model.missingKey());
-
-    main.update(&model, .onboarding_codex, &fx);
-    try testing.expectEqual(main.ConnectionChoice.codex, model.onboarding_choice);
     try testing.expect(fx.pendingFetchAt(0) == null);
-
-    main.update(&model, .onboarding_openrouter, &fx);
     main.update(&model, .finish_onboarding, &fx);
     try testing.expect(model.onboarding_open);
 
     main.update(&model, .{ .api_key_edit = .{ .insert_text = "sk-or-v1-onboarding" } }, &fx);
     main.update(&model, .finish_onboarding, &fx);
+    try testing.expect(model.onboarding_open and model.missingKey());
+    const validation = fx.pendingFetchAt(0) orelse return error.TestExpectedFetch;
+    main.update(&model, .{ .response = .{ .key = validation.key, .status = 200 } }, &fx);
     try testing.expect(!model.onboarding_open);
     try testing.expect(!model.missingKey());
     try testing.expectEqual(main.CredentialAction.save, model.credential_action);

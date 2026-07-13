@@ -11,6 +11,23 @@ pub const Error = error{
     PathTooLong,
 };
 
+pub const HistoryMessage = struct {
+    id: u32,
+    role: u8,
+    content: []u8,
+};
+
+pub const HistoryPage = struct {
+    messages: []HistoryMessage,
+    has_more: bool,
+
+    pub fn deinit(page: *HistoryPage, allocator: std.mem.Allocator) void {
+        for (page.messages) |message| if (message.content.len > 0) allocator.free(message.content);
+        if (page.messages.len > 0) allocator.free(page.messages);
+        page.messages = &.{};
+    }
+};
+
 pub const Database = struct {
     handle: *c.sqlite3,
 
@@ -28,6 +45,8 @@ pub const Database = struct {
         var database = Database{ .handle = handle.? };
         errdefer database.close();
         try database.configure();
+        const version = try database.schemaVersion();
+        if (version > 0 and version < 2) try database.backup(path, version);
         try database.migrate();
         return database;
     }
@@ -78,9 +97,67 @@ pub const Database = struct {
             \\  next_thread_id INTEGER NOT NULL,
             \\  next_message_id INTEGER NOT NULL
             \\);
-            \\PRAGMA user_version = 1;
+            \\CREATE TABLE IF NOT EXISTS model_cache (
+            \\  slug TEXT PRIMARY KEY,
+            \\  label TEXT NOT NULL,
+            \\  favorite INTEGER NOT NULL DEFAULT 0,
+            \\  updated_at_ms INTEGER NOT NULL DEFAULT 0
+            \\);
+            \\PRAGMA user_version = 2;
             \\COMMIT;
         );
+    }
+
+    fn backup(database: *Database, path: []const u8, version: i64) Error!void {
+        var backup_path: [1100:0]u8 = undefined;
+        const rendered = std.fmt.bufPrint(backup_path[0 .. backup_path.len - 1], "{s}.backup-v{d}", .{ path, version }) catch return error.PathTooLong;
+        backup_path[rendered.len] = 0;
+        var destination: ?*c.sqlite3 = null;
+        if (c.sqlite3_open_v2(&backup_path, &destination, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE, null) != c.SQLITE_OK or destination == null) {
+            if (destination) |opened| _ = c.sqlite3_close(opened);
+            return error.OpenFailed;
+        }
+        defer _ = c.sqlite3_close(destination.?);
+        const operation = c.sqlite3_backup_init(destination.?, "main", database.handle, "main") orelse return error.SqlFailed;
+        const step = c.sqlite3_backup_step(operation, -1);
+        const finish = c.sqlite3_backup_finish(operation);
+        if ((step != c.SQLITE_DONE and step != c.SQLITE_OK) or finish != c.SQLITE_OK) return error.SqlFailed;
+    }
+
+    pub fn setSchemaVersionForTest(database: *Database, version: u32) Error!void {
+        var sql: [64:0]u8 = undefined;
+        const rendered = std.fmt.bufPrint(sql[0 .. sql.len - 1], "PRAGMA user_version = {d};", .{version}) catch return error.SqlFailed;
+        sql[rendered.len] = 0;
+        try database.exec(&sql);
+    }
+
+    pub fn upsertCachedModel(database: *Database, slug: []const u8, label: []const u8, favorite: bool, updated_at_ms: i64) Error!void {
+        const statement = try database.prepare(
+            "INSERT INTO model_cache(slug,label,favorite,updated_at_ms) VALUES(?1,?2,?3,?4) " ++
+                "ON CONFLICT(slug) DO UPDATE SET label=excluded.label,favorite=excluded.favorite,updated_at_ms=excluded.updated_at_ms;",
+        );
+        defer _ = c.sqlite3_finalize(statement);
+        try bindText(statement, 1, slug);
+        try bindText(statement, 2, label);
+        try bindInt(statement, 3, @intFromBool(favorite));
+        try bindInt(statement, 4, updated_at_ms);
+        try stepDone(statement);
+    }
+
+    pub fn loadCachedModels(database: *Database, model: anytype) Error!void {
+        const statement = try database.prepare("SELECT slug,label,favorite FROM model_cache ORDER BY favorite DESC,updated_at_ms DESC LIMIT 32;");
+        defer _ = c.sqlite3_finalize(statement);
+        model.model_catalog_count = 0;
+        while (model.model_catalog_count < model.model_catalog.len) {
+            const result = c.sqlite3_step(statement);
+            if (result == c.SQLITE_DONE) break;
+            if (result != c.SQLITE_ROW) return error.SqlFailed;
+            var entry: @TypeOf(model.model_catalog[0]) = .{ .favorite = c.sqlite3_column_int(statement, 2) != 0 };
+            setFixed(&entry.slug_storage, &entry.slug_len, textColumn(statement, 0));
+            setFixed(&entry.label_storage, &entry.label_len, textColumn(statement, 1));
+            model.model_catalog[model.model_catalog_count] = entry;
+            model.model_catalog_count += 1;
+        }
     }
 
     pub fn schemaVersion(database: *Database) Error!i64 {
@@ -88,6 +165,60 @@ pub const Database = struct {
         defer _ = c.sqlite3_finalize(statement);
         if (c.sqlite3_step(statement) != c.SQLITE_ROW) return error.SqlFailed;
         return c.sqlite3_column_int64(statement, 0);
+    }
+
+    pub fn messageCount(database: *Database, thread_id: u32) Error!usize {
+        const statement = try database.prepare("SELECT COUNT(*) FROM messages WHERE thread_id=?1;");
+        defer _ = c.sqlite3_finalize(statement);
+        try bindInt(statement, 1, thread_id);
+        if (c.sqlite3_step(statement) != c.SQLITE_ROW) return error.SqlFailed;
+        return intColumn(usize, statement, 0);
+    }
+
+    pub fn loadHistoryBefore(database: *Database, allocator: std.mem.Allocator, thread_id: u32, before_id: u32, limit: usize) (Error || std.mem.Allocator.Error)!HistoryPage {
+        const statement = try database.prepare(
+            "SELECT id,role,content FROM messages WHERE thread_id=?1 AND id<?2 ORDER BY id DESC LIMIT ?3;",
+        );
+        defer _ = c.sqlite3_finalize(statement);
+        try bindInt(statement, 1, thread_id);
+        try bindInt(statement, 2, before_id);
+        try bindInt(statement, 3, limit + 1);
+        var messages: std.ArrayList(HistoryMessage) = .empty;
+        errdefer {
+            for (messages.items) |message| allocator.free(message.content);
+            messages.deinit(allocator);
+        }
+        while (true) {
+            const result = c.sqlite3_step(statement);
+            if (result == c.SQLITE_DONE) break;
+            if (result != c.SQLITE_ROW) return error.SqlFailed;
+            const content = try allocator.dupe(u8, textColumn(statement, 2));
+            errdefer allocator.free(content);
+            try messages.append(allocator, .{
+                .id = intColumn(u32, statement, 0),
+                .role = intColumn(u8, statement, 1),
+                .content = content,
+            });
+        }
+        const has_more = messages.items.len > limit;
+        if (has_more) {
+            const removed = messages.pop().?;
+            allocator.free(removed.content);
+        }
+        std.mem.reverse(HistoryMessage, messages.items);
+        return .{ .messages = try messages.toOwnedSlice(allocator), .has_more = has_more };
+    }
+
+    pub fn begin(database: *Database) Error!void {
+        try database.exec("BEGIN IMMEDIATE;");
+    }
+
+    pub fn commit(database: *Database) Error!void {
+        try database.exec("COMMIT;");
+    }
+
+    pub fn rollback(database: *Database) void {
+        database.exec("ROLLBACK;") catch {};
     }
 
     pub fn purgeExpired(database: *Database, cutoff_ms: i64) Error!void {
@@ -100,6 +231,112 @@ pub const Database = struct {
         defer _ = c.sqlite3_finalize(threads);
         try bindInt(threads, 1, cutoff_ms);
         try stepDone(threads);
+    }
+
+    pub fn upsertProject(database: *Database, id: u32, name: []const u8, archived_at_ms: i64, position: usize) Error!void {
+        const statement = try database.prepare(
+            "INSERT INTO projects(id,name,archived_at_ms,position) VALUES(?1,?2,?3,?4) " ++
+                "ON CONFLICT(id) DO UPDATE SET name=excluded.name,archived_at_ms=excluded.archived_at_ms,position=excluded.position;",
+        );
+        defer _ = c.sqlite3_finalize(statement);
+        try bindInt(statement, 1, id);
+        try bindText(statement, 2, name);
+        try bindInt(statement, 3, archived_at_ms);
+        try bindInt(statement, 4, position);
+        try stepDone(statement);
+    }
+
+    pub fn upsertThread(database: *Database, id: u32, project_id: u32, title: []const u8, archived_at_ms: i64, position: usize, draft: []const u8, model_choice: u8, model_slug: []const u8, active_model: []const u8) Error!void {
+        const statement = try database.prepare(
+            "INSERT INTO threads(id,project_id,title,archived_at_ms,position,draft,model_choice,model_slug,active_model) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) " ++
+                "ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,title=excluded.title,archived_at_ms=excluded.archived_at_ms,position=excluded.position,draft=excluded.draft,model_choice=excluded.model_choice,model_slug=excluded.model_slug,active_model=excluded.active_model;",
+        );
+        defer _ = c.sqlite3_finalize(statement);
+        try bindInt(statement, 1, id);
+        try bindInt(statement, 2, project_id);
+        try bindText(statement, 3, title);
+        try bindInt(statement, 4, archived_at_ms);
+        try bindInt(statement, 5, position);
+        try bindText(statement, 6, draft);
+        try bindInt(statement, 7, model_choice);
+        try bindText(statement, 8, model_slug);
+        try bindText(statement, 9, active_model);
+        try stepDone(statement);
+    }
+
+    pub fn upsertMessage(database: *Database, id: u32, thread_id: u32, role: u8, content: []const u8) Error!void {
+        const statement = try database.prepare(
+            "INSERT INTO messages(id,thread_id,role,content,position) VALUES(?1,?2,?3,?4,?1) " ++
+                "ON CONFLICT(id) DO UPDATE SET thread_id=excluded.thread_id,role=excluded.role,content=excluded.content;",
+        );
+        defer _ = c.sqlite3_finalize(statement);
+        try bindInt(statement, 1, id);
+        try bindInt(statement, 2, thread_id);
+        try bindInt(statement, 3, role);
+        try bindText(statement, 4, content);
+        try stepDone(statement);
+    }
+
+    pub fn clearMessages(database: *Database, thread_id: u32) Error!void {
+        const statement = try database.prepare("DELETE FROM messages WHERE thread_id=?1;");
+        defer _ = c.sqlite3_finalize(statement);
+        try bindInt(statement, 1, thread_id);
+        try stepDone(statement);
+    }
+
+    pub fn saveMeta(database: *Database, active_project_id: u32, active_thread_id: u32, next_project_id: u32, next_thread_id: u32, next_message_id: u32) Error!void {
+        const statement = try database.prepare(
+            "INSERT INTO workspace_meta(singleton,active_project_id,active_thread_id,next_project_id,next_thread_id,next_message_id) VALUES(1,?1,?2,?3,?4,?5) " ++
+                "ON CONFLICT(singleton) DO UPDATE SET active_project_id=excluded.active_project_id,active_thread_id=excluded.active_thread_id,next_project_id=excluded.next_project_id,next_thread_id=excluded.next_thread_id,next_message_id=excluded.next_message_id;",
+        );
+        defer _ = c.sqlite3_finalize(statement);
+        try bindInt(statement, 1, active_project_id);
+        try bindInt(statement, 2, active_thread_id);
+        try bindInt(statement, 3, next_project_id);
+        try bindInt(statement, 4, next_thread_id);
+        try bindInt(statement, 5, next_message_id);
+        try stepDone(statement);
+    }
+
+    pub fn reconcile(database: *Database, project_ids: []const u32, thread_ids: []const u32) Error!void {
+        const threads = try database.prepare("SELECT id FROM threads;");
+        defer _ = c.sqlite3_finalize(threads);
+        var stale_threads: [24]u32 = undefined;
+        var stale_thread_count: usize = 0;
+        while (true) {
+            const result = c.sqlite3_step(threads);
+            if (result == c.SQLITE_DONE) break;
+            if (result != c.SQLITE_ROW) return error.SqlFailed;
+            const id = intColumn(u32, threads, 0);
+            if (!containsId(thread_ids, id) and stale_thread_count < stale_threads.len) {
+                stale_threads[stale_thread_count] = id;
+                stale_thread_count += 1;
+            }
+        }
+        for (stale_threads[0..stale_thread_count]) |id| try database.deleteById("DELETE FROM threads WHERE id=?1;", id);
+
+        const projects = try database.prepare("SELECT id FROM projects;");
+        defer _ = c.sqlite3_finalize(projects);
+        var stale_projects: [8]u32 = undefined;
+        var stale_project_count: usize = 0;
+        while (true) {
+            const result = c.sqlite3_step(projects);
+            if (result == c.SQLITE_DONE) break;
+            if (result != c.SQLITE_ROW) return error.SqlFailed;
+            const id = intColumn(u32, projects, 0);
+            if (!containsId(project_ids, id) and stale_project_count < stale_projects.len) {
+                stale_projects[stale_project_count] = id;
+                stale_project_count += 1;
+            }
+        }
+        for (stale_projects[0..stale_project_count]) |id| try database.deleteById("DELETE FROM projects WHERE id=?1;", id);
+    }
+
+    fn deleteById(database: *Database, sql: [*:0]const u8, id: u32) Error!void {
+        const statement = try database.prepare(sql);
+        defer _ = c.sqlite3_finalize(statement);
+        try bindInt(statement, 1, id);
+        try stepDone(statement);
     }
 
     pub fn save(database: *Database, model: anytype) Error!void {
@@ -160,6 +397,7 @@ pub const Database = struct {
     }
 
     pub fn load(database: *Database, model: anytype) Error!bool {
+        try database.loadCachedModels(model);
         model.project_count = 0;
         model.thread_count = 0;
 
@@ -169,7 +407,7 @@ pub const Database = struct {
             const result = c.sqlite3_step(projects);
             if (result == c.SQLITE_DONE) break;
             if (result != c.SQLITE_ROW) return error.SqlFailed;
-            if (model.project_count == model.projects.len) return error.InvalidData;
+            if (!model.ensureProjectCapacity(model.project_count + 1)) return error.InvalidData;
             var project: @TypeOf(model.projects[0]) = .{ .id = intColumn(u32, projects, 0) };
             setFixed(&project.name_storage, &project.name_len, textColumn(projects, 1));
             project.archived_at_ms = c.sqlite3_column_int64(projects, 2);
@@ -184,7 +422,7 @@ pub const Database = struct {
             const result = c.sqlite3_step(threads);
             if (result == c.SQLITE_DONE) break;
             if (result != c.SQLITE_ROW) return error.SqlFailed;
-            if (model.thread_count == model.threads.len) return error.InvalidData;
+            if (!model.ensureThreadCapacity(model.thread_count + 1)) return error.InvalidData;
             var thread: @TypeOf(model.threads[0]) = .{
                 .id = intColumn(u32, threads, 0),
                 .project_id = intColumn(u32, threads, 1),
@@ -201,7 +439,14 @@ pub const Database = struct {
             model.thread_count += 1;
         }
 
-        const messages = try database.prepare("SELECT id,thread_id,role,content FROM messages ORDER BY thread_id,position,id;");
+        // Keep the complete transcript durable and hydrate a generous initial
+        // page. Older pages are queried on demand, independently of the
+        // provider's small context window.
+        const messages = try database.prepare(
+            "SELECT m.id,m.thread_id,m.role,m.content FROM messages AS m " ++
+                "WHERE m.id IN (SELECT recent.id FROM messages AS recent WHERE recent.thread_id=m.thread_id ORDER BY recent.id DESC LIMIT 50) " ++
+                "ORDER BY m.thread_id,m.id;",
+        );
         defer _ = c.sqlite3_finalize(messages);
         while (true) {
             const result = c.sqlite3_step(messages);
@@ -213,16 +458,21 @@ pub const Database = struct {
                 if (thread.id == thread_id) target = thread;
             }
             const thread = target orelse return error.InvalidData;
-            if (thread.message_count == thread.messages.len) return error.InvalidData;
+            if (!thread.ensureMessageCapacity(model.allocator, thread.message_count + 1)) return error.InvalidData;
             const role_value = intColumn(u8, messages, 2);
             if (role_value >= std.meta.fields(@TypeOf(thread.messages[0].role)).len) return error.InvalidData;
             var message: @TypeOf(thread.messages[0]) = .{
                 .id = intColumn(u32, messages, 0),
                 .role = @enumFromInt(role_value),
             };
-            setFixed(&message.content_storage, &message.content_len, textColumn(messages, 3));
+            const content = textColumn(messages, 3);
+            message.content_storage = model.allocator.dupe(u8, content) catch return error.InvalidData;
+            message.content_len = content.len;
             thread.messages[thread.message_count] = message;
             thread.message_count += 1;
+        }
+        for (model.threads[0..model.thread_count]) |*thread| {
+            thread.has_older_messages = thread.message_count == 50;
         }
 
         const meta = try database.prepare("SELECT active_project_id,active_thread_id,next_project_id,next_thread_id,next_message_id FROM workspace_meta WHERE singleton=1;");
@@ -277,6 +527,11 @@ fn textColumn(statement: *c.sqlite3_stmt, column: c_int) []const u8 {
 
 fn intColumn(comptime T: type, statement: *c.sqlite3_stmt, column: c_int) T {
     return @intCast(c.sqlite3_column_int64(statement, column));
+}
+
+fn containsId(ids: []const u32, target: u32) bool {
+    for (ids) |id| if (id == target) return true;
+    return false;
 }
 
 fn setFixed(storage: anytype, len: *usize, value: []const u8) void {

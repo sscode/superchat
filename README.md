@@ -4,12 +4,12 @@
 
 Superchat keeps projects, conversations, drafts, and model choices on your Mac while using [OpenRouter](https://openrouter.ai/) to talk to the models you choose. It is built with the [Vercel Labs Native SDK](https://github.com/vercel-labs/native), Zig, and a GPU-rendered native interface—there is no web app or WebView hiding underneath.
 
-> Superchat is an early prototype. OpenRouter is ready to use; accounts, cloud sync, subscription-based providers, packaging, and automatic updates are still planned.
+> Superchat is an early public beta. OpenRouter is ready to use; cloud sync, subscription-based providers, and automatic in-app updates are still planned.
 
 ## What you can do
 
 - Organize conversations into projects.
-- Switch models per chat, including a custom OpenRouter model slug.
+- Search OpenRouter's live model catalog, favorite useful results, or enter a model slug directly.
 - Stream several responses at once and move between chats while they finish.
 - Fork an assistant response into one or several new chats, each with a different model.
 - Copy complete responses or select and copy text from a rendered paragraph.
@@ -19,13 +19,15 @@ Superchat keeps projects, conversations, drafts, and model choices on your Mac w
 
 ## Quick start
 
-### What you need
+### Install a release
 
-- A Mac.
-- [Node.js](https://nodejs.org/) and npm.
-- An [OpenRouter API key](https://openrouter.ai/keys).
+Download the universal `.dmg` from [GitHub Releases](https://github.com/sscode/superchat/releases), open it, and drag Superchat to Applications. Release builds contain both Apple Silicon and Intel code; users do not need Node.js, npm, or Zig.
 
-### 1. Install the project
+On first launch, paste an [OpenRouter API key](https://openrouter.ai/keys). Superchat verifies it with OpenRouter before saving it to macOS Keychain.
+
+### Run from source
+
+Contributors need macOS, Node.js 22+, npm, and Xcode Command Line Tools:
 
 ```bash
 git clone https://github.com/sscode/superchat.git
@@ -34,8 +36,6 @@ npm install
 ```
 
 The first Native SDK command downloads its pinned Zig toolchain automatically.
-
-### 2. Launch the app
 
 ```bash
 npm run dev
@@ -47,16 +47,14 @@ Development mode skips onboarding so you can get straight into the app. To exper
 npm run dev:onboarding
 ```
 
-### 3. Connect OpenRouter
-
-Open **Settings** with `⌘,`, choose **Add API key**, and paste your OpenRouter key. Superchat stores it in macOS Keychain—not in the chat database or source tree.
+Open **Settings** with `⌘,`, choose **Add API key**, and paste your OpenRouter key. Superchat validates it and stores it in macOS Keychain—not in the chat database or source tree.
 
 Choose a model with `⌘K`, write a message, and press `⌘↩` to send.
 
 ## A typical workflow
 
 1. Create a project with `⌘⇧N` and a chat with `⌘N`.
-2. Open the model picker with `⌘K`. Choose Auto, a suggested model, or enter any OpenRouter model slug.
+2. Open the model picker with `⌘K`. Search OpenRouter's catalog, choose Auto, or enter a model slug.
 3. Send a message with `⌘↩`.
 4. Move to another chat while the answer streams; the original request continues in the background.
 5. On an assistant response, choose **Copy** or **Fork**. Forking can create several model-specific chats at once and optionally start each with the same follow-up message.
@@ -83,7 +81,6 @@ Superchat is designed to be usable without reaching for the mouse. The same refe
 | Open archive | `⌘⇧H` |
 | Clear current chat | `⌘⇧⌫` |
 | Open settings | `⌘,` |
-| Open account | `⌘⇧A` |
 | Close the current panel | `Esc` |
 
 ## Local data and privacy
@@ -106,6 +103,7 @@ Archived items disappear from the main workspace immediately. You can restore th
 | `npm run check` | Run strict compile-time checks |
 | `npm test` | Run the test suite |
 | `npm run build` | Create a release build |
+| `npm run package:macos` | Clean-build a universal, ad-hoc-signed `.app` and `.dmg` |
 
 You can also provide a key to a development process without saving it through the UI:
 
@@ -121,24 +119,38 @@ Avoid placing real credentials in `.env.example` or committing them to Git.
 | --- | --- |
 | `src/main.zig` | Application state, actions, OpenRouter requests, and SSE streaming |
 | `src/storage.zig` | SQLite schema, migrations, loading, and persistence |
+| `src/persistence.zig` | Debounced, background SQLite command queue |
 | `src/app.native` | Native UI, layout, styling, and keyboard handling |
 | `src/tests.zig` | Unit and integration-style state tests |
 | `app.zon` | App identity, window configuration, menu commands, and shortcuts |
 | `build.zig` | Zig build and native dependencies |
+| `scripts/package-macos.sh` | Reproducible universal macOS packaging |
+| `.github/workflows/` | ARM/Intel CI and signed, notarized tag releases |
 | `AUTH_PLAN.md` | Proposed optional authentication and sync architecture |
 
-## Current status and limits
+## Current status
 
 The intentionally small first version has a few boundaries worth knowing:
 
 - macOS is the only supported platform.
-- OpenRouter API keys are the only working provider connection. Claude and ChatGPT subscription connections appear as planned options but are disabled.
-- Account screens are local UI scaffolding; authentication and sync are not implemented. See [AUTH_PLAN.md](AUTH_PLAN.md) for the proposed direction.
-- Each chat currently retains its latest 12 messages, with up to 5,000 bytes per message.
-- The workspace currently supports up to 8 projects and 24 total chats; archived items count toward those limits until deleted.
-- Release packaging, code signing, GitHub distribution, and update checks are not implemented yet.
+- OpenRouter API keys are the only working provider connection. Claude and ChatGPT subscription adapters are clearly marked as roadmap work.
+- Authentication and sync are not in the app's critical path. See [AUTH_PLAN.md](AUTH_PLAN.md) for the proposed optional architecture.
+- SQLite retains the complete transcript. The UI opens the latest 50 messages and loads earlier pages on demand; provider requests independently use the latest 12 messages.
+- Projects and chats grow dynamically instead of stopping at prototype-era 8/24 limits. Individual responses have a 64 KiB safety ceiling.
+- Tagged GitHub releases build a clean universal app, sign it with Developer ID, submit it for Apple notarization, staple the result, and publish the `.dmg` to GitHub Releases.
+- Automatic in-app update checks are not implemented yet; GitHub Releases is the distribution source for the beta.
 
-These constraints keep the prototype easy to understand while its storage and provider boundaries settle.
+Before enabling the release workflow, configure the repository secrets documented below.
+
+## Publishing a macOS release
+
+The release workflow runs for tags matching `v*`. Add these GitHub Actions secrets:
+
+- `MACOS_CERTIFICATE_P12` — base64-encoded Developer ID Application certificate.
+- `MACOS_CERTIFICATE_PASSWORD` and `MACOS_SIGNING_IDENTITY`.
+- `APPLE_ID`, `APPLE_APP_PASSWORD`, and `APPLE_TEAM_ID` for notarization.
+
+Then update the version in `app.zon` and `package.json`, create a tag such as `v0.2.0`, and push it. GitHub hosts the resulting release and DMG; no Cloudflare service is required.
 
 ## Why Native SDK?
 

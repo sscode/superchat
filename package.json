@@ -7,7 +7,8 @@
     "dev:onboarding": "SUPERCHAT_FORCE_ONBOARDING=1 native dev",
     "check": "native check --strict",
     "test": "native test --yes",
-    "build": "native build --yes"
+    "build": "native build --yes",
+    "package:macos": "bash scripts/package-macos.sh"
   },
   "devDependencies": {
     "@native-sdk/cli": "0.4.4"

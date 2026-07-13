@@ -10,6 +10,7 @@ const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 pub const workspace_storage = @import("storage.zig");
 const storage = workspace_storage;
+const persistence = @import("persistence.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -24,18 +25,28 @@ pub const window_min_height: f32 = 480;
 pub const header_natural_height: f32 = 56;
 
 const openrouter_url = "https://openrouter.ai/api/v1/chat/completions";
+const openrouter_key_url = "https://openrouter.ai/api/v1/key";
+const key_validation_request: u64 = 1 << 61;
+const models_request: u64 = (1 << 61) + 1;
+const model_search_timer: u64 = (1 << 52) + 1;
+const openrouter_models_url = "https://openrouter.ai/api/v1/models";
 const credential_service = "dev.sscode.superchat";
 const credential_account = "openrouter-api-key";
 const onboarding_account = "onboarding-complete";
 const onboarding_marker = "1";
 const request_key_base: u64 = 1000;
 const clipboard_key_base: u64 = 1 << 40;
+const stream_flush_key_base: u64 = 1 << 44;
+const draft_save_key_base: u64 = 1 << 48;
+const history_poll_key: u64 = 1 << 52;
+const stream_flush_interval_ms: u64 = 16;
+const draft_save_interval_ms: u64 = 300;
 const archive_retention_ms: i64 = 30 * 24 * 60 * 60 * 1000;
 const day_ms: i64 = 24 * 60 * 60 * 1000;
-const max_messages = 12;
-const max_message_bytes = 5000;
-const max_projects = 8;
-const max_threads = 24;
+const provider_context_messages = 12;
+const history_page_size = 50;
+const max_message_bytes = 64 * 1024;
+const persistence_batch_ids = 4096;
 const max_project_name_bytes = 48;
 const max_thread_title_bytes = 64;
 const max_draft_bytes = 4000;
@@ -91,7 +102,6 @@ pub const ModelChoice = enum {
 };
 
 pub const CredentialAction = enum { none, save, delete, complete_onboarding };
-pub const ConnectionChoice = enum { openrouter, claude_code, codex };
 pub const RenameKind = enum { project, thread };
 
 pub const ModelOption = struct {
@@ -100,10 +110,33 @@ pub const ModelOption = struct {
     slug: []const u8,
 };
 
+pub const CatalogModel = struct {
+    slug_storage: [max_model_bytes]u8 = undefined,
+    slug_len: usize = 0,
+    label_storage: [96]u8 = undefined,
+    label_len: usize = 0,
+    favorite: bool = false,
+
+    pub fn slug(entry: *const CatalogModel) []const u8 {
+        return entry.slug_storage[0..entry.slug_len];
+    }
+    pub fn label(entry: *const CatalogModel) []const u8 {
+        return entry.label_storage[0..entry.label_len];
+    }
+};
+
+pub const CatalogRow = struct {
+    index: u32,
+    label: []const u8,
+    slug: []const u8,
+    favorite: bool,
+    favorite_label: []const u8,
+};
+
 pub const Message = struct {
     id: u32 = 0,
     role: Role = .user,
-    content_storage: [max_message_bytes]u8 = undefined,
+    content_storage: []u8 = @constCast(&[_]u8{}),
     content_len: usize = 0,
 
     pub fn content(message: *const Message) []const u8 {
@@ -116,6 +149,11 @@ pub const Message = struct {
 
     pub fn isAssistant(message: *const Message) bool {
         return message.role == .assistant;
+    }
+
+    fn deinit(message: *Message, allocator: std.mem.Allocator) void {
+        if (message.content_storage.len > 0) allocator.free(message.content_storage);
+        message.* = .{};
     }
 };
 
@@ -140,7 +178,7 @@ pub const Thread = struct {
     title_storage: [max_thread_title_bytes]u8 = undefined,
     title_len: usize = 0,
     archived_at_ms: i64 = 0,
-    messages: [max_messages]Message = undefined,
+    messages: []Message = @constCast(&[_]Message{}),
     message_count: usize = 0,
     draft_buffer: canvas.TextBuffer(max_draft_bytes) = .{},
     model_buffer: canvas.TextBuffer(max_model_bytes) = canvas.TextBuffer(max_model_bytes).init("openrouter/auto"),
@@ -152,6 +190,11 @@ pub const Thread = struct {
     active_model_len: usize = 0,
     stream_message_index: ?usize = null,
     stream_failed: bool = false,
+    stream_pending_storage: []u8 = @constCast(&[_]u8{}),
+    stream_pending_len: usize = 0,
+    stream_flush_scheduled: bool = false,
+    has_older_messages: bool = false,
+    history_loading: bool = false,
 
     pub fn title(thread: *const Thread) []const u8 {
         return thread.title_storage[0..thread.title_len];
@@ -192,17 +235,23 @@ pub const Thread = struct {
         thread.active_model_len = len;
     }
 
-    fn appendMessage(thread: *Thread, next_message_id: *u32, role: Role, content: []const u8) bool {
-        if (thread.message_count == max_messages) {
-            std.mem.copyForwards(Message, thread.messages[0 .. max_messages - 1], thread.messages[1..]);
-            thread.message_count -= 1;
-        }
+    pub fn ensureMessageCapacity(thread: *Thread, allocator: std.mem.Allocator, needed: usize) bool {
+        if (needed <= thread.messages.len) return true;
+        const capacity = @max(needed, @max(@as(usize, 8), thread.messages.len * 2));
+        thread.messages = if (thread.messages.len == 0)
+            allocator.alloc(Message, capacity) catch return false
+        else
+            allocator.realloc(thread.messages, capacity) catch return false;
+        return true;
+    }
+
+    fn appendMessage(thread: *Thread, allocator: std.mem.Allocator, next_message_id: *u32, role: Role, content: []const u8) bool {
         const trimmed = std.mem.trim(u8, content, " \t\r\n");
         if (trimmed.len == 0) return false;
-        var message = Message{ .id = next_message_id.*, .role = role };
         const len = utf8PrefixLen(trimmed, max_message_bytes);
-        @memcpy(message.content_storage[0..len], trimmed[0..len]);
-        message.content_len = len;
+        if (!thread.ensureMessageCapacity(allocator, thread.message_count + 1)) return false;
+        const owned = allocator.dupe(u8, trimmed[0..len]) catch return false;
+        const message = Message{ .id = next_message_id.*, .role = role, .content_storage = owned, .content_len = len };
         thread.messages[thread.message_count] = message;
         thread.message_count += 1;
         next_message_id.* += 1;
@@ -210,22 +259,21 @@ pub const Thread = struct {
         return true;
     }
 
-    fn appendClonedMessage(thread: *Thread, next_message_id: *u32, source: *const Message) void {
-        if (thread.message_count == max_messages) return;
+    fn appendClonedMessage(thread: *Thread, allocator: std.mem.Allocator, next_message_id: *u32, source: *const Message) bool {
+        if (!thread.ensureMessageCapacity(allocator, thread.message_count + 1)) return false;
         var cloned = source.*;
+        cloned.content_storage = allocator.dupe(u8, source.content()) catch return false;
         cloned.id = next_message_id.*;
         thread.messages[thread.message_count] = cloned;
         thread.message_count += 1;
         next_message_id.* += 1;
+        return true;
     }
 
-    fn appendStreamDelta(thread: *Thread, next_message_id: *u32, delta: []const u8) bool {
+    fn appendStreamDelta(thread: *Thread, allocator: std.mem.Allocator, next_message_id: *u32, delta: []const u8) bool {
         if (delta.len == 0) return true;
         if (thread.stream_message_index == null) {
-            if (thread.message_count == max_messages) {
-                std.mem.copyForwards(Message, thread.messages[0 .. max_messages - 1], thread.messages[1..]);
-                thread.message_count -= 1;
-            }
+            if (!thread.ensureMessageCapacity(allocator, thread.message_count + 1)) return false;
             thread.messages[thread.message_count] = Message{ .id = next_message_id.*, .role = .assistant };
             thread.stream_message_index = thread.message_count;
             thread.message_count += 1;
@@ -234,9 +282,42 @@ pub const Thread = struct {
         const message = &thread.messages[thread.stream_message_index.?];
         const available = max_message_bytes - message.content_len;
         const copy_len = utf8PrefixLen(delta, available);
+        message.content_storage = if (message.content_storage.len == 0)
+            allocator.alloc(u8, copy_len) catch return false
+        else
+            allocator.realloc(message.content_storage, message.content_len + copy_len) catch return false;
         @memcpy(message.content_storage[message.content_len..][0..copy_len], delta[0..copy_len]);
         message.content_len += copy_len;
         return copy_len == delta.len;
+    }
+
+    fn queueStreamDelta(thread: *Thread, allocator: std.mem.Allocator, delta: []const u8) bool {
+        const existing_len = if (thread.stream_message_index) |index| thread.messages[index].content_len else 0;
+        if (existing_len + thread.stream_pending_len + delta.len > max_message_bytes) return false;
+        thread.stream_pending_storage = if (thread.stream_pending_storage.len == 0)
+            allocator.alloc(u8, delta.len) catch return false
+        else
+            allocator.realloc(thread.stream_pending_storage, thread.stream_pending_len + delta.len) catch return false;
+        @memcpy(thread.stream_pending_storage[thread.stream_pending_len..][0..delta.len], delta);
+        thread.stream_pending_len += delta.len;
+        return true;
+    }
+
+    fn flushStreamDelta(thread: *Thread, allocator: std.mem.Allocator, next_message_id: *u32) bool {
+        defer {
+            thread.stream_pending_len = 0;
+            thread.stream_flush_scheduled = false;
+        }
+        return thread.appendStreamDelta(allocator, next_message_id, thread.stream_pending_storage[0..thread.stream_pending_len]);
+    }
+
+    fn deinit(thread: *Thread, allocator: std.mem.Allocator) void {
+        for (thread.messages[0..thread.message_count]) |*message| message.deinit(allocator);
+        if (thread.messages.len > 0) allocator.free(thread.messages);
+        if (thread.stream_pending_storage.len > 0) allocator.free(thread.stream_pending_storage);
+        thread.messages = @constCast(&[_]Message{});
+        thread.stream_pending_storage = @constCast(&[_]u8{});
+        thread.message_count = 0;
     }
 };
 
@@ -279,7 +360,6 @@ pub const cmd_next_project = "workspace.next-project";
 pub const cmd_focus_composer = "workspace.focus-composer";
 pub const cmd_model_picker = "workspace.model-picker";
 pub const cmd_settings = "workspace.settings";
-pub const cmd_account = "workspace.account";
 pub const cmd_fork_latest = "workspace.fork-latest";
 pub const cmd_copy_latest = "workspace.copy-latest";
 pub const cmd_rename_thread = "workspace.rename-thread";
@@ -295,7 +375,7 @@ fn requestKey(thread_id: u32) u64 {
 }
 
 fn requestThreadId(key: u64) ?u32 {
-    if (key <= request_key_base or key - request_key_base > @as(u64, max_threads)) return null;
+    if (key <= request_key_base or key - request_key_base > std.math.maxInt(u32)) return null;
     return @intCast(key - request_key_base);
 }
 
@@ -305,6 +385,31 @@ fn clipboardKey(message_id: u32) u64 {
 
 fn forkChoiceBit(choice: ModelChoice) u8 {
     return @as(u8, 1) << @intCast(@intFromEnum(choice));
+}
+
+fn appendUniqueId(ids: []u32, count: *usize, id: u32) void {
+    for (ids[0..count.*]) |existing| if (existing == id) return;
+    if (count.* == ids.len) return;
+    ids[count.*] = id;
+    count.* += 1;
+}
+
+fn streamFlushKey(thread_id: u32) u64 {
+    return stream_flush_key_base + thread_id;
+}
+
+fn streamFlushThreadId(key: u64) ?u32 {
+    if (key <= stream_flush_key_base or key - stream_flush_key_base > std.math.maxInt(u32)) return null;
+    return @intCast(key - stream_flush_key_base);
+}
+
+fn draftSaveKey(thread_id: u32) u64 {
+    return draft_save_key_base + thread_id;
+}
+
+fn draftSaveThreadId(key: u64) ?u32 {
+    if (key <= draft_save_key_base or key - draft_save_key_base > std.math.maxInt(u32)) return null;
+    return @intCast(key - draft_save_key_base);
 }
 
 const ApiMessage = struct {
@@ -336,23 +441,27 @@ const ApiStreamChunk = struct {
     @"error": ?ApiError = null,
 };
 
+const RemoteModel = struct { id: []const u8, name: []const u8 = "" };
+const RemoteModels = struct { data: []const RemoteModel = &.{} };
+
 pub const Msg = union(enum) {
     draft_edit: canvas.TextInputEvent,
     model_edit: canvas.TextInputEvent,
     api_key_edit: canvas.TextInputEvent,
+    model_search_edit: canvas.TextInputEvent,
     fork_seed_edit: canvas.TextInputEvent,
     toggle_model_picker,
     close_model_picker,
     select_model: ModelChoice,
+    select_auto_model,
+    select_custom_model,
+    select_catalog_model: u32,
+    toggle_model_favorite: u32,
+    model_search: native_sdk.EffectTimer,
     open_settings,
     close_settings,
     save_settings,
     remove_api_key,
-    open_account,
-    close_account,
-    onboarding_openrouter,
-    onboarding_claude,
-    onboarding_codex,
     finish_onboarding,
     skip_onboarding,
     copy_message: u32,
@@ -391,13 +500,21 @@ pub const Msg = union(enum) {
     close_overlay,
     send,
     clear,
+    load_older,
+    history_poll: native_sdk.EffectTimer,
     stream_line: native_sdk.EffectLine,
+    stream_flush: native_sdk.EffectTimer,
+    persist_draft: native_sdk.EffectTimer,
     response: native_sdk.EffectResponse,
     chrome_changed: native_sdk.WindowChrome,
 
     pub const view_unbound = .{
         "response",
         "stream_line",
+        "stream_flush",
+        "history_poll",
+        "model_search",
+        "persist_draft",
         "clipboard_result",
         "chrome_changed",
         "previous_project",
@@ -414,13 +531,15 @@ pub const Msg = union(enum) {
         "archive_project",
         "open_archive",
         "close_overlay",
+        "select_model",
     };
 };
 
 pub const Model = struct {
-    projects: [max_projects]Project = undefined,
+    allocator: std.mem.Allocator = std.heap.page_allocator,
+    projects: []Project = @constCast(&[_]Project{}),
     project_count: usize = 0,
-    threads: [max_threads]Thread = undefined,
+    threads: []Thread = @constCast(&[_]Thread{}),
     thread_count: usize = 0,
     next_project_id: u32 = 1,
     next_thread_id: u32 = 1,
@@ -431,13 +550,21 @@ pub const Model = struct {
     api_key_storage: [max_api_key_bytes]u8 = undefined,
     api_key_len: usize = 0,
     request_storage: [max_request_bytes]u8 = undefined,
+    model_search_buffer: canvas.TextBuffer(80) = .{},
+    model_catalog: [32]CatalogModel = undefined,
+    model_catalog_count: usize = 0,
+    model_catalog_loading: bool = false,
+    model_catalog_status_storage: [120]u8 = undefined,
+    model_catalog_status_len: usize = 0,
+    model_catalog_url_storage: [512]u8 = undefined,
+    model_catalog_dirty_mask: u32 = 0,
     model_picker_open: bool = false,
     settings_open: bool = false,
-    account_open: bool = false,
     onboarding_open: bool = false,
-    onboarding_choice: ConnectionChoice = .openrouter,
     dev_mode: bool = false,
     force_onboarding: bool = false,
+    key_validation_pending: bool = false,
+    key_validation_onboarding: bool = false,
     fork_open: bool = false,
     fork_source_thread_id: u32 = 0,
     fork_source_message_id: u32 = 0,
@@ -457,13 +584,24 @@ pub const Model = struct {
     chrome_leading: f32 = 0,
     chrome_trailing: f32 = 0,
     header_height: f32 = header_natural_height,
-    persistence_revision: u64 = 0,
+    persistence_workspace_dirty: bool = false,
+    persistence_structure_dirty: bool = false,
+    persistence_meta_dirty: bool = false,
+    persistence_thread_ids: [persistence_batch_ids]u32 = undefined,
+    persistence_thread_count: usize = 0,
+    persistence_message_thread_ids: [persistence_batch_ids]u32 = undefined,
+    persistence_message_thread_count: usize = 0,
+    persistence_clear_thread_ids: [persistence_batch_ids]u32 = undefined,
+    persistence_clear_thread_count: usize = 0,
+    history_request_thread_id: u32 = 0,
+    stream_parse_storage: [max_stream_line_bytes * 2]u8 = undefined,
 
     // These are implementation state read by the derived bindings below
     // or by update/effects; they are intentionally not exposed directly
     // to the markup contract.
     pub const view_unbound = .{
         "projects",
+        "allocator",
         "project_count",
         "threads",
         "thread_count",
@@ -474,14 +612,23 @@ pub const Model = struct {
         "api_key_storage",
         "api_key_len",
         "request_storage",
+        "model_search_buffer",
+        "model_catalog",
+        "model_catalog_count",
+        "model_catalog_status_storage",
+        "model_catalog_status_len",
+        "model_catalog_url_storage",
+        "model_catalog_dirty_mask",
+        "model_catalog_loading",
         "dev_mode",
         "composer_focus_flip",
         "hasMessages",
         "canSend",
         "forkCount",
         "credential_action",
-        "onboarding_choice",
         "force_onboarding",
+        "key_validation_pending",
+        "key_validation_onboarding",
         "fork_source_thread_id",
         "fork_source_message_id",
         "fork_model_mask",
@@ -490,13 +637,25 @@ pub const Model = struct {
         "rename_id",
         "rename_buffer",
         "clock",
-        "persistence_revision",
+        "persistence_workspace_dirty",
+        "persistence_structure_dirty",
+        "persistence_meta_dirty",
+        "persistence_thread_ids",
+        "persistence_thread_count",
+        "persistence_message_thread_ids",
+        "persistence_message_thread_count",
+        "persistence_clear_thread_ids",
+        "persistence_clear_thread_count",
+        "history_request_thread_id",
+        "stream_parse_storage",
         "delete_kind",
         "delete_id",
         "activeThread",
         "activeThreadConst",
         "threadById",
         "active_thread_id",
+        "modelOptions",
+        "activeModelChoice",
     };
 
     pub const modelOptions = [_]ModelOption{
@@ -519,7 +678,6 @@ pub const Model = struct {
         .{ .action = "Focus message", .keys = "Cmd + L" },
         .{ .action = "Choose model", .keys = "Cmd + K" },
         .{ .action = "Open settings", .keys = "Cmd + ," },
-        .{ .action = "Open account", .keys = "Cmd + Shift + A" },
         .{ .action = "Fork latest response", .keys = "Cmd + Shift + F" },
         .{ .action = "Copy latest response", .keys = "Cmd + Shift + C" },
         .{ .action = "Rename chat", .keys = "Cmd + Shift + R" },
@@ -537,8 +695,35 @@ pub const Model = struct {
         return thread.draft();
     }
 
-    fn markDirty(model: *Model) void {
-        model.persistence_revision +%= 1;
+    fn markWorkspaceDirty(model: *Model) void {
+        model.persistence_workspace_dirty = true;
+        model.persistence_structure_dirty = true;
+        model.persistence_meta_dirty = true;
+    }
+
+    fn markStructureDirty(model: *Model) void {
+        model.persistence_structure_dirty = true;
+        model.persistence_meta_dirty = true;
+    }
+
+    fn markMetaDirty(model: *Model) void {
+        model.persistence_meta_dirty = true;
+    }
+
+    fn markThreadDirty(model: *Model, thread_id: u32) void {
+        appendUniqueId(&model.persistence_thread_ids, &model.persistence_thread_count, thread_id);
+    }
+
+    fn markMessagesDirty(model: *Model, thread_id: u32) void {
+        model.markThreadDirty(thread_id);
+        appendUniqueId(&model.persistence_message_thread_ids, &model.persistence_message_thread_count, thread_id);
+        model.persistence_meta_dirty = true;
+    }
+
+    fn markMessagesCleared(model: *Model, thread_id: u32) void {
+        model.markThreadDirty(thread_id);
+        appendUniqueId(&model.persistence_clear_thread_ids, &model.persistence_clear_thread_count, thread_id);
+        model.persistence_meta_dirty = true;
     }
 
     pub fn brandLabel(model: *const Model) []const u8 {
@@ -593,11 +778,13 @@ pub const Model = struct {
     }
 
     pub fn cannotAddProject(model: *const Model) bool {
-        return model.project_count >= max_projects or model.thread_count >= max_threads;
+        _ = model;
+        return false;
     }
 
     pub fn cannotAddThread(model: *const Model) bool {
-        return model.thread_count >= max_threads;
+        _ = model;
+        return false;
     }
 
     pub fn workspaceStatus(model: *const Model, arena: std.mem.Allocator) []const u8 {
@@ -692,6 +879,42 @@ pub const Model = struct {
         return "Custom model";
     }
 
+    pub fn modelSearch(model: *const Model) []const u8 {
+        return model.model_search_buffer.text();
+    }
+
+    pub fn catalogRows(model: *const Model, arena: std.mem.Allocator) []const CatalogRow {
+        const rows = arena.alloc(CatalogRow, model.model_catalog_count) catch return &.{};
+        for (model.model_catalog[0..model.model_catalog_count], 0..) |*entry, index| {
+            rows[index] = .{ .index = @intCast(index), .label = entry.label(), .slug = entry.slug(), .favorite = entry.favorite, .favorite_label = if (entry.favorite) "Unfavorite" else "Favorite" };
+        }
+        return rows;
+    }
+
+    pub fn modelCatalogLoading(model: *const Model) bool {
+        return model.model_catalog_loading;
+    }
+
+    pub fn modelCatalogStatus(model: *const Model) []const u8 {
+        return model.model_catalog_status_storage[0..model.model_catalog_status_len];
+    }
+
+    fn setModelCatalogStatus(model: *Model, value: []const u8) void {
+        const len = utf8PrefixLen(value, model.model_catalog_status_storage.len);
+        @memcpy(model.model_catalog_status_storage[0..len], value[0..len]);
+        model.model_catalog_status_len = len;
+    }
+
+    fn selectCatalogModel(model: *Model, index: u32) void {
+        if (index >= model.model_catalog_count) return;
+        const entry = &model.model_catalog[index];
+        const thread = model.activeThread() orelse return;
+        thread.model_choice = .custom;
+        thread.model_buffer.set(entry.slug());
+        model.model_picker_open = false;
+        model.markThreadDirty(thread.id);
+    }
+
     pub fn activeModelChoice(model: *const Model) ModelChoice {
         const thread = model.activeThreadConst() orelse return .auto;
         return thread.model_choice;
@@ -739,7 +962,7 @@ pub const Model = struct {
 
     pub fn cannotCreateForks(model: *const Model) bool {
         const count = model.forkCount();
-        return count == 0 or count > max_threads - model.thread_count or model.fork_source_message_id == 0;
+        return count == 0 or model.fork_source_message_id == 0;
     }
 
     pub fn apiKeyField(model: *const Model, arena: std.mem.Allocator) []const u8 {
@@ -752,30 +975,28 @@ pub const Model = struct {
         return if (model.api_key_len > 0) "Key is set · paste to replace" else "sk-or-v1-…";
     }
 
-    pub fn onboardingOpenRouter(model: *const Model) bool {
-        return model.onboarding_choice == .openrouter;
-    }
-
-    pub fn onboardingClaude(model: *const Model) bool {
-        return model.onboarding_choice == .claude_code;
-    }
-
-    pub fn onboardingCodex(model: *const Model) bool {
-        return model.onboarding_choice == .codex;
-    }
-
     pub fn cannotFinishOnboarding(model: *const Model) bool {
-        return model.api_key_len == 0 and model.api_key_buffer.isEmpty();
+        return model.key_validation_pending or (model.api_key_len == 0 and model.api_key_buffer.isEmpty());
     }
 
     pub fn cannotSaveSettings(model: *const Model) bool {
         const thread = model.activeThreadConst() orelse return true;
-        return thread.model_buffer.isEmpty();
+        return thread.model_buffer.isEmpty() or model.key_validation_pending;
     }
 
     pub fn messageRows(model: *const Model) []const Message {
         const thread = model.activeThreadConst() orelse return &.{};
         return thread.messages[0..thread.message_count];
+    }
+
+    pub fn canLoadOlder(model: *const Model) bool {
+        const thread = model.activeThreadConst() orelse return false;
+        return thread.has_older_messages and !thread.history_loading and thread.message_count > 0;
+    }
+
+    pub fn historyLoading(model: *const Model) bool {
+        const thread = model.activeThreadConst() orelse return false;
+        return thread.history_loading;
     }
 
     pub fn hasMessages(model: *const Model) bool {
@@ -875,8 +1096,28 @@ pub const Model = struct {
         return null;
     }
 
+    pub fn ensureProjectCapacity(model: *Model, needed: usize) bool {
+        if (needed <= model.projects.len) return true;
+        const capacity = @max(needed, @max(@as(usize, 8), model.projects.len * 2));
+        model.projects = if (model.projects.len == 0)
+            model.allocator.alloc(Project, capacity) catch return false
+        else
+            model.allocator.realloc(model.projects, capacity) catch return false;
+        return true;
+    }
+
+    pub fn ensureThreadCapacity(model: *Model, needed: usize) bool {
+        if (needed <= model.threads.len) return true;
+        const capacity = @max(needed, @max(@as(usize, 16), model.threads.len * 2));
+        model.threads = if (model.threads.len == 0)
+            model.allocator.alloc(Thread, capacity) catch return false
+        else
+            model.allocator.realloc(model.threads, capacity) catch return false;
+        return true;
+    }
+
     fn addProject(model: *Model) ?u32 {
-        if (model.project_count >= max_projects or model.thread_count >= max_threads) return null;
+        if (!model.ensureProjectCapacity(model.project_count + 1)) return null;
         const id = model.next_project_id;
         model.next_project_id += 1;
         var project = Project{ .id = id };
@@ -889,7 +1130,7 @@ pub const Model = struct {
     }
 
     fn addThread(model: *Model, project_id: u32) ?u32 {
-        if (model.thread_count >= max_threads) return null;
+        if (!model.ensureThreadCapacity(model.thread_count + 1)) return null;
         const id = model.next_thread_id;
         model.next_thread_id += 1;
         var thread = Thread{ .id = id, .project_id = project_id };
@@ -937,7 +1178,6 @@ pub const Model = struct {
             model.rename_buffer.set(thread.title());
         }
         model.settings_open = false;
-        model.account_open = false;
         model.fork_open = false;
         model.archive_open = false;
         model.rename_open = true;
@@ -961,6 +1201,7 @@ pub const Model = struct {
     fn removeThreadAt(model: *Model, index: usize, fx: *Effects) void {
         const thread = &model.threads[index];
         if (thread.sending) fx.cancel(requestKey(thread.id));
+        thread.deinit(model.allocator);
         if (index + 1 < model.thread_count) {
             std.mem.copyForwards(Thread, model.threads[index .. model.thread_count - 1], model.threads[index + 1 .. model.thread_count]);
         }
@@ -1154,7 +1395,6 @@ pub const Model = struct {
         model.fork_seed_buffer.clear();
         model.model_picker_open = false;
         model.settings_open = false;
-        model.account_open = false;
         model.rename_open = false;
         model.archive_open = false;
         model.fork_open = true;
@@ -1184,7 +1424,8 @@ pub const Model = struct {
     }
 
     fn cycleProject(model: *Model, forward: bool) void {
-        var ids: [max_projects]u32 = undefined;
+        const ids = model.allocator.alloc(u32, model.project_count) catch return;
+        defer model.allocator.free(ids);
         var count: usize = 0;
         var current: usize = 0;
         for (model.projects[0..model.project_count]) |project| {
@@ -1210,7 +1451,8 @@ pub const Model = struct {
     }
 
     fn cycleThread(model: *Model, forward: bool) void {
-        var ids: [max_threads]u32 = undefined;
+        const ids = model.allocator.alloc(u32, model.thread_count) catch return;
+        defer model.allocator.free(ids);
         var count: usize = 0;
         var current: usize = 0;
         for (model.threads[0..model.thread_count]) |thread| {
@@ -1231,12 +1473,13 @@ pub const Model = struct {
 
     pub fn appendMessage(model: *Model, role: Role, content: []const u8) bool {
         const thread = model.activeThread() orelse return false;
-        return thread.appendMessage(&model.next_message_id, role, content);
+        return thread.appendMessage(model.allocator, &model.next_message_id, role, content);
     }
 
     fn buildRequest(model: *Model, thread: *const Thread) ?[]const u8 {
-        var api_messages: [max_messages]ApiMessage = undefined;
-        for (thread.messages[0..thread.message_count], 0..) |*message, index| {
+        var api_messages: [provider_context_messages]ApiMessage = undefined;
+        const first = thread.message_count -| provider_context_messages;
+        for (thread.messages[first..thread.message_count], 0..) |*message, index| {
             api_messages[index] = .{
                 .role = if (message.role == .user) "user" else "assistant",
                 .content = message.content(),
@@ -1245,9 +1488,19 @@ pub const Model = struct {
         var writer: std.Io.Writer = .fixed(&model.request_storage);
         std.json.Stringify.value(ApiRequest{
             .model = std.mem.trim(u8, thread.modelName(), " \t"),
-            .messages = api_messages[0..thread.message_count],
+            .messages = api_messages[0..@min(thread.message_count, provider_context_messages)],
         }, .{}, &writer) catch return null;
         return writer.buffered();
+    }
+
+    pub fn deinit(model: *Model) void {
+        for (model.threads[0..model.thread_count]) |*thread| thread.deinit(model.allocator);
+        if (model.threads.len > 0) model.allocator.free(model.threads);
+        if (model.projects.len > 0) model.allocator.free(model.projects);
+        model.threads = @constCast(&[_]Thread{});
+        model.projects = @constCast(&[_]Project{});
+        model.thread_count = 0;
+        model.project_count = 0;
     }
 };
 
@@ -1294,7 +1547,6 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, cmd_focus_composer)) return .focus_composer;
     if (std.mem.eql(u8, name, cmd_model_picker)) return .open_model_picker;
     if (std.mem.eql(u8, name, cmd_settings)) return .open_settings;
-    if (std.mem.eql(u8, name, cmd_account)) return .open_account;
     if (std.mem.eql(u8, name, cmd_fork_latest)) return .fork_latest;
     if (std.mem.eql(u8, name, cmd_copy_latest)) return .copy_latest;
     if (std.mem.eql(u8, name, cmd_rename_thread)) return .open_rename_thread;
@@ -1312,7 +1564,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .draft_edit => |edit| {
             const thread = model.activeThread() orelse return;
             thread.draft_buffer.apply(edit);
-            model.markDirty();
+            fx.startTimer(.{
+                .key = draftSaveKey(thread.id),
+                .interval_ms = draft_save_interval_ms,
+                .on_fire = Effects.timerMsg(.persist_draft),
+            });
         },
         .fork_seed_edit => |edit| model.fork_seed_buffer.apply(edit),
         .rename_edit => |edit| model.rename_buffer.apply(edit),
@@ -1320,18 +1576,34 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const thread = model.activeThread() orelse return;
             thread.model_buffer.apply(edit);
             thread.model_choice = .custom;
-            model.markDirty();
+            model.markThreadDirty(thread.id);
         },
         .api_key_edit => |edit| model.api_key_buffer.apply(edit),
-        .toggle_model_picker => model.model_picker_open = !model.model_picker_open,
+        .model_search_edit => |edit| {
+            model.model_search_buffer.apply(edit);
+            fx.startTimer(.{ .key = model_search_timer, .interval_ms = 250, .on_fire = Effects.timerMsg(.model_search) });
+        },
+        .model_search => searchModels(model, fx),
+        .toggle_model_picker => {
+            model.model_picker_open = !model.model_picker_open;
+            if (model.model_picker_open and model.model_catalog_count == 0) model.setModelCatalogStatus("Search OpenRouter by model or provider");
+        },
         .close_model_picker => model.model_picker_open = false,
         .select_model => |choice| {
             model.selectModel(choice);
-            model.markDirty();
+            if (model.activeThreadConst()) |thread| model.markThreadDirty(thread.id);
+        },
+        .select_auto_model => model.selectModel(.auto),
+        .select_custom_model => model.selectModel(.custom),
+        .select_catalog_model => |index| model.selectCatalogModel(index),
+        .toggle_model_favorite => |index| {
+            if (index < model.model_catalog_count) {
+                model.model_catalog[index].favorite = !model.model_catalog[index].favorite;
+                model.model_catalog_dirty_mask |= @as(u32, 1) << @intCast(index);
+            }
         },
         .open_settings => {
             model.model_picker_open = false;
-            model.account_open = false;
             model.fork_open = false;
             model.rename_open = false;
             model.archive_open = false;
@@ -1346,9 +1618,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const thread = model.activeThread() orelse return;
             if (thread.model_buffer.isEmpty()) return;
             if (!model.api_key_buffer.isEmpty()) {
-                model.setApiKey(model.api_key_buffer.text());
-                model.credential_action = .save;
-                model.setStatus("API key saved securely");
+                validateApiKey(model, false, fx);
+                return;
             }
             model.clearApiKeyInput();
             model.settings_open = false;
@@ -1359,23 +1630,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.credential_action = .delete;
             model.setStatus("API key removed");
         },
-        .open_account => {
-            model.model_picker_open = false;
-            model.settings_open = false;
-            model.fork_open = false;
-            model.rename_open = false;
-            model.archive_open = false;
-            model.account_open = true;
-        },
-        .close_account => model.account_open = false,
-        .onboarding_openrouter => model.onboarding_choice = .openrouter,
-        .onboarding_claude => model.onboarding_choice = .claude_code,
-        .onboarding_codex => model.onboarding_choice = .codex,
         .finish_onboarding => {
             if (model.cannotFinishOnboarding()) return;
             if (!model.api_key_buffer.isEmpty()) {
-                model.setApiKey(model.api_key_buffer.text());
-                model.credential_action = .save;
+                validateApiKey(model, true, fx);
+                return;
             } else {
                 model.credential_action = .complete_onboarding;
             }
@@ -1408,14 +1667,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .toggle_fork_model => |choice| model.fork_model_mask ^= forkChoiceBit(choice),
         .create_forks => {
+            const first_new_thread = model.thread_count;
             createForks(model, fx);
-            model.markDirty();
+            for (model.threads[first_new_thread..model.thread_count]) |thread| model.markMessagesDirty(thread.id);
         },
         .open_rename_thread => model.openRename(.thread),
         .open_rename_project => model.openRename(.project),
         .save_rename => {
             model.saveRename();
-            model.markDirty();
+            model.markStructureDirty();
         },
         .close_rename => {
             model.rename_open = false;
@@ -1424,18 +1684,17 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .archive_thread => {
             model.archiveThread(fx);
-            model.markDirty();
+            model.markStructureDirty();
         },
         .archive_project => {
             model.archiveProject(fx);
-            model.markDirty();
+            model.markStructureDirty();
         },
         .open_archive => {
             model.purgeExpired(fx);
-            model.markDirty();
+            model.markStructureDirty();
             model.model_picker_open = false;
             model.settings_open = false;
-            model.account_open = false;
             model.fork_open = false;
             model.rename_open = false;
             model.delete_confirm_open = false;
@@ -1447,11 +1706,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .restore_thread => |thread_id| {
             model.restoreThread(thread_id);
-            model.markDirty();
+            model.markStructureDirty();
         },
         .restore_project => |project_id| {
             model.restoreProject(project_id);
-            model.markDirty();
+            model.markStructureDirty();
         },
         .delete_thread => |thread_id| {
             const thread = model.threadByIdConst(thread_id) orelse return;
@@ -1475,7 +1734,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.deleteThread(model.delete_id, fx);
             model.delete_confirm_open = false;
             model.delete_id = 0;
-            model.markDirty();
+            model.markStructureDirty();
         },
         .cancel_delete => {
             model.delete_confirm_open = false;
@@ -1485,19 +1744,19 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const project_id = model.addProject() orelse return;
             const thread_id = model.addThread(project_id) orelse return;
             _ = model.activateThread(thread_id);
-            model.markDirty();
+            model.markStructureDirty();
         },
         .new_thread => {
             const thread_id = model.addThread(model.active_project_id) orelse return;
             _ = model.activateThread(thread_id);
-            model.markDirty();
+            model.markStructureDirty();
         },
         .select_project => |project_id| {
             if (project_id == model.active_project_id) return;
             for (model.threads[0..model.thread_count]) |thread| {
                 if (thread.project_id == project_id and !thread.isArchived()) {
                     _ = model.activateThread(thread.id);
-                    model.markDirty();
+                    model.markMetaDirty();
                     return;
                 }
             }
@@ -1505,37 +1764,36 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .select_thread => |thread_id| {
             if (thread_id == model.active_thread_id) return;
             _ = model.activateThread(thread_id);
-            model.markDirty();
+            model.markMetaDirty();
         },
         .previous_project => {
             model.cycleProject(false);
-            model.markDirty();
+            model.markMetaDirty();
         },
         .next_project => {
             model.cycleProject(true);
-            model.markDirty();
+            model.markMetaDirty();
         },
         .previous_thread => {
             model.cycleThread(false);
-            model.markDirty();
+            model.markMetaDirty();
         },
         .next_thread => {
             model.cycleThread(true);
-            model.markDirty();
+            model.markMetaDirty();
         },
         .focus_composer => model.composer_focus_flip = !model.composer_focus_flip,
         .open_model_picker => {
             model.settings_open = false;
-            model.account_open = false;
             model.fork_open = false;
             model.rename_open = false;
             model.archive_open = false;
             model.delete_confirm_open = false;
             model.model_picker_open = true;
+            if (model.model_catalog_count == 0) model.setModelCatalogStatus("Search OpenRouter by model or provider");
         },
         .close_overlay => {
             model.settings_open = false;
-            model.account_open = false;
             model.fork_open = false;
             model.rename_open = false;
             model.archive_open = false;
@@ -1543,6 +1801,26 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.clearApiKeyInput();
             model.fork_seed_buffer.clear();
             model.rename_buffer.clear();
+        },
+        .load_older => {
+            const thread = model.activeThread() orelse return;
+            if (!thread.has_older_messages or thread.history_loading or thread.message_count == 0) return;
+            thread.history_loading = true;
+            model.history_request_thread_id = thread.id;
+            fx.startTimer(.{
+                .key = history_poll_key,
+                .interval_ms = 50,
+                .on_fire = Effects.timerMsg(.history_poll),
+            });
+        },
+        .history_poll => {
+            const thread = model.activeThread() orelse return;
+            if (!thread.history_loading) return;
+            fx.startTimer(.{
+                .key = history_poll_key,
+                .interval_ms = 50,
+                .on_fire = Effects.timerMsg(.history_poll),
+            });
         },
         .clear => {
             const thread = model.activeThread() orelse return;
@@ -1552,20 +1830,48 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             } else {
                 thread.clearStatus();
             }
+            for (thread.messages[0..thread.message_count]) |*message| message.deinit(model.allocator);
             thread.message_count = 0;
             thread.active_model_len = 0;
             thread.stream_message_index = null;
             thread.stream_failed = false;
-            model.markDirty();
+            thread.stream_pending_len = 0;
+            thread.stream_flush_scheduled = false;
+            fx.cancelTimer(streamFlushKey(thread.id));
+            model.markMessagesCleared(thread.id);
         },
         .send => {
+            const thread_id = model.active_thread_id;
+            const before = model.next_message_id;
             send(model, fx);
-            model.markDirty();
+            if (model.next_message_id != before) model.markMessagesDirty(thread_id);
         },
         .stream_line => |line| receiveStreamLine(model, line, fx),
+        .stream_flush => |timer| {
+            const thread_id = streamFlushThreadId(timer.key) orelse return;
+            const thread = model.threadById(thread_id) orelse return;
+            if (!thread.flushStreamDelta(model.allocator, &model.next_message_id)) {
+                thread.stream_failed = true;
+                thread.setStatus("Response exceeded the 64 KiB safety limit");
+                fx.cancel(requestKey(thread.id));
+            }
+        },
+        .persist_draft => |timer| {
+            const thread_id = draftSaveThreadId(timer.key) orelse return;
+            if (model.threadByIdConst(thread_id) != null) model.markThreadDirty(thread_id);
+        },
         .response => |response| {
-            receive(model, response);
-            model.markDirty();
+            if (response.key == key_validation_request) {
+                receiveKeyValidation(model, response);
+                return;
+            }
+            if (response.key == models_request) {
+                receiveModels(model, response);
+                return;
+            }
+            const thread_id = requestThreadId(response.key) orelse return;
+            receive(model, response, fx);
+            model.markMessagesDirty(thread_id);
         },
         .chrome_changed => |chrome| {
             model.chrome_leading = chrome.insets.left;
@@ -1591,6 +1897,7 @@ fn copyMessage(model: *Model, message_id: u32, fx: *Effects) void {
 
 fn createForks(model: *Model, fx: *Effects) void {
     if (model.cannotCreateForks()) return;
+    if (!model.ensureThreadCapacity(model.thread_count + model.forkCount())) return;
     const source = model.threadById(model.fork_source_thread_id) orelse return;
     var source_message_count: ?usize = null;
     for (source.messages[0..source.message_count], 0..) |message, index| {
@@ -1607,7 +1914,7 @@ fn createForks(model: *Model, fx: *Effects) void {
         const thread_id = model.addThread(project_id) orelse break;
         const target = model.threadById(thread_id) orelse continue;
         for (source.messages[0..history_count]) |*message| {
-            target.appendClonedMessage(&model.next_message_id, message);
+            if (!target.appendClonedMessage(model.allocator, &model.next_message_id, message)) return;
         }
         Model.configureThreadModel(target, option.choice, custom_slug);
         var title_buffer: [max_thread_title_bytes]u8 = undefined;
@@ -1628,6 +1935,118 @@ fn createForks(model: *Model, fx: *Effects) void {
     model.fork_seed_buffer.clear();
 }
 
+fn validateApiKey(model: *Model, onboarding: bool, fx: *Effects) void {
+    const candidate = std.mem.trim(u8, model.api_key_buffer.text(), " \t\r\n");
+    if (candidate.len == 0 or candidate.len > max_api_key_bytes) {
+        model.setStatus("Enter a valid OpenRouter API key");
+        return;
+    }
+    var auth_storage: [max_api_key_bytes + 7]u8 = undefined;
+    const auth = std.fmt.bufPrint(&auth_storage, "Bearer {s}", .{candidate}) catch {
+        model.setStatus("The OpenRouter API key is too long");
+        return;
+    };
+    const headers = [_]std.http.Header{.{ .name = "Authorization", .value = auth }};
+    fx.fetch(.{
+        .key = key_validation_request,
+        .method = .GET,
+        .url = openrouter_key_url,
+        .headers = &headers,
+        .timeout_ms = 15_000,
+        .on_response = Effects.responseMsg(.response),
+    });
+    model.key_validation_pending = true;
+    model.key_validation_onboarding = onboarding;
+    model.setStatus("Checking OpenRouter key…");
+}
+
+fn receiveKeyValidation(model: *Model, response: native_sdk.EffectResponse) void {
+    model.key_validation_pending = false;
+    if (response.outcome != .ok) {
+        model.setStatus("Could not verify the key; check your connection and try again");
+        return;
+    }
+    if (response.status == 401 or response.status == 403) {
+        model.setStatus("OpenRouter rejected this API key");
+        return;
+    }
+    if (response.status < 200 or response.status >= 300) {
+        model.setStatus("OpenRouter could not verify this key right now");
+        return;
+    }
+    model.setApiKey(std.mem.trim(u8, model.api_key_buffer.text(), " \t\r\n"));
+    model.credential_action = .save;
+    model.clearApiKeyInput();
+    model.settings_open = false;
+    if (model.key_validation_onboarding) model.onboarding_open = false;
+    model.key_validation_onboarding = false;
+    model.setStatus("OpenRouter connected · key verified");
+}
+
+fn searchModels(model: *Model, fx: *Effects) void {
+    const query = std.mem.trim(u8, model.model_search_buffer.text(), " \t\r\n");
+    if (query.len < 2) {
+        model.setModelCatalogStatus("Type at least 2 characters to search OpenRouter");
+        return;
+    }
+    var writer: std.Io.Writer = .fixed(&model.model_catalog_url_storage);
+    writer.writeAll(openrouter_models_url ++ "?sort=most-popular&q=") catch return;
+    for (query) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.' or byte == '/') {
+            writer.writeByte(byte) catch return;
+        } else if (byte == ' ') {
+            writer.writeAll("%20") catch return;
+        }
+    }
+    fx.fetch(.{
+        .key = models_request,
+        .method = .GET,
+        .url = writer.buffered(),
+        .timeout_ms = 15_000,
+        .on_response = Effects.responseMsg(.response),
+    });
+    model.model_catalog_loading = true;
+    model.setModelCatalogStatus("Searching OpenRouter…");
+}
+
+fn receiveModels(model: *Model, response: native_sdk.EffectResponse) void {
+    model.model_catalog_loading = false;
+    if (response.outcome != .ok) {
+        model.setModelCatalogStatus("Could not reach OpenRouter's model catalog");
+        return;
+    }
+    if (response.status < 200 or response.status >= 300 or response.truncated) {
+        model.setModelCatalogStatus("Model search failed; try a more specific search");
+        return;
+    }
+    var parsed = std.json.parseFromSlice(RemoteModels, model.allocator, response.body, .{ .ignore_unknown_fields = true }) catch {
+        model.setModelCatalogStatus("OpenRouter returned an unreadable model list");
+        return;
+    };
+    defer parsed.deinit();
+    var next: [32]CatalogModel = undefined;
+    var count: usize = 0;
+    for (parsed.value.data) |remote| {
+        if (count == next.len or remote.id.len == 0) break;
+        var favorite = false;
+        for (model.model_catalog[0..model.model_catalog_count]) |*cached| {
+            if (std.mem.eql(u8, cached.slug(), remote.id)) favorite = cached.favorite;
+        }
+        var entry = CatalogModel{ .favorite = favorite };
+        entry.slug_len = utf8PrefixLen(remote.id, entry.slug_storage.len);
+        @memcpy(entry.slug_storage[0..entry.slug_len], remote.id[0..entry.slug_len]);
+        const label = if (remote.name.len > 0) remote.name else remote.id;
+        entry.label_len = utf8PrefixLen(label, entry.label_storage.len);
+        @memcpy(entry.label_storage[0..entry.label_len], label[0..entry.label_len]);
+        next[count] = entry;
+        count += 1;
+    }
+    @memcpy(model.model_catalog[0..count], next[0..count]);
+    model.model_catalog_count = count;
+    model.model_catalog_dirty_mask = if (count == 32) std.math.maxInt(u32) else (@as(u32, 1) << @intCast(count)) -| 1;
+    model.setModelCatalogStatus(if (count == 0) "No models matched" else "Results from OpenRouter");
+}
+
 fn send(model: *Model, fx: *Effects) void {
     const thread = model.activeThread() orelse return;
     sendThread(model, thread, fx);
@@ -1635,7 +2054,7 @@ fn send(model: *Model, fx: *Effects) void {
 
 fn sendThread(model: *Model, thread: *Thread, fx: *Effects) void {
     if (thread.sending or model.api_key_len == 0 or thread.draft_buffer.isEmpty() or thread.model_buffer.isEmpty()) return;
-    if (!thread.appendMessage(&model.next_message_id, .user, thread.draft())) return;
+    if (!thread.appendMessage(model.allocator, &model.next_message_id, .user, thread.draft())) return;
     thread.draft_buffer.clear();
 
     const body = model.buildRequest(thread) orelse {
@@ -1692,7 +2111,8 @@ fn receiveStreamLine(model: *Model, line: native_sdk.EffectLine, fx: *Effects) v
         event_line;
     if (std.mem.eql(u8, payload, "[DONE]")) return;
 
-    var parsed = std.json.parseFromSlice(ApiStreamChunk, std.heap.page_allocator, payload, .{ .ignore_unknown_fields = true }) catch {
+    var scratch = std.heap.FixedBufferAllocator.init(&model.stream_parse_storage);
+    var parsed = std.json.parseFromSlice(ApiStreamChunk, scratch.allocator(), payload, .{ .ignore_unknown_fields = true }) catch {
         thread.stream_failed = true;
         thread.setStatus("OpenRouter returned an unreadable stream event");
         fx.cancel(line.key);
@@ -1709,18 +2129,31 @@ fn receiveStreamLine(model: *Model, line: native_sdk.EffectLine, fx: *Effects) v
     if (parsed.value.model.len > 0) thread.setActiveModel(parsed.value.model);
     if (parsed.value.choices.len == 0) return;
     const content = parsed.value.choices[0].delta.content orelse return;
-    if (!thread.appendStreamDelta(&model.next_message_id, content)) {
+    if (!thread.queueStreamDelta(model.allocator, content)) {
         thread.stream_failed = true;
-        thread.setStatus("Response exceeded the 5,000 byte message limit");
+        thread.setStatus("Response exceeded the 64 KiB safety limit");
         fx.cancel(line.key);
         return;
+    }
+    if (!thread.stream_flush_scheduled) {
+        thread.stream_flush_scheduled = true;
+        fx.startTimer(.{
+            .key = streamFlushKey(thread.id),
+            .interval_ms = stream_flush_interval_ms,
+            .on_fire = Effects.timerMsg(.stream_flush),
+        });
     }
     thread.clearStatus();
 }
 
-fn receive(model: *Model, response: native_sdk.EffectResponse) void {
+fn receive(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
     const target_thread_id = requestThreadId(response.key) orelse return;
     const thread = model.threadById(target_thread_id) orelse return;
+    if (thread.stream_flush_scheduled) fx.cancelTimer(streamFlushKey(thread.id));
+    if (thread.stream_pending_len > 0 and !thread.flushStreamDelta(model.allocator, &model.next_message_id)) {
+        thread.stream_failed = true;
+        thread.setStatus("Response exceeded the 64 KiB safety limit");
+    }
     receiveThread(thread, response);
 }
 
@@ -1747,6 +2180,20 @@ fn receiveThread(thread: *Thread, response: native_sdk.EffectResponse) void {
     }
     if (response.status < 200 or response.status >= 300) {
         if (thread.stream_failed) return;
+        const friendly = switch (response.status) {
+            400 => "OpenRouter rejected this request; the model name or request may be invalid",
+            401, 403 => "OpenRouter rejected the API key; reconnect it in Settings",
+            402 => "OpenRouter credits are required for this model",
+            404 => "This model is unavailable; choose another model",
+            408 => "OpenRouter timed out while preparing the response",
+            413 => "This conversation exceeds the model's context limit",
+            429 => "OpenRouter is rate limiting requests; wait a moment and retry",
+            else => "",
+        };
+        if (friendly.len > 0) {
+            thread.setStatus(friendly);
+            return;
+        }
         var status_buffer: [64]u8 = undefined;
         const text = std.fmt.bufPrint(&status_buffer, "OpenRouter returned HTTP {d}", .{response.status}) catch "OpenRouter request failed";
         thread.setStatus(text);
@@ -1768,7 +2215,12 @@ pub fn onChrome(chrome: native_sdk.WindowChrome) ?Msg {
 
 pub const AppUi = canvas.Ui(Msg);
 pub const app_markup = @embedFile("app.native");
-pub const CompiledAppView = canvas.CompiledMarkupView(Model, Msg, app_markup);
+pub const CompiledAppView = blk: {
+    @setEvalBranchQuota(200_000);
+    const View = canvas.CompiledMarkupView(Model, Msg, app_markup);
+    _ = View.document;
+    break :blk View;
+};
 
 // UiApp deliberately keeps update pure of platform services. This thin
 // wrapper handles the OS-bound credential concerns around it: the
@@ -1776,9 +2228,9 @@ pub const CompiledAppView = canvas.CompiledMarkupView(Model, Msg, app_markup);
 const SecureChatApp = struct {
     inner: native_sdk.App,
     chat: *ChatApp,
-    database: *storage.Database,
-    saved_revision: u64 = 0,
+    persistence_worker: *persistence.Worker,
     credential_loaded: bool = false,
+    persistence_error_shown: bool = false,
 
     fn app(self: *SecureChatApp) native_sdk.App {
         return .{
@@ -1813,6 +2265,52 @@ const SecureChatApp = struct {
         }
 
         try self.inner.event(runtime, value);
+        if (self.chat.model.history_request_thread_id != 0) {
+            const thread_id = self.chat.model.history_request_thread_id;
+            self.chat.model.history_request_thread_id = 0;
+            if (self.chat.model.threadByIdConst(thread_id)) |thread| {
+                if (thread.message_count > 0) {
+                    _ = self.persistence_worker.enqueue(.{ .load_history = .{
+                        .thread_id = thread_id,
+                        .before_id = thread.messages[0].id,
+                        .limit = history_page_size,
+                    } });
+                }
+            }
+        }
+        if (self.persistence_worker.takeHistoryResult()) |result_value| {
+            var result = result_value;
+            const model = &self.chat.model;
+            if (model.threadById(result.thread_id)) |thread| {
+                const count = result.page.messages.len;
+                if (thread.ensureMessageCapacity(model.allocator, thread.message_count + count)) {
+                    std.mem.copyBackwards(Message, thread.messages[count .. count + thread.message_count], thread.messages[0..thread.message_count]);
+                    for (result.page.messages, 0..) |history, index| {
+                        thread.messages[index] = .{
+                            .id = history.id,
+                            .role = if (history.role == @intFromEnum(Role.assistant)) .assistant else .user,
+                            .content_storage = history.content,
+                            .content_len = history.content.len,
+                        };
+                        result.page.messages[index].content = @constCast(&[_]u8{});
+                    }
+                    thread.message_count += count;
+                    thread.has_older_messages = result.page.has_more;
+                }
+                thread.history_loading = false;
+            }
+            result.page.deinit(model.allocator);
+            if (self.chat.installed) try self.chat.rebuild(runtime, self.chat.canvas_window_id);
+        }
+        if (self.chat.model.model_catalog_dirty_mask != 0) {
+            const now = self.chat.model.clock.wallMs();
+            for (self.chat.model.model_catalog[0..self.chat.model.model_catalog_count], 0..) |*entry, index| {
+                const bit = @as(u32, 1) << @intCast(index);
+                if (self.chat.model.model_catalog_dirty_mask & bit == 0) continue;
+                if (!self.persistence_worker.enqueue(.{ .upsert_cached_model = persistence.CachedModelRecord.from(entry, now) })) break;
+                self.chat.model.model_catalog_dirty_mask &= ~bit;
+            }
+        }
         const action = self.chat.model.credential_action;
         self.chat.model.credential_action = .none;
         switch (action) {
@@ -1850,22 +2348,102 @@ const SecureChatApp = struct {
             },
         }
 
-        if (self.chat.model.persistence_revision != self.saved_revision) {
-            self.database.save(&self.chat.model) catch {
-                self.chat.model.setStatus("Workspace changes could not be saved locally");
-                if (self.chat.installed) try self.chat.rebuild(runtime, self.chat.canvas_window_id);
-                return;
-            };
-            self.saved_revision = self.chat.model.persistence_revision;
+        self.flushPersistence();
+        if (self.persistence_worker.hasFailed() and !self.persistence_error_shown) {
+            self.persistence_error_shown = true;
+            self.chat.model.setStatus("Workspace changes could not be saved locally");
+            if (self.chat.installed) try self.chat.rebuild(runtime, self.chat.canvas_window_id);
         }
     }
 
     fn stop(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
         const self: *SecureChatApp = @ptrCast(@alignCast(context));
-        if (self.chat.model.persistence_revision != self.saved_revision) {
-            self.database.save(&self.chat.model) catch {};
+        for (self.chat.model.threads[0..self.chat.model.thread_count]) |*thread| {
+            if (thread.stream_pending_len > 0) {
+                _ = thread.flushStreamDelta(self.chat.model.allocator, &self.chat.model.next_message_id);
+                self.chat.model.markMessagesDirty(thread.id);
+            } else {
+                self.chat.model.markThreadDirty(thread.id);
+            }
         }
+        self.chat.model.markMetaDirty();
+        self.flushPersistence();
+        self.persistence_worker.stopAndDestroy();
         try self.inner.stop(runtime);
+    }
+
+    fn flushPersistence(self: *SecureChatApp) void {
+        const model = &self.chat.model;
+        var required: usize = 0;
+        if (model.persistence_structure_dirty) {
+            required = model.project_count + model.thread_count + 2;
+            if (model.persistence_workspace_dirty) {
+                for (model.threads[0..model.thread_count]) |thread| required += thread.message_count;
+            }
+        } else {
+            required = model.persistence_clear_thread_count + model.persistence_thread_count + @intFromBool(model.persistence_meta_dirty);
+            for (model.persistence_message_thread_ids[0..model.persistence_message_thread_count]) |thread_id| {
+                const thread = model.threadByIdConst(thread_id) orelse continue;
+                required += thread.message_count;
+            }
+        }
+        if (required == 0 or !self.persistence_worker.canEnqueue(required)) return;
+
+        if (model.persistence_structure_dirty) {
+            for (model.projects[0..model.project_count], 0..) |project, position| {
+                _ = self.persistence_worker.enqueue(.{ .upsert_project = persistence.ProjectRecord.from(&project, position) });
+            }
+            for (model.threads[0..model.thread_count], 0..) |thread, position| {
+                _ = self.persistence_worker.enqueue(.{ .upsert_thread = persistence.ThreadRecord.from(&thread, position) });
+                if (model.persistence_workspace_dirty) {
+                    for (thread.messages[0..thread.message_count]) |message| {
+                        _ = self.persistence_worker.enqueue(.{ .upsert_message = persistence.MessageRecord.from(thread.id, &message) });
+                    }
+                }
+            }
+            var reconcile = persistence.ReconcileRecord{};
+            for (model.projects[0..model.project_count]) |project| {
+                reconcile.project_ids[reconcile.project_count] = project.id;
+                reconcile.project_count += 1;
+            }
+            for (model.threads[0..model.thread_count]) |thread| {
+                reconcile.thread_ids[reconcile.thread_count] = thread.id;
+                reconcile.thread_count += 1;
+            }
+            _ = self.persistence_worker.enqueue(.{ .reconcile = reconcile });
+        } else {
+            for (model.persistence_clear_thread_ids[0..model.persistence_clear_thread_count]) |thread_id| {
+                _ = self.persistence_worker.enqueue(.{ .clear_messages = thread_id });
+            }
+            for (model.persistence_thread_ids[0..model.persistence_thread_count]) |thread_id| {
+                for (model.threads[0..model.thread_count], 0..) |thread, position| {
+                    if (thread.id != thread_id) continue;
+                    _ = self.persistence_worker.enqueue(.{ .upsert_thread = persistence.ThreadRecord.from(&thread, position) });
+                    break;
+                }
+            }
+            for (model.persistence_message_thread_ids[0..model.persistence_message_thread_count]) |thread_id| {
+                const thread = model.threadByIdConst(thread_id) orelse continue;
+                for (thread.messages[0..thread.message_count]) |message| {
+                    _ = self.persistence_worker.enqueue(.{ .upsert_message = persistence.MessageRecord.from(thread.id, &message) });
+                }
+            }
+        }
+        if (model.persistence_meta_dirty) {
+            _ = self.persistence_worker.enqueue(.{ .meta = .{
+                .active_project_id = model.active_project_id,
+                .active_thread_id = model.active_thread_id,
+                .next_project_id = model.next_project_id,
+                .next_thread_id = model.next_thread_id,
+                .next_message_id = model.next_message_id,
+            } });
+        }
+        model.persistence_workspace_dirty = false;
+        model.persistence_structure_dirty = false;
+        model.persistence_meta_dirty = false;
+        model.persistence_thread_count = 0;
+        model.persistence_message_thread_count = 0;
+        model.persistence_clear_thread_count = 0;
     }
 };
 
@@ -1896,7 +2474,8 @@ pub fn main(init: std.process.Init) !void {
     var database_path_buffer: [1200]u8 = undefined;
     const database_path = try native_sdk.app_dirs.join(native_sdk.app_dirs.currentPlatform(), &database_path_buffer, &.{ data_directory, "superchat.sqlite3" });
     var database = try storage.Database.open(database_path);
-    defer database.close();
+    var database_owned = true;
+    errdefer if (database_owned) database.close();
     const now_ms = native_sdk.Clock.system.wallMs();
     try database.purgeExpired(now_ms -| archive_retention_ms);
 
@@ -1915,13 +2494,20 @@ pub fn main(init: std.process.Init) !void {
     });
     defer app_state.destroy();
     app_state.model = initialModelWithOptions(api_key, dev_mode, force_onboarding);
-    if (try database.load(&app_state.model)) {
+    defer app_state.model.deinit();
+    const loaded_workspace = try database.load(&app_state.model);
+    if (loaded_workspace) {
         if (!app_state.model.normalizeLoadedWorkspace()) return error.InvalidWorkspace;
     } else {
+        app_state.model.deinit();
         app_state.model = initialModelWithOptions(api_key, dev_mode, force_onboarding);
+        try database.save(&app_state.model);
     }
-    try database.save(&app_state.model);
-    var secure_app = SecureChatApp{ .inner = app_state.app(), .chat = app_state, .database = &database };
+    const persistence_worker = try persistence.Worker.create(std.heap.page_allocator, database, init.io);
+    database_owned = false;
+    var secure_app = SecureChatApp{ .inner = app_state.app(), .chat = app_state, .persistence_worker = persistence_worker };
+    app_state.model.markWorkspaceDirty();
+    secure_app.flushPersistence();
 
     try runner.runWithOptions(secure_app.app(), .{
         .app_name = "superchat",

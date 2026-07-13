@@ -18,7 +18,6 @@
         .{ .id = "workspace.focus-composer", .key = "l", .modifiers = .{"primary"} },
         .{ .id = "workspace.model-picker", .key = "k", .modifiers = .{"primary"} },
         .{ .id = "workspace.settings", .key = ",", .modifiers = .{"primary"} },
-        .{ .id = "workspace.account", .key = "a", .modifiers = .{ "primary", "shift" } },
         .{ .id = "workspace.fork-latest", .key = "f", .modifiers = .{ "primary", "shift" } },
         .{ .id = "workspace.copy-latest", .key = "c", .modifiers = .{ "primary", "shift" } },
         .{ .id = "workspace.rename-thread", .key = "r", .modifiers = .{ "primary", "shift" } },

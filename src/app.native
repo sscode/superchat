@@ -5,17 +5,7 @@
       <spacer width="{chrome_leading}" />
       <text size="heading">{brandLabel}</text>
       <spacer grow="1" />
-      <stack>
-        <select size="sm" width="210" on-press="toggle_model_picker" label="Model selector">{selectedModelLabel}</select>
-        <if test="{model_picker_open}">
-          <dropdown-menu anchor="below" anchor-alignment="stretch" on-dismiss="close_model_picker" label="Models">
-            <for each="modelOptions" as="m">
-              <menu-item on-press="select_model:{m.choice}" selected="{m.choice == activeModelChoice}">{m.label}</menu-item>
-            </for>
-          </dropdown-menu>
-        </if>
-      </stack>
-      <button size="sm" variant="ghost" icon="circle-dot" on-press="open_account" label="Open account">Account</button>
+      <select size="sm" width="210" on-press="toggle_model_picker" label="Model selector">{selectedModelLabel}</select>
       <button size="sm" variant="ghost" icon="settings" on-press="open_settings" label="Open settings"></button>
       <button size="sm" variant="ghost" icon="trash" on-press="clear" disabled="{cannotClear}" label="Clear current chat"></button>
       <spacer width="{chrome_trailing}" />
@@ -67,6 +57,12 @@
         <separator />
         <scroll grow="1" label="Conversation">
           <column padding="24" gap="14">
+            <if test="{canLoadOlder}">
+              <row main="center"><button size="sm" variant="ghost" on-press="load_older">Load earlier messages</button></row>
+            </if>
+            <if test="{historyLoading}">
+              <row main="center" gap="8"><spinner size="sm" /><text foreground="text_muted">Loading earlier messages</text></row>
+            </if>
             <for each="messageRows" key="id" as="m">
               <if test="{m.isUser}">
                 <row main="end">
@@ -123,6 +119,36 @@
     </row>
   </column>
 
+  <if test="{model_picker_open}">
+    <panel background="scrim" on-press="close_model_picker" label="Model picker backdrop">
+      <column main="center" cross="center">
+        <dialog width="620" height="520" label="Choose an OpenRouter model">
+          <column padding="20" gap="10">
+            <row cross="center"><text size="heading" grow="1">Choose a model</text><text foreground="text_muted">Cmd + K</text></row>
+            <text-field text="{modelSearch}" on-input="model_search_edit" placeholder="Search models or providers…" autofocus="true" label="Search OpenRouter models" />
+            <text size="sm" foreground="text_muted">{modelCatalogStatus}</text>
+            <if test="{modelCatalogLoading}"><row gap="8"><spinner size="sm" /><text>Searching</text></row></if>
+            <scroll grow="1" label="OpenRouter model results">
+              <column gap="4">
+                <for each="catalogRows" key="index" as="m">
+                  <row gap="6" cross="center">
+                    <button grow="1" variant="ghost" on-press="select_catalog_model:{m.index}" label="{m.slug}">{m.label} · {m.slug}</button>
+                    <button size="sm" variant="ghost" on-press="toggle_model_favorite:{m.index}" label="Favorite model">{m.favorite_label}</button>
+                  </row>
+                </for>
+              </column>
+            </scroll>
+            <row gap="8" main="end">
+              <button variant="outline" on-press="select_auto_model">OpenRouter Auto</button>
+              <button variant="ghost" on-press="select_custom_model">Enter model ID manually</button>
+              <button variant="primary" on-press="close_model_picker">Done</button>
+            </row>
+          </column>
+        </dialog>
+      </column>
+    </panel>
+  </if>
+
   <if test="{settings_open}">
     <panel background="scrim" on-press="close_settings" label="Settings backdrop">
       <column main="center" cross="center">
@@ -134,7 +160,7 @@
             </row>
             <text>OpenRouter API key</text>
             <text-field text="{apiKeyField}" on-input="api_key_edit" placeholder="{apiKeyPlaceholder}" autofocus="true" label="OpenRouter API key" />
-            <text size="sm" foreground="text_muted">Saved securely in Keychain.</text>
+            <text size="sm" foreground="text_muted">{statusLine}</text>
             <text>Custom model for this chat</text>
             <text-field text="{modelName}" on-input="model_edit" placeholder="provider/model" label="Custom OpenRouter model" />
             <text size="heading">Keyboard shortcuts</text>
@@ -153,20 +179,6 @@
               <button size="sm" variant="ghost" on-press="close_settings">Cancel</button>
               <button size="sm" variant="primary" on-press="save_settings" disabled="{cannotSaveSettings}">Save</button>
             </row>
-          </column>
-        </dialog>
-      </column>
-    </panel>
-  </if>
-
-  <if test="{account_open}">
-    <panel background="scrim" on-press="close_account" label="Account backdrop">
-      <column main="center" cross="center">
-        <dialog width="440" height="330" label="Account">
-          <column padding="24" gap="12">
-            <text size="heading">Your account · Cmd + Shift + A</text>
-            <text foreground="text_muted" wrap="true">Local-only for now. Accounts will arrive with backup and cross-device sync; your API key stays in Keychain.</text>
-            <button size="sm" variant="primary" on-press="close_account">Done</button>
           </column>
         </dialog>
       </column>
@@ -261,28 +273,13 @@
         <dialog width="620" height="440" label="Connect a model provider">
           <column padding="24" gap="10">
             <text size="heading">Welcome to Superchat</text>
-            <text foreground="text_muted">Choose how this Mac will reach models. No Superchat account is required.</text>
-            <row gap="8">
-              <button size="sm" variant="outline" on-press="onboarding_openrouter">OpenRouter</button>
-              <button size="sm" variant="outline" on-press="onboarding_claude">Claude</button>
-              <button size="sm" variant="outline" on-press="onboarding_codex">ChatGPT</button>
-            </row>
-            <if test="{onboardingOpenRouter}">
-              <text size="heading">Connect OpenRouter · available</text>
-              <text foreground="text_muted" wrap="true">Use one Keychain-stored key to choose models from multiple providers.</text>
-              <text-field text="{apiKeyField}" on-input="api_key_edit" placeholder="sk-or-v1-…" autofocus="true" label="OpenRouter API key" />
-              <button variant="primary" on-press="finish_onboarding" disabled="{cannotFinishOnboarding}">Connect OpenRouter</button>
-            </if>
-            <if test="{onboardingClaude}">
-              <text size="heading">Claude subscription · adapter planned</text>
-              <text foreground="text_muted" wrap="true">The future adapter will use the official Claude Code harness and its existing login.</text>
-              <button variant="outline" disabled="true">Not available in this build</button>
-            </if>
-            <if test="{onboardingCodex}">
-              <text size="heading">ChatGPT subscription · adapter planned</text>
-              <text foreground="text_muted" wrap="true">The future adapter will use the official Codex app-server and its existing login.</text>
-              <button variant="outline" disabled="true">Not available in this build</button>
-            </if>
+            <text foreground="text_muted">Connect OpenRouter to reach models from multiple providers. No Superchat account is required.</text>
+            <text size="heading">Connect OpenRouter · available</text>
+            <text foreground="text_muted" wrap="true">{statusLine}</text>
+            <text-field text="{apiKeyField}" on-input="api_key_edit" placeholder="sk-or-v1-…" autofocus="true" label="OpenRouter API key" />
+            <button variant="primary" on-press="finish_onboarding" disabled="{cannotFinishOnboarding}">Connect OpenRouter</button>
+            <text size="heading">Planned connections</text>
+            <text size="sm" foreground="text_muted" wrap="true">Claude and ChatGPT subscription adapters are roadmap items and are not available in this build.</text>
             <spacer grow="1" />
             <row main="end">
               <button size="sm" variant="ghost" on-press="skip_onboarding">Set up later</button>
