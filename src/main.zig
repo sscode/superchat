@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const superchat_options = @import("superchat_options");
 const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 pub const workspace_storage = @import("storage.zig");
@@ -30,7 +31,7 @@ const key_validation_request: u64 = 1 << 61;
 const models_request: u64 = (1 << 61) + 1;
 const model_search_timer: u64 = (1 << 52) + 1;
 const openrouter_models_url = "https://openrouter.ai/api/v1/models";
-const credential_service = "dev.sscode.superchat";
+const credential_service = "dev.sscode.superchat.credentials.v1";
 const credential_account = "openrouter-api-key";
 const onboarding_account = "onboarding-complete";
 const onboarding_marker = "1";
@@ -39,8 +40,10 @@ const clipboard_key_base: u64 = 1 << 40;
 const stream_flush_key_base: u64 = 1 << 44;
 const draft_save_key_base: u64 = 1 << 48;
 const history_poll_key: u64 = 1 << 52;
+const toast_timer_key: u64 = (1 << 52) + 2;
 const stream_flush_interval_ms: u64 = 16;
 const draft_save_interval_ms: u64 = 300;
+const toast_duration_ms: u64 = 2200;
 const archive_retention_ms: i64 = 30 * 24 * 60 * 60 * 1000;
 const day_ms: i64 = 24 * 60 * 60 * 1000;
 const provider_context_messages = 12;
@@ -53,6 +56,7 @@ const max_draft_bytes = 4000;
 const max_model_bytes = 128;
 const max_api_key_bytes = 256;
 const max_status_bytes = 240;
+const max_toast_bytes = 96;
 const max_stream_line_bytes = 32 * 1024;
 const max_request_bytes = native_sdk.max_effect_fetch_payload_bytes;
 
@@ -82,7 +86,7 @@ const shell_windows = [_]native_sdk.ShellWindow{.{
     .min_height = window_min_height,
     .restore_state = true,
     .restore_policy = .center_on_primary,
-    .titlebar = .hidden_inset_tall,
+    .titlebar = .standard,
     .views = &shell_views,
 }};
 const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
@@ -108,6 +112,13 @@ pub const ModelOption = struct {
     choice: ModelChoice,
     label: []const u8,
     slug: []const u8,
+};
+
+pub const QuickModel = struct {
+    number: u8,
+    label: []const u8,
+    slug: []const u8,
+    shortcut: []const u8,
 };
 
 pub const CatalogModel = struct {
@@ -351,7 +362,11 @@ pub const ArchivedThreadRow = struct {
     expiry: []const u8,
 };
 
+pub const chats_project_id: u32 = 0;
+const chats_project_name = "Chats";
+
 pub const cmd_new_thread = "workspace.new-thread";
+pub const cmd_new_project_thread = "workspace.new-project-thread";
 pub const cmd_new_project = "workspace.new-project";
 pub const cmd_previous_thread = "workspace.previous-thread";
 pub const cmd_next_thread = "workspace.next-thread";
@@ -369,6 +384,17 @@ pub const cmd_archive_project = "workspace.archive-project";
 pub const cmd_open_archive = "workspace.archive";
 pub const cmd_clear_thread = "workspace.clear-thread";
 pub const cmd_close_overlay = "workspace.close-overlay";
+pub const quick_model_commands = [_][]const u8{
+    "workspace.model-1",
+    "workspace.model-2",
+    "workspace.model-3",
+    "workspace.model-4",
+    "workspace.model-5",
+    "workspace.model-6",
+    "workspace.model-7",
+    "workspace.model-8",
+    "workspace.model-9",
+};
 
 fn requestKey(thread_id: u32) u64 {
     return request_key_base + thread_id;
@@ -453,6 +479,7 @@ pub const Msg = union(enum) {
     toggle_model_picker,
     close_model_picker,
     select_model: ModelChoice,
+    select_quick_model: u8,
     select_auto_model,
     select_custom_model,
     select_catalog_model: u32,
@@ -489,6 +516,7 @@ pub const Msg = union(enum) {
     cancel_delete,
     new_project,
     new_thread,
+    new_project_thread,
     select_project: u32,
     select_thread: u32,
     previous_project,
@@ -505,6 +533,7 @@ pub const Msg = union(enum) {
     stream_line: native_sdk.EffectLine,
     stream_flush: native_sdk.EffectTimer,
     persist_draft: native_sdk.EffectTimer,
+    dismiss_toast: native_sdk.EffectTimer,
     response: native_sdk.EffectResponse,
     chrome_changed: native_sdk.WindowChrome,
 
@@ -515,6 +544,7 @@ pub const Msg = union(enum) {
         "history_poll",
         "model_search",
         "persist_draft",
+        "dismiss_toast",
         "clipboard_result",
         "chrome_changed",
         "previous_project",
@@ -584,6 +614,8 @@ pub const Model = struct {
     chrome_leading: f32 = 0,
     chrome_trailing: f32 = 0,
     header_height: f32 = header_natural_height,
+    toast_storage: [max_toast_bytes]u8 = undefined,
+    toast_len: usize = 0,
     persistence_workspace_dirty: bool = false,
     persistence_structure_dirty: bool = false,
     persistence_meta_dirty: bool = false,
@@ -637,6 +669,8 @@ pub const Model = struct {
         "rename_id",
         "rename_buffer",
         "clock",
+        "toast_storage",
+        "toast_len",
         "persistence_workspace_dirty",
         "persistence_structure_dirty",
         "persistence_meta_dirty",
@@ -658,6 +692,18 @@ pub const Model = struct {
         "activeModelChoice",
     };
 
+    pub const quickModels = [_]QuickModel{
+        .{ .number = 1, .label = "GPT-5.5", .slug = "openai/gpt-5.5", .shortcut = "Cmd + 1" },
+        .{ .number = 2, .label = "GPT-5.4 Mini", .slug = "openai/gpt-5.4-mini", .shortcut = "Cmd + 2" },
+        .{ .number = 3, .label = "Claude Sonnet 5", .slug = "anthropic/claude-sonnet-5", .shortcut = "Cmd + 3" },
+        .{ .number = 4, .label = "Claude Opus 4.8", .slug = "anthropic/claude-opus-4.8", .shortcut = "Cmd + 4" },
+        .{ .number = 5, .label = "Gemini 3.5 Flash", .slug = "google/gemini-3.5-flash", .shortcut = "Cmd + 5" },
+        .{ .number = 6, .label = "Gemini 3.1 Pro", .slug = "google/gemini-3.1-pro-preview", .shortcut = "Cmd + 6" },
+        .{ .number = 7, .label = "GLM 5.2", .slug = "z-ai/glm-5.2", .shortcut = "Cmd + 7" },
+        .{ .number = 8, .label = "Kimi K2.6", .slug = "moonshotai/kimi-k2.6", .shortcut = "Cmd + 8" },
+        .{ .number = 9, .label = "Kimi K2.7 Code", .slug = "moonshotai/kimi-k2.7-code", .shortcut = "Cmd + 9" },
+    };
+
     pub const modelOptions = [_]ModelOption{
         .{ .choice = .auto, .label = "Auto · best fit", .slug = "openrouter/auto" },
         .{ .choice = .claude_sonnet, .label = "Claude Sonnet 5", .slug = "anthropic/claude-sonnet-5" },
@@ -669,7 +715,8 @@ pub const Model = struct {
     };
 
     pub const shortcutHints = [_]ShortcutHint{
-        .{ .action = "New chat", .keys = "Cmd + N" },
+        .{ .action = "New top-level chat", .keys = "Cmd + N" },
+        .{ .action = "New chat in project", .keys = "Cmd + Option + N" },
         .{ .action = "New project", .keys = "Cmd + Shift + N" },
         .{ .action = "Previous chat", .keys = "Cmd + [" },
         .{ .action = "Next chat", .keys = "Cmd + ]" },
@@ -677,6 +724,15 @@ pub const Model = struct {
         .{ .action = "Next project", .keys = "Cmd + Option + Down" },
         .{ .action = "Focus message", .keys = "Cmd + L" },
         .{ .action = "Choose model", .keys = "Cmd + K" },
+        .{ .action = "Quick model: GPT-5.5", .keys = "Cmd + 1" },
+        .{ .action = "Quick model: GPT-5.4 Mini", .keys = "Cmd + 2" },
+        .{ .action = "Quick model: Claude Sonnet 5", .keys = "Cmd + 3" },
+        .{ .action = "Quick model: Claude Opus 4.8", .keys = "Cmd + 4" },
+        .{ .action = "Quick model: Gemini 3.5 Flash", .keys = "Cmd + 5" },
+        .{ .action = "Quick model: Gemini 3.1 Pro", .keys = "Cmd + 6" },
+        .{ .action = "Quick model: GLM 5.2", .keys = "Cmd + 7" },
+        .{ .action = "Quick model: Kimi K2.6", .keys = "Cmd + 8" },
+        .{ .action = "Quick model: Kimi K2.7 Code", .keys = "Cmd + 9" },
         .{ .action = "Open settings", .keys = "Cmd + ," },
         .{ .action = "Fork latest response", .keys = "Cmd + Shift + F" },
         .{ .action = "Copy latest response", .keys = "Cmd + Shift + C" },
@@ -734,11 +790,26 @@ pub const Model = struct {
         return if (model.composer_focus_flip) "composer-a" else "composer-b";
     }
 
+    pub fn toastVisible(model: *const Model) bool {
+        return model.toast_len > 0;
+    }
+
+    pub fn toastText(model: *const Model) []const u8 {
+        return model.toast_storage[0..model.toast_len];
+    }
+
+    fn showToast(model: *Model, message: []const u8, fx: *Effects) void {
+        const len = utf8PrefixLen(message, max_toast_bytes);
+        @memcpy(model.toast_storage[0..len], message[0..len]);
+        model.toast_len = len;
+        fx.startTimer(.{ .key = toast_timer_key, .interval_ms = toast_duration_ms, .on_fire = Effects.timerMsg(.dismiss_toast) });
+    }
+
     pub fn projectRows(model: *const Model, arena: std.mem.Allocator) []const Project {
         const out = arena.alloc(Project, model.project_count) catch return &.{};
         var count: usize = 0;
         for (model.projects[0..model.project_count]) |project| {
-            if (project.isArchived()) continue;
+            if (project.id == chats_project_id or project.isArchived()) continue;
             out[count] = project;
             count += 1;
         }
@@ -746,6 +817,7 @@ pub const Model = struct {
     }
 
     pub fn threadRows(model: *const Model, arena: std.mem.Allocator) []const ThreadRow {
+        if (model.active_project_id == chats_project_id) return &.{};
         const out = arena.alloc(ThreadRow, model.thread_count) catch return &.{};
         var count: usize = 0;
         for (model.threads[0..model.thread_count]) |*thread| {
@@ -763,11 +835,22 @@ pub const Model = struct {
         return out[0..count];
     }
 
-    pub fn activeProjectName(model: *const Model) []const u8 {
-        for (model.projects[0..model.project_count]) |*project| {
-            if (project.id == model.active_project_id) return project.name();
+    pub fn topLevelThreadRows(model: *const Model, arena: std.mem.Allocator) []const ThreadRow {
+        const out = arena.alloc(ThreadRow, model.thread_count) catch return &.{};
+        var count: usize = 0;
+        for (model.threads[0..model.thread_count]) |*thread| {
+            if (thread.project_id != chats_project_id or thread.isArchived()) continue;
+            out[count] = .{
+                .id = thread.id,
+                .title = if (thread.sending)
+                    std.fmt.allocPrint(arena, "{s} · responding", .{thread.title()}) catch thread.title()
+                else
+                    thread.title(),
+                .selected = thread.id == model.active_thread_id,
+            };
+            count += 1;
         }
-        return "Project";
+        return out[0..count];
     }
 
     pub fn activeThreadTitle(model: *const Model) []const u8 {
@@ -787,16 +870,8 @@ pub const Model = struct {
         return false;
     }
 
-    pub fn workspaceStatus(model: *const Model, arena: std.mem.Allocator) []const u8 {
-        var projects: usize = 0;
-        var threads: usize = 0;
-        for (model.projects[0..model.project_count]) |project| projects += @intFromBool(!project.isArchived());
-        for (model.threads[0..model.thread_count]) |thread| {
-            if (thread.isArchived()) continue;
-            const project = model.projectByIdConst(thread.project_id) orelse continue;
-            threads += @intFromBool(!project.isArchived());
-        }
-        return std.fmt.allocPrint(arena, "{d} projects · {d} chats", .{ projects, threads }) catch "Workspace";
+    pub fn cannotManageProject(model: *const Model) bool {
+        return model.active_project_id == chats_project_id;
     }
 
     pub fn renameValue(model: *const Model) []const u8 {
@@ -824,7 +899,7 @@ pub const Model = struct {
         const out = arena.alloc(ArchivedProjectRow, model.project_count) catch return &.{};
         var count: usize = 0;
         for (model.projects[0..model.project_count]) |*project| {
-            if (!project.isArchived()) continue;
+            if (project.id == chats_project_id or !project.isArchived()) continue;
             out[count] = .{ .id = project.id, .name = project.name(), .expiry = model.expiryLabel(arena, project.archived_at_ms) };
             count += 1;
         }
@@ -872,6 +947,9 @@ pub const Model = struct {
 
     pub fn selectedModelLabel(model: *const Model) []const u8 {
         const thread = model.activeThreadConst() orelse return "No model";
+        for (quickModels) |option| {
+            if (std.mem.eql(u8, option.slug, thread.modelName())) return option.label;
+        }
         if (thread.model_choice == .custom) return thread.modelName();
         for (modelOptions) |option| {
             if (option.choice == thread.model_choice) return option.label;
@@ -911,6 +989,16 @@ pub const Model = struct {
         const thread = model.activeThread() orelse return;
         thread.model_choice = .custom;
         thread.model_buffer.set(entry.slug());
+        model.model_picker_open = false;
+        model.markThreadDirty(thread.id);
+    }
+
+    fn selectQuickModel(model: *Model, number: u8) void {
+        if (number == 0 or number > quickModels.len) return;
+        const option = quickModels[number - 1];
+        const thread = model.activeThread() orelse return;
+        thread.model_choice = .custom;
+        thread.model_buffer.set(option.slug);
         model.model_picker_open = false;
         model.markThreadDirty(thread.id);
     }
@@ -1129,6 +1217,16 @@ pub const Model = struct {
         return id;
     }
 
+    fn ensureChatsProject(model: *Model) bool {
+        if (model.projectByIdConst(chats_project_id) != null) return true;
+        if (!model.ensureProjectCapacity(model.project_count + 1)) return false;
+        var project = Project{ .id = chats_project_id };
+        setProjectName(&project, chats_project_name);
+        model.projects[model.project_count] = project;
+        model.project_count += 1;
+        return true;
+    }
+
     fn addThread(model: *Model, project_id: u32) ?u32 {
         if (!model.ensureThreadCapacity(model.thread_count + 1)) return null;
         const id = model.next_thread_id;
@@ -1169,6 +1267,7 @@ pub const Model = struct {
         model.rename_buffer.clear();
         model.rename_kind = kind;
         if (kind == .project) {
+            if (model.active_project_id == chats_project_id) return;
             const project = model.projectByIdConst(model.active_project_id) orelse return;
             model.rename_id = project.id;
             model.rename_buffer.set(project.name());
@@ -1187,6 +1286,7 @@ pub const Model = struct {
         const value = std.mem.trim(u8, model.rename_buffer.text(), " \t\r\n");
         if (value.len == 0) return;
         if (model.rename_kind == .project) {
+            if (model.rename_id == chats_project_id) return;
             const project = model.projectById(model.rename_id) orelse return;
             setProjectName(project, value);
         } else {
@@ -1208,17 +1308,19 @@ pub const Model = struct {
         model.thread_count -= 1;
     }
 
-    fn deleteThread(model: *Model, thread_id: u32, fx: *Effects) void {
+    fn deleteThread(model: *Model, thread_id: u32, fx: *Effects) bool {
         for (model.threads[0..model.thread_count], 0..) |thread, index| {
             if (thread.id != thread_id or !thread.isArchived()) continue;
             model.removeThreadAt(index, fx);
-            return;
+            return true;
         }
+        return false;
     }
 
-    fn deleteProject(model: *Model, project_id: u32, fx: *Effects) void {
-        const project = model.projectByIdConst(project_id) orelse return;
-        if (!project.isArchived()) return;
+    fn deleteProject(model: *Model, project_id: u32, fx: *Effects) bool {
+        if (project_id == chats_project_id) return false;
+        const project = model.projectByIdConst(project_id) orelse return false;
+        if (!project.isArchived()) return false;
         var thread_index: usize = 0;
         while (thread_index < model.thread_count) {
             if (model.threads[thread_index].project_id == project_id) {
@@ -1233,8 +1335,9 @@ pub const Model = struct {
                 std.mem.copyForwards(Project, model.projects[index .. model.project_count - 1], model.projects[index + 1 .. model.project_count]);
             }
             model.project_count -= 1;
-            return;
+            return true;
         }
+        return false;
     }
 
     fn activateFirstVisible(model: *Model) bool {
@@ -1248,6 +1351,7 @@ pub const Model = struct {
     }
 
     fn normalizeLoadedWorkspace(model: *Model) bool {
+        if (!model.ensureChatsProject()) return false;
         var max_project_id: u32 = 0;
         var max_thread_id: u32 = 0;
         var max_message_id: u32 = 0;
@@ -1265,12 +1369,11 @@ pub const Model = struct {
             if (!thread.isArchived() and project != null and !project.?.isArchived()) return true;
         }
         if (model.activateFirstVisible()) return true;
-        const project_id = model.addProject() orelse return false;
-        const thread_id = model.addThread(project_id) orelse return false;
+        const thread_id = model.addThread(chats_project_id) orelse return false;
         return model.activateThread(thread_id);
     }
 
-    fn archiveThread(model: *Model, fx: *Effects) void {
+    fn archiveThread(model: *Model, fx: *Effects) bool {
         const active_id = model.active_thread_id;
         const project_id = model.active_project_id;
         var replacement_id: u32 = 0;
@@ -1282,17 +1385,19 @@ pub const Model = struct {
         }
         if (replacement_id == 0) replacement_id = model.addThread(project_id) orelse {
             model.setStatus("Delete an archived chat before archiving this one");
-            return;
+            return false;
         };
-        const thread = model.threadById(active_id) orelse return;
+        const thread = model.threadById(active_id) orelse return false;
         if (thread.sending) fx.cancel(requestKey(thread.id));
         thread.sending = false;
         thread.archived_at_ms = @max(model.clock.wallMs(), 1);
         _ = model.activateThread(replacement_id);
+        return true;
     }
 
-    fn archiveProject(model: *Model, fx: *Effects) void {
+    fn archiveProject(model: *Model, fx: *Effects) bool {
         const active_id = model.active_project_id;
+        if (active_id == chats_project_id) return false;
         var replacement_thread_id: u32 = 0;
         for (model.projects[0..model.project_count]) |project| {
             if (project.id == active_id or project.isArchived()) continue;
@@ -1307,18 +1412,19 @@ pub const Model = struct {
         if (replacement_thread_id == 0) {
             const new_project_id = model.addProject() orelse {
                 model.setStatus("Delete an archived project before archiving this one");
-                return;
+                return false;
             };
-            replacement_thread_id = model.addThread(new_project_id) orelse return;
+            replacement_thread_id = model.addThread(new_project_id) orelse return false;
         }
         for (model.threads[0..model.thread_count]) |*thread| {
             if (thread.project_id != active_id or !thread.sending) continue;
             fx.cancel(requestKey(thread.id));
             thread.sending = false;
         }
-        const project = model.projectById(active_id) orelse return;
+        const project = model.projectById(active_id) orelse return false;
         project.archived_at_ms = @max(model.clock.wallMs(), 1);
         _ = model.activateThread(replacement_thread_id);
+        return true;
     }
 
     fn restoreThread(model: *Model, thread_id: u32) void {
@@ -1332,6 +1438,7 @@ pub const Model = struct {
     }
 
     fn restoreProject(model: *Model, project_id: u32) void {
+        if (project_id == chats_project_id) return;
         const project = model.projectById(project_id) orelse return;
         if (!project.isArchived()) return;
         project.archived_at_ms = 0;
@@ -1355,7 +1462,7 @@ pub const Model = struct {
         while (project_index < model.project_count) {
             const project = model.projects[project_index];
             if (project.isArchived() and now - project.archived_at_ms >= archive_retention_ms) {
-                model.deleteProject(project.id, fx);
+                _ = model.deleteProject(project.id, fx);
             } else {
                 project_index += 1;
             }
@@ -1526,9 +1633,9 @@ pub fn initialModelWithClock(api_key: []const u8, clock: native_sdk.Clock) Model
 fn initialModelWithOptionsAndClock(api_key: []const u8, dev_mode: bool, force_onboarding: bool, clock: native_sdk.Clock) Model {
     var model = Model{ .dev_mode = dev_mode, .force_onboarding = force_onboarding, .clock = clock };
     model.setApiKey(api_key);
-    const project_id = model.addProject().?;
-    model.active_project_id = project_id;
-    model.active_thread_id = model.addThread(project_id).?;
+    std.debug.assert(model.ensureChatsProject());
+    model.active_project_id = chats_project_id;
+    model.active_thread_id = model.addThread(chats_project_id).?;
     return model;
 }
 
@@ -1537,8 +1644,16 @@ pub fn shouldShowOnboarding(dev_mode: bool, force_onboarding: bool, has_api_key:
     return !dev_mode and !has_api_key and !onboarding_complete;
 }
 
+pub fn usesPersistentCredentialStore(dev_mode: bool) bool {
+    return superchat_options.credential_store and !dev_mode;
+}
+
 pub fn onCommand(name: []const u8) ?Msg {
+    for (quick_model_commands, 1..) |command, number| {
+        if (std.mem.eql(u8, name, command)) return .{ .select_quick_model = @intCast(number) };
+    }
     if (std.mem.eql(u8, name, cmd_new_thread)) return .new_thread;
+    if (std.mem.eql(u8, name, cmd_new_project_thread)) return .new_project_thread;
     if (std.mem.eql(u8, name, cmd_new_project)) return .new_project;
     if (std.mem.eql(u8, name, cmd_previous_thread)) return .previous_thread;
     if (std.mem.eql(u8, name, cmd_next_thread)) return .next_thread;
@@ -1593,6 +1708,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.selectModel(choice);
             if (model.activeThreadConst()) |thread| model.markThreadDirty(thread.id);
         },
+        .select_quick_model => |number| model.selectQuickModel(number),
         .select_auto_model => model.selectModel(.auto),
         .select_custom_model => model.selectModel(.custom),
         .select_catalog_model => |index| model.selectCatalogModel(index),
@@ -1683,12 +1799,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.rename_buffer.clear();
         },
         .archive_thread => {
-            model.archiveThread(fx);
-            model.markStructureDirty();
+            if (model.archiveThread(fx)) {
+                model.showToast("Chat archived", fx);
+                model.markStructureDirty();
+            }
         },
         .archive_project => {
-            model.archiveProject(fx);
-            model.markStructureDirty();
+            if (model.archiveProject(fx)) {
+                model.showToast("Project archived", fx);
+                model.markStructureDirty();
+            }
         },
         .open_archive => {
             model.purgeExpired(fx);
@@ -1720,6 +1840,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.delete_confirm_open = true;
         },
         .delete_project => |project_id| {
+            if (project_id == chats_project_id) return;
             const project = model.projectByIdConst(project_id) orelse return;
             if (!project.isArchived()) return;
             model.delete_kind = .project;
@@ -1728,13 +1849,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .confirm_delete => {
             if (!model.delete_confirm_open) return;
-            if (model.delete_kind == .project)
+            const deleted = if (model.delete_kind == .project)
                 model.deleteProject(model.delete_id, fx)
             else
                 model.deleteThread(model.delete_id, fx);
             model.delete_confirm_open = false;
             model.delete_id = 0;
-            model.markStructureDirty();
+            if (deleted) {
+                model.showToast(if (model.delete_kind == .project) "Project deleted permanently" else "Chat deleted permanently", fx);
+                model.markStructureDirty();
+            }
         },
         .cancel_delete => {
             model.delete_confirm_open = false;
@@ -1747,6 +1871,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.markStructureDirty();
         },
         .new_thread => {
+            const thread_id = model.addThread(chats_project_id) orelse return;
+            _ = model.activateThread(thread_id);
+            model.markStructureDirty();
+        },
+        .new_project_thread => {
+            if (model.active_project_id == chats_project_id) return;
             const thread_id = model.addThread(model.active_project_id) orelse return;
             _ = model.activateThread(thread_id);
             model.markStructureDirty();
@@ -1859,6 +1989,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .persist_draft => |timer| {
             const thread_id = draftSaveThreadId(timer.key) orelse return;
             if (model.threadByIdConst(thread_id) != null) model.markThreadDirty(thread_id);
+        },
+        .dismiss_toast => |timer| {
+            if (timer.key == toast_timer_key) model.toast_len = 0;
         },
         .response => |response| {
             if (response.key == key_validation_request) {
@@ -2251,17 +2384,24 @@ const SecureChatApp = struct {
         const self: *SecureChatApp = @ptrCast(@alignCast(context));
         if (!self.credential_loaded) {
             self.credential_loaded = true;
-            // An explicit launch-time environment key wins for developer
-            // workflows; otherwise restore from the OS credential store.
-            if (self.chat.model.api_key_len == 0) {
-                var buffer: [max_api_key_bytes]u8 = undefined;
-                if (runtime.getCredential(.{ .service = credential_service, .account = credential_account }, &buffer) catch null) |secret| {
-                    self.chat.model.setApiKey(secret);
+            if (!usesPersistentCredentialStore(self.chat.model.dev_mode)) {
+                // Debug/ad-hoc binaries change signing identity frequently.
+                // Keep their keys in memory so they never trigger Keychain's
+                // access prompt for the production credential item.
+                self.chat.model.onboarding_open = shouldShowOnboarding(true, self.chat.model.force_onboarding, self.chat.model.api_key_len > 0, false);
+            } else {
+                // An explicit launch-time environment key wins; otherwise
+                // restore the release credential from macOS Keychain.
+                if (self.chat.model.api_key_len == 0) {
+                    var buffer: [max_api_key_bytes]u8 = undefined;
+                    if (runtime.getCredential(.{ .service = credential_service, .account = credential_account }, &buffer) catch null) |secret| {
+                        self.chat.model.setApiKey(secret);
+                    }
                 }
+                var onboarding_buffer: [8]u8 = undefined;
+                const onboarding_complete = (runtime.getCredential(.{ .service = credential_service, .account = onboarding_account }, &onboarding_buffer) catch null) != null;
+                self.chat.model.onboarding_open = shouldShowOnboarding(false, self.chat.model.force_onboarding, self.chat.model.api_key_len > 0, onboarding_complete);
             }
-            var onboarding_buffer: [8]u8 = undefined;
-            const onboarding_complete = (runtime.getCredential(.{ .service = credential_service, .account = onboarding_account }, &onboarding_buffer) catch null) != null;
-            self.chat.model.onboarding_open = shouldShowOnboarding(self.chat.model.dev_mode, self.chat.model.force_onboarding, self.chat.model.api_key_len > 0, onboarding_complete);
         }
 
         try self.inner.event(runtime, value);
@@ -2313,7 +2453,12 @@ const SecureChatApp = struct {
         }
         const action = self.chat.model.credential_action;
         self.chat.model.credential_action = .none;
-        switch (action) {
+        if (!usesPersistentCredentialStore(self.chat.model.dev_mode)) {
+            if (action == .save) {
+                self.chat.model.setStatus("Key is active for this development session");
+                if (self.chat.installed) try self.chat.rebuild(runtime, self.chat.canvas_window_id);
+            }
+        } else switch (action) {
             .none => {},
             .save => {
                 var key_saved = true;
@@ -2452,7 +2597,7 @@ const SecureChatApp = struct {
 pub fn main(init: std.process.Init) !void {
     const api_key = init.environ_map.get("OPENROUTER_API_KEY") orelse "";
     const dev_mode_value = init.environ_map.get("SUPERCHAT_DEV_MODE") orelse "";
-    const dev_mode = std.mem.eql(u8, dev_mode_value, "1") or std.ascii.eqlIgnoreCase(dev_mode_value, "true");
+    const dev_mode = builtin.mode == .Debug or std.mem.eql(u8, dev_mode_value, "1") or std.ascii.eqlIgnoreCase(dev_mode_value, "true");
     const force_onboarding_value = init.environ_map.get("SUPERCHAT_FORCE_ONBOARDING") orelse "";
     const force_onboarding = std.mem.eql(u8, force_onboarding_value, "1") or std.ascii.eqlIgnoreCase(force_onboarding_value, "true");
 

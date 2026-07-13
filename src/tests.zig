@@ -248,6 +248,21 @@ test "model picker searches OpenRouter catalog and keeps favorites" {
     try testing.expectEqualStrings("anthropic/claude-test", activeThread(&model).modelName());
 }
 
+test "quick model slots map Command 1 through 9 to current OpenRouter slugs" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+
+    for (main.quick_model_commands, main.Model.quickModels) |command, option| {
+        model.model_picker_open = true;
+        const message = main.onCommand(command) orelse return error.TestExpectedShortcut;
+        main.update(&model, message, &fx);
+        try testing.expectEqualStrings(option.slug, activeThread(&model).modelName());
+        try testing.expectEqualStrings(option.label, model.selectedModelLabel());
+        try testing.expect(!model.model_picker_open);
+    }
+}
+
 test "workspace grows past prototype project and chat limits" {
     var model = main.initialModel("test-key");
     var fx = main.Effects.init(testing.allocator);
@@ -308,8 +323,44 @@ test "projects and threads preserve independent conversations" {
     try testing.expectEqual(first_thread, model.active_thread_id);
     var rows_arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer rows_arena.deinit();
-    const rows = model.threadRows(rows_arena.allocator());
+    const rows = model.topLevelThreadRows(rows_arena.allocator());
     try testing.expectEqual(@as(usize, 2), rows.len);
+}
+
+test "top-level and project chats have distinct creation paths" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+
+    try testing.expectEqual(main.chats_project_id, model.active_project_id);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expectEqual(@as(usize, 1), model.topLevelThreadRows(arena_state.allocator()).len);
+    try testing.expectEqual(@as(usize, 0), model.projectRows(arena_state.allocator()).len);
+
+    main.update(&model, .new_project, &fx);
+    const project_id = model.active_project_id;
+    const first_project_thread = model.active_thread_id;
+    try testing.expect(project_id != main.chats_project_id);
+
+    main.update(&model, .new_project_thread, &fx);
+    const second_project_thread = model.active_thread_id;
+    try testing.expect(second_project_thread != first_project_thread);
+    try testing.expectEqual(project_id, activeThread(&model).project_id);
+    _ = arena_state.reset(.retain_capacity);
+    try testing.expectEqual(@as(usize, 2), model.threadRows(arena_state.allocator()).len);
+
+    main.update(&model, .new_thread, &fx);
+    try testing.expectEqual(main.chats_project_id, model.active_project_id);
+    try testing.expectEqual(main.chats_project_id, activeThread(&model).project_id);
+    _ = arena_state.reset(.retain_capacity);
+    try testing.expectEqual(@as(usize, 2), model.topLevelThreadRows(arena_state.allocator()).len);
+    try testing.expectEqual(@as(usize, 1), model.projectRows(arena_state.allocator()).len);
+
+    main.update(&model, .open_rename_project, &fx);
+    try testing.expect(!model.rename_open);
+    main.update(&model, .archive_project, &fx);
+    try testing.expectEqual(main.chats_project_id, model.active_project_id);
 }
 
 test "projects and chats can be renamed without changing their identity" {
@@ -318,6 +369,7 @@ test "projects and chats can be renamed without changing their identity" {
     defer fx.deinit();
     fx.executor = .fake;
 
+    main.update(&model, .new_project, &fx);
     const project_id = model.active_project_id;
     const thread_id = model.active_thread_id;
     main.update(&model, .open_rename_project, &fx);
@@ -351,11 +403,17 @@ test "archived chats leave the workspace and can be restored" {
     main.update(&model, .archive_thread, &fx);
 
     try testing.expect(threadWithId(&model, archived_id).isArchived());
+    try testing.expect(model.toastVisible());
+    try testing.expectEqualStrings("Chat archived", model.toastText());
+    const toast_timer = fx.pendingTimerAt(0) orelse return error.TestExpectedTimer;
+    try testing.expectEqual(@as(u64, 2200), toast_timer.interval_ms);
+    main.update(&model, .{ .dismiss_toast = .{ .key = toast_timer.key } }, &fx);
+    try testing.expect(!model.toastVisible());
     try testing.expect(!threadWithId(&model, archived_id).sending);
     try testing.expect(model.active_thread_id != archived_id);
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    try testing.expectEqual(@as(usize, 1), model.threadRows(arena_state.allocator()).len);
+    try testing.expectEqual(@as(usize, 1), model.topLevelThreadRows(arena_state.allocator()).len);
     const archived = model.archivedThreadRows(arena_state.allocator());
     try testing.expectEqual(@as(usize, 1), archived.len);
     try testing.expectEqualStrings("Deletes in 30 days", archived[0].expiry);
@@ -384,6 +442,7 @@ test "archived projects cascade their chats and permanent delete requires confir
     const child_thread_id = model.active_thread_id;
     main.update(&model, .archive_project, &fx);
     try testing.expect(projectWithId(&model, archived_project_id).isArchived());
+    try testing.expectEqualStrings("Project archived", model.toastText());
     try testing.expect(model.active_project_id != archived_project_id);
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -402,6 +461,7 @@ test "archived projects cascade their chats and permanent delete requires confir
     try testing.expect(projectWithId(&model, archived_project_id).isArchived());
     main.update(&model, .confirm_delete, &fx);
     try testing.expect(!model.delete_confirm_open);
+    try testing.expectEqualStrings("Project deleted permanently", model.toastText());
     for (model.projects[0..model.project_count]) |project| try testing.expect(project.id != archived_project_id);
     for (model.threads[0..model.thread_count]) |thread| try testing.expect(thread.id != child_thread_id);
 }
@@ -440,6 +500,7 @@ test "SQLite restores the workspace after reopening and purges expired archives"
     defer fx.deinit();
     fx.executor = .fake;
 
+    main.update(model, .new_project, &fx);
     const persisted_project_id = model.active_project_id;
     const persisted_thread_id = model.active_thread_id;
     try testing.expect(model.appendMessage(.user, "Persist this conversation"));
@@ -454,6 +515,7 @@ test "SQLite restores the workspace after reopening and purges expired archives"
     const archived_project_id = model.active_project_id;
     main.update(model, .archive_project, &fx);
     const archived_at = projectWithId(model, archived_project_id).archived_at_ms;
+    main.update(model, .{ .select_project = persisted_project_id }, &fx);
 
     {
         var database = try main.workspace_storage.Database.open(path);
@@ -778,6 +840,7 @@ test "the global shortcut map reaches creation navigation focus and settings" {
 
     const commands = [_][]const u8{
         main.cmd_new_thread,
+        main.cmd_new_project_thread,
         main.cmd_new_project,
         main.cmd_previous_thread,
         main.cmd_next_thread,
@@ -812,6 +875,10 @@ test "the global shortcut map reaches creation navigation focus and settings" {
     main.update(&model, main.onCommand(main.cmd_new_project).?, &fx);
     const second_project = model.active_project_id;
     try testing.expect(second_project != first_project);
+    const first_project_thread = model.active_thread_id;
+    main.update(&model, main.onCommand(main.cmd_new_project_thread).?, &fx);
+    try testing.expect(model.active_thread_id != first_project_thread);
+    try testing.expectEqual(second_project, activeThread(&model).project_id);
     main.update(&model, main.onCommand(main.cmd_previous_project).?, &fx);
     try testing.expectEqual(first_project, model.active_project_id);
     main.update(&model, main.onCommand(main.cmd_next_project).?, &fx);
@@ -834,6 +901,8 @@ test "first-run onboarding is bypassed by credentials completion or dev mode" {
     try testing.expect(!main.shouldShowOnboarding(false, false, false, true));
     try testing.expect(!main.shouldShowOnboarding(true, false, false, false));
     try testing.expect(main.shouldShowOnboarding(true, true, true, true));
+    try testing.expect(!main.usesPersistentCredentialStore(true));
+    try testing.expect(!main.usesPersistentCredentialStore(false));
 
     const dev_model = main.initialModelWithMode("", true);
     try testing.expect(dev_model.dev_mode);

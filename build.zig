@@ -13,6 +13,10 @@ const native_sdk = @import("native_sdk");
 
 pub fn build(b: *std.Build) void {
     const artifacts = native_sdk.addAppArtifacts(b, b.dependency("native_sdk", .{}), .{ .name = "superchat" });
+    const app_options = b.addOptions();
+    app_options.addOption(bool, "credential_store", b.option(bool, "credential-store", "Persist credentials in the OS keychain (signed releases only)") orelse false);
+    artifacts.exe.root_module.addOptions("superchat_options", app_options);
+    artifacts.tests.root_module.addOptions("superchat_options", app_options);
     if (b.sysroot) |sysroot| {
         const include_path: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include" }) };
         const library_path: std.Build.LazyPath = .{ .cwd_relative = "/usr/lib" };

@@ -14,13 +14,16 @@ rm -rf "$OUTPUT" "$ROOT/zig-out/package"
 rm -f "$ROOT"/zig-out/*.dmg
 mkdir -p "$STAGE" "$OUTPUT"
 
-npx native build --yes -Doptimize=ReleaseFast -Dtarget=aarch64-macos
+SIGNING="${SUPERCHAT_SIGNING:-adhoc}"
+CREDENTIAL_STORE=false
+if [[ "$SIGNING" == "identity" ]]; then CREDENTIAL_STORE=true; fi
+
+npx native build --yes -Doptimize=ReleaseFast -Dtarget=aarch64-macos -Dcredential-store="$CREDENTIAL_STORE"
 cp "$ROOT/zig-out/bin/superchat" "$STAGE/superchat-arm64"
-npx native build --yes -Doptimize=ReleaseFast -Dtarget=x86_64-macos
+npx native build --yes -Doptimize=ReleaseFast -Dtarget=x86_64-macos -Dcredential-store="$CREDENTIAL_STORE"
 cp "$ROOT/zig-out/bin/superchat" "$STAGE/superchat-x86_64"
 lipo -create "$STAGE/superchat-arm64" "$STAGE/superchat-x86_64" -output "$STAGE/superchat"
 
-SIGNING="${SUPERCHAT_SIGNING:-adhoc}"
 ARGS=(--target macos --output "$APP" --binary "$STAGE/superchat" --signing "$SIGNING")
 if [[ "$SIGNING" == "identity" ]]; then
   : "${SUPERCHAT_SIGNING_IDENTITY:?Set SUPERCHAT_SIGNING_IDENTITY for identity signing}"

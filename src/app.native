@@ -1,12 +1,11 @@
-<!-- Projects orient; threads act; the conversation remains the dominant plane. -->
+<!-- Chats are immediate; projects stay optional; the conversation remains the dominant plane. -->
 <stack>
   <column background="background">
-    <row height="{header_height}" padding="12" gap="10" cross="center" background="surface" window-drag="true" label="Superchat toolbar">
+    <row height="{header_height}" padding="12" gap="10" cross="center" background="surface" label="Superchat toolbar">
       <spacer width="{chrome_leading}" />
       <text size="heading">{brandLabel}</text>
       <spacer grow="1" />
       <select size="sm" width="210" on-press="toggle_model_picker" label="Model selector">{selectedModelLabel}</select>
-      <button size="sm" variant="ghost" icon="settings" on-press="open_settings" label="Open settings"></button>
       <button size="sm" variant="ghost" icon="trash" on-press="clear" disabled="{cannotClear}" label="Clear current chat"></button>
       <spacer width="{chrome_trailing}" />
     </row>
@@ -15,33 +14,32 @@
     <row grow="1">
       <column width="226" background="surface">
         <row padding="10" gap="8" cross="center">
-          <text foreground="text_muted" grow="1">Projects</text>
+          <text foreground="text_muted" grow="1">Chats</text>
           <button size="sm" variant="ghost" icon="archive" on-press="open_archive" label="Open archive"></button>
-          <button size="sm" variant="ghost" icon="plus" on-press="new_project" disabled="{cannotAddProject}" label="New project"></button>
+          <button size="sm" variant="ghost" icon="plus" on-press="new_thread" disabled="{cannotAddThread}" label="New top-level chat"></button>
         </row>
-        <column padding="6" gap="2">
-          <for each="projectRows" key="id" as="p">
-            <list-item on-press="select_project:{p.id}" selected="{p.id == active_project_id}" label="{p.name}">{p.name}</list-item>
-          </for>
-        </column>
-        <separator />
-        <row padding="10" gap="8" cross="center">
-          <text foreground="text_muted" grow="1">{activeProjectName}</text>
-          <button size="sm" variant="ghost" icon="edit" on-press="open_rename_project" label="Rename project"></button>
-          <button size="sm" variant="ghost" icon="archive" on-press="archive_project" label="Archive project"></button>
-          <button size="sm" variant="ghost" icon="plus" on-press="new_thread" disabled="{cannotAddThread}" label="New chat"></button>
-        </row>
-        <scroll grow="1" label="Chats in project">
+        <scroll grow="1" label="Chats and projects">
           <column padding="6" gap="2">
+            <for each="topLevelThreadRows" key="id" as="t">
+              <list-item on-press="select_thread:{t.id}" selected="{t.selected}" label="{t.title}">{t.title}</list-item>
+            </for>
+            <separator />
+            <row padding="4" gap="8" cross="center">
+              <text foreground="text_muted" grow="1">Projects</text>
+              <button size="sm" variant="ghost" icon="edit" on-press="open_rename_project" disabled="{cannotManageProject}" label="Rename selected project"></button>
+              <button size="sm" variant="ghost" icon="archive" on-press="archive_project" disabled="{cannotManageProject}" label="Archive selected project"></button>
+              <button size="sm" variant="ghost" icon="plus" on-press="new_project_thread" disabled="{cannotManageProject}" label="New chat in selected project"></button>
+              <button size="sm" variant="ghost" icon="plus" on-press="new_project" disabled="{cannotAddProject}" label="New project"></button>
+            </row>
+            <for each="projectRows" key="id" as="p">
+              <list-item on-press="select_project:{p.id}" selected="{p.id == active_project_id}" label="{p.name}">{p.name}</list-item>
+            </for>
             <for each="threadRows" key="id" as="t">
               <list-item on-press="select_thread:{t.id}" selected="{t.selected}" label="{t.title}">{t.title}</list-item>
             </for>
           </column>
         </scroll>
-        <separator />
-        <row padding="10">
-          <text size="sm" foreground="text_muted">{workspaceStatus}</text>
-        </row>
+        <button size="sm" variant="ghost" on-press="open_settings" label="View keyboard shortcuts">Keyboard shortcuts</button>
       </column>
       <separator />
 
@@ -124,7 +122,12 @@
       <column main="center" cross="center">
         <dialog width="620" height="520" label="Choose an OpenRouter model">
           <column padding="20" gap="10">
-            <row cross="center"><text size="heading" grow="1">Choose a model</text><text foreground="text_muted">Cmd + K</text></row>
+            <text size="heading">Choose a model</text>
+            <grid columns="3" gap="6">
+              <for each="quickModels" as="q">
+                <button variant="outline" on-press="select_quick_model:{q.number}" label="{q.slug}">{q.number} · {q.label}</button>
+              </for>
+            </grid>
             <text-field text="{modelSearch}" on-input="model_search_edit" placeholder="Search models or providers…" autofocus="true" label="Search OpenRouter models" />
             <text size="sm" foreground="text_muted">{modelCatalogStatus}</text>
             <if test="{modelCatalogLoading}"><row gap="8"><spinner size="sm" /><text>Searching</text></row></if>
@@ -154,10 +157,7 @@
       <column main="center" cross="center">
         <dialog width="560" height="500" label="Settings">
           <column padding="20" gap="10">
-            <row cross="center">
-              <text size="heading" grow="1">Settings</text>
-              <text foreground="text_muted">Cmd + ,</text>
-            </row>
+            <text size="heading">Settings</text>
             <text>OpenRouter API key</text>
             <text-field text="{apiKeyField}" on-input="api_key_edit" placeholder="{apiKeyPlaceholder}" autofocus="true" label="OpenRouter API key" />
             <text size="sm" foreground="text_muted">{statusLine}</text>
@@ -196,9 +196,11 @@
             <text wrap="true" foreground="text_muted">{forkSourcePreview}</text>
             <textarea text="{forkSeed}" on-input="fork_seed_edit" on-submit="create_forks" height="84" placeholder="Optional follow-up for every selected model…" label="Fork follow-up message" />
             <text size="heading">Models</text>
-            <for each="forkModelRows" as="m">
-              <checkbox checked="{m.selected}" on-toggle="toggle_fork_model:{m.choice}" text="{m.label}" label="{m.label}" />
-            </for>
+            <grid columns="3" gap="8">
+              <for each="forkModelRows" as="m">
+                <checkbox checked="{m.selected}" on-toggle="toggle_fork_model:{m.choice}" text="{m.label}" label="{m.label}" />
+              </for>
+            </grid>
             <if test="{missingKey}">
               <text size="sm" foreground="text_muted">Without an API key, the follow-up remains a draft.</text>
             </if>
@@ -288,5 +290,11 @@
         </dialog>
       </column>
     </panel>
+  </if>
+
+  <if test="{toastVisible}">
+    <column main="end" cross="center" padding="24">
+      <badge variant="secondary">{toastText}</badge>
+    </column>
   </if>
 </stack>

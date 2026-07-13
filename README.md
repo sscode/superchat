@@ -8,7 +8,7 @@ Superchat keeps projects, conversations, drafts, and model choices on your Mac w
 
 ## What you can do
 
-- Organize conversations into projects.
+- Start chats immediately or organize related conversations into optional projects.
 - Search OpenRouter's live model catalog, favorite useful results, or enter a model slug directly.
 - Stream several responses at once and move between chats while they finish.
 - Fork an assistant response into one or several new chats, each with a different model.
@@ -49,11 +49,13 @@ npm run dev:onboarding
 
 Open **Settings** with `⌘,`, choose **Add API key**, and paste your OpenRouter key. Superchat validates it and stores it in macOS Keychain—not in the chat database or source tree.
 
+Debug and locally packaged ad-hoc builds deliberately keep API keys in memory for the current session instead of reading or writing Keychain. This prevents rebuilt binaries from repeatedly asking for access to the release app's credential. Set `OPENROUTER_API_KEY` when launching a development build if you do not want to paste it again. Keychain persistence is enabled only in consistently Developer-ID-signed release builds.
+
 Choose a model with `⌘K`, write a message, and press `⌘↩` to send.
 
 ## A typical workflow
 
-1. Create a project with `⌘⇧N` and a chat with `⌘N`.
+1. Create a top-level chat with `⌘N`. Projects are optional: create one with `⌘⇧N`, then add chats to it with `⌘⌥N`.
 2. Open the model picker with `⌘K`. Search OpenRouter's catalog, choose Auto, or enter a model slug.
 3. Send a message with `⌘↩`.
 4. Move to another chat while the answer streams; the original request continues in the background.
@@ -65,13 +67,15 @@ Superchat is designed to be usable without reaching for the mouse. The same refe
 
 | Action | Shortcut |
 | --- | --- |
-| New chat | `⌘N` |
+| New top-level chat | `⌘N` |
+| New chat in selected project | `⌘⌥N` |
 | New project | `⌘⇧N` |
 | Previous / next chat | `⌘[` / `⌘]` |
 | Previous / next project | `⌘⌥↑` / `⌘⌥↓` |
 | Focus composer | `⌘L` |
 | Send message | `⌘↩` |
 | Choose model | `⌘K` |
+| Quick models 1–9 | `⌘1` through `⌘9` |
 | Fork latest response | `⌘⇧F` |
 | Copy latest response | `⌘⇧C` |
 | Rename chat | `⌘⇧R` |
