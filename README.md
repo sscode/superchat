@@ -204,7 +204,7 @@ The intentionally small first version has a few boundaries worth knowing:
 - Projects and chats grow dynamically instead of stopping at prototype-era 8/24 limits. Individual responses have a 64 KiB safety ceiling.
 - A message accepts up to four attachments totaling 640 KB: PNG, JPEG, WebP, GIF, PDF, UTF-8 text, Markdown, JSON, CSV, and common source-code formats. OpenRouter receives images, PDFs, and text files; Codex receives images plus bounded text-file content; the development-only Claude adapter currently accepts text files. Saved draft attachment metadata survives a restart, but the file must be removed and reattached before sending so Superchat never re-reads a local file without a fresh user action.
 - Tagged GitHub releases build a clean universal app, sign it with Developer ID, submit it for Apple notarization, staple the result, and publish the `.dmg` to GitHub Releases.
-- Superchat checks GitHub's latest-release endpoint at launch and from Settings. When a newer semantic version is available, it opens only the repository's allow-listed GitHub release page in the system browser; no update server or Cloudflare service is required.
+- Superchat checks GitHub's latest-release endpoint at launch and from Settings. When a newer semantic version is available, a compact update control appears beside the Superchat wordmark and opens only the repository's allow-listed GitHub release page in the system browser; no update server or Cloudflare service is required.
 
 Before enabling the release workflow, configure the repository secrets documented below.
 
@@ -216,7 +216,7 @@ The release workflow runs for tags matching `v*`. Add these GitHub Actions secre
 - `MACOS_CERTIFICATE_PASSWORD` and `MACOS_SIGNING_IDENTITY`.
 - `APPLE_ID`, `APPLE_APP_PASSWORD`, and `APPLE_TEAM_ID` for notarization.
 
-Then update the version in `app.zon`, `package.json`, and `build.zig`, create a tag such as `v0.2.0`, and push it. GitHub hosts the resulting release and DMG; no Cloudflare service is required.
+Then update the version in `app.zon`, `package.json`, `package-lock.json`, `build.zig`, and the MCP client metadata in `src/mcp.zig`; create a matching tag such as `v0.2.0`, and push it. GitHub hosts the resulting release and DMG; no Cloudflare service is required.
 
 ## Why Native SDK?
 

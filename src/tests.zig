@@ -1136,6 +1136,7 @@ test "GitHub release responses expose a newer version in Settings" {
         .body = "{\"tag_name\":\"v0.2.0\",\"html_url\":\"https://github.com/sscode/superchat/releases/tag/v0.2.0\"}",
     } }, &fx);
     try testing.expectEqual(main.UpdateState.available, model.update_state);
+    try testing.expect(model.updateAvailable());
     try testing.expectEqualStrings("https://github.com/sscode/superchat/releases/tag/v0.2.0", model.update_url_storage[0..model.update_url_len]);
     main.update(&model, .{ .response = .{
         .key = (1 << 61) + 6,
@@ -1143,6 +1144,8 @@ test "GitHub release responses expose a newer version in Settings" {
         .body = "{\"tag_name\":\"latest\",\"html_url\":\"https://github.com/sscode/superchat/releases/latest\"}",
     } }, &fx);
     try testing.expectEqual(main.UpdateState.failed, model.update_state);
+    try testing.expect(!model.updateAvailable());
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, ">Update available</button>") != null);
 }
 
 test "background responses return to their owning thread while navigation stays live" {

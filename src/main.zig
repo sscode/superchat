@@ -1416,8 +1416,12 @@ pub const Model = struct {
         return "Version " ++ superchat_options.version;
     }
 
+    pub fn updateAvailable(model: *const Model) bool {
+        return model.update_state == .available and model.update_url_len > 0;
+    }
+
     pub fn updateButtonText(model: *const Model) []const u8 {
-        return if (model.update_state == .available) "View available update" else "Check for updates";
+        return if (model.updateAvailable()) "View available update" else "Check for updates";
     }
 
     pub fn updateButtonDisabled(model: *const Model) bool {
@@ -3778,7 +3782,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .check_updates => checkUpdates(model, fx),
         .open_update => {
-            if (model.update_state == .available and model.update_url_len > 0) model.open_update_requested = true else checkUpdates(model, fx);
+            if (model.updateAvailable()) model.open_update_requested = true else checkUpdates(model, fx);
         },
         .response => |response| {
             if (response.key == key_validation_request) {

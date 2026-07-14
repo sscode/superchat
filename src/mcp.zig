@@ -224,7 +224,7 @@ pub fn runHelper(io: std.Io, allocator: std.mem.Allocator, mode: HelperMode, inp
     const stdout_file = child.stdout orelse return error.MissingPipe;
     var reader = LineReader{};
 
-    try stdin_file.writeStreamingAll(io, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"" ++ protocol_version ++ "\",\"capabilities\":{},\"clientInfo\":{\"name\":\"Superchat\",\"version\":\"0.1.0\"}}}\n");
+    try stdin_file.writeStreamingAll(io, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"" ++ protocol_version ++ "\",\"capabilities\":{},\"clientInfo\":{\"name\":\"Superchat\",\"version\":\"0.1.1\"}}}\n");
     const initialize_response = try reader.readResponse(io, stdout_file, 1);
     var initialized = try std.json.parseFromSlice(InitializeEnvelope, allocator, initialize_response, .{ .ignore_unknown_fields = true });
     defer initialized.deinit();

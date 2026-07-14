@@ -3,6 +3,9 @@
   <column background="background">
     <row height="{header_height}" padding="12" gap="12" cross="center" background="surface" label="Superchat toolbar">
       <text><span scale="1.15" weight="bold">{brandLabel}</span></text>
+      <if test="{updateAvailable}">
+        <button size="sm" variant="outline" icon="download" on-press="open_update" label="A Superchat update is available">Update available</button>
+      </if>
       <spacer grow="1" />
       <if test="{hasThreadCost}">
         <badge size="sm" variant="outline">{threadCostLabel}</badge>

@@ -2,7 +2,7 @@
   "name": "superchat",
   "private": true,
   "license": "MIT",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "scripts": {
     "postinstall": "node scripts/patch-native-sdk.mjs",
     "dev": "SUPERCHAT_DEV_MODE=1 native dev",
