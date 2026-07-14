@@ -53,7 +53,7 @@
         .{ .id = "workspace.model-8", .key = "8", .modifiers = .{ "primary", "shift" } },
         .{ .id = "workspace.model-9", .key = "9", .modifiers = .{ "primary", "shift" } },
         .{ .id = "workspace.model-codex-subscription", .key = "1", .modifiers = .{ "primary", "option", "shift" } },
-        .{ .id = "workspace.settings", .key = ",", .modifiers = .{"primary"} },
+        .{ .id = "workspace.shortcuts", .key = ",", .modifiers = .{"primary"} },
         .{ .id = "workspace.fork-latest", .key = "f", .modifiers = .{ "primary", "shift" } },
         .{ .id = "workspace.copy-latest", .key = "c", .modifiers = .{ "primary", "shift" } },
         .{ .id = "workspace.rename-thread", .key = "r", .modifiers = .{ "primary", "shift" } },

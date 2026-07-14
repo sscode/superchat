@@ -1440,6 +1440,10 @@ test "the global shortcut map reaches creation navigation focus and settings" {
     try testing.expect(model.settings_open);
     main.update(&model, main.onCommand(main.cmd_close_overlay).?, &fx);
     try testing.expect(!model.settings_open and !model.model_picker_open);
+    main.update(&model, main.onCommand(main.cmd_shortcuts).?, &fx);
+    try testing.expect(model.shortcuts_open and !model.settings_open);
+    main.update(&model, .close_shortcuts, &fx);
+    try testing.expect(!model.shortcuts_open);
 }
 
 test "MCP servers persist and discovered tools become keyboard-editable composer commands" {
@@ -1634,7 +1638,7 @@ test "OpenRouter usage and timing are attached to the assistant response" {
     try testing.expectEqual(@as(u64, 1250), activeThread(&model).total_cost_micros);
     const connection_label = model.headerConnectionLabel(testing.allocator);
     defer testing.allocator.free(connection_label);
-    try testing.expectEqualStrings("Connected · openai/measured", connection_label);
+    try testing.expectEqualStrings("Last response · openai/measured", connection_label);
     const cost_label = model.threadCostLabel(testing.allocator);
     defer testing.allocator.free(cost_label);
     try testing.expectEqualStrings("Thread · $0.001250", cost_label);
@@ -1655,7 +1659,8 @@ test "modal layouts fit the 560 point minimum window and long content scrolls" {
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"520\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Archived items\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Command palette\"") != null);
-    try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Settings and keyboard shortcuts\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Settings\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"All keyboard shortcuts\"") != null);
 }
 
 test "first-run onboarding is bypassed by credentials completion or dev mode" {

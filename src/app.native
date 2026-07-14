@@ -4,21 +4,26 @@
     <row height="{header_height}" padding="12" gap="12" cross="center" background="surface" label="Superchat toolbar">
       <text><span scale="1.15" weight="bold">{brandLabel}</span></text>
       <spacer grow="1" />
-      <text size="sm" foreground="text_muted">{headerConnectionLabel}</text>
       <if test="{hasThreadCost}">
         <badge size="sm" variant="outline">{threadCostLabel}</badge>
       </if>
-      <select size="sm" width="224" on-press="toggle_model_picker" label="Model selector">{selectedModelLabel}</select>
+      <column gap="2" cross="end">
+        <row gap="8" cross="center">
+          <text size="sm" foreground="text_muted">Next response</text>
+          <select size="sm" width="224" on-press="toggle_model_picker" label="Model for the next response">{selectedModelLabel}</select>
+        </row>
+        <text size="sm" foreground="text_muted">{headerConnectionLabel}</text>
+      </column>
     </row>
     <row grow="1">
-      <column width="252" background="surface">
-        <row padding="12" gap="6" cross="center">
+      <column width="268" background="surface">
+        <row padding="16" gap="6" cross="center">
           <text size="sm" foreground="text_muted" grow="1"><span weight="bold">CHATS</span></text>
           <button size="sm" variant="ghost" icon="archive" on-press="open_archive" label="Open archive"></button>
           <button size="sm" variant="ghost" icon="plus" on-press="new_thread" disabled="{cannotAddThread}" label="New top-level chat"></button>
         </row>
         <scroll grow="1" label="Chats and projects">
-          <column padding="8" gap="4">
+          <column padding="12" gap="6">
             <for each="topLevelThreadRows" key="id" as="t">
               <list-item on-press="select_thread:{t.id}" selected="{t.selected}" label="{t.title}">{t.title}</list-item>
             </for>
@@ -31,11 +36,25 @@
               <button size="sm" variant="ghost" icon="folder" on-press="new_project" disabled="{cannotAddProject}" label="New project"></button>
             </row>
             <for each="projectSidebarRows" key="key" as="r">
-              <list-item on-press="select_sidebar_row:{r.key}" selected="{r.selected}" label="{r.title}">{r.prefix} {r.title}</list-item>
+              <if test="{r.is_project}">
+                <if test="{r.selected}">
+                  <button size="sm" grow="1" variant="secondary" icon="folder-open" on-press="select_sidebar_row:{r.key}" label="Selected project {r.title}">{r.title}</button>
+                </if>
+                <else>
+                  <button size="sm" grow="1" variant="ghost" icon="folder" on-press="select_sidebar_row:{r.key}" label="Project {r.title}">{r.title}</button>
+                </else>
+              </if>
+              <else>
+                <list-item on-press="select_sidebar_row:{r.key}" selected="{r.selected}" label="Chat {r.title}">{r.prefix} {r.title}</list-item>
+              </else>
             </for>
           </column>
         </scroll>
-        <button size="sm" variant="ghost" icon="settings" on-press="open_settings" label="View keyboard shortcuts, Command comma">Shortcuts · Cmd + ,</button>
+        <separator />
+        <column padding="12" gap="8" background="background">
+          <button size="sm" variant="outline" icon="terminal" on-press="open_shortcuts" label="Open keyboard shortcuts, Command comma">Keyboard shortcuts · Cmd + ,</button>
+          <button size="sm" variant="ghost" icon="settings" on-press="open_settings">Settings</button>
+        </column>
       </column>
       <separator />
 
@@ -54,8 +73,9 @@
             <for each="messageRows" key="id" as="m">
               <if test="{m.isUser}">
                 <row main="end">
-                  <column gap="2" cross="end">
-                    <bubble variant="primary" label="You said"><text wrap="true">{m.content}  {m.attachmentSummary}</text></bubble>
+                  <column gap="4" cross="end" label="You said">
+                    <text size="sm" foreground="text_muted">You</text>
+                    <text wrap="true">{m.content}  {m.attachmentSummary}</text>
                     <button size="sm" variant="ghost" foreground="text_muted" on-press="edit_message:{m.id}">Edit</button>
                   </column>
                 </row>
@@ -76,7 +96,10 @@
               </else>
             </for>
             <if test="{sending}">
-              <badge size="sm" variant="outline">Thinking…</badge>
+              <row gap="8" cross="center" label="Assistant is thinking">
+                <spinner size="sm" />
+                <text size="sm" foreground="text_muted">Thinking…</text>
+              </row>
             </if>
           </column>
         </scroll>
@@ -175,7 +198,7 @@
         <dialog width="680" height="520" label="Settings">
           <column padding="24" gap="12">
             <text size="heading">Settings</text>
-            <scroll grow="1" label="Settings and keyboard shortcuts">
+            <scroll grow="1" label="Settings">
               <column gap="12">
                 <text><span weight="bold">Model connections</span></text>
                 <text size="sm" foreground="text_muted" wrap="true">Connect a subscription or use OpenRouter for access to its full model catalog.</text>
@@ -224,21 +247,44 @@
                 <separator />
                 <text><span weight="bold">Updates</span></text>
                 <button size="sm" variant="outline" icon="refresh-cw" on-press="open_update" disabled="{updateButtonDisabled}">{updateStatus} · {updateButtonText}</button>
-                <separator />
-                <text><span weight="bold">Keyboard shortcuts</span></text>
-                <text size="sm" foreground="text_muted">Every primary workflow is available without leaving the keyboard.</text>
-                <for each="shortcutHints" as="h">
-                  <row padding="4" gap="12" cross="center">
-                    <text grow="1">{h.action}</text>
-                    <badge size="sm" variant="outline">{h.keys}</badge>
-                  </row>
-                </for>
               </column>
             </scroll>
             <row gap="8" main="end">
               <button size="sm" variant="ghost" on-press="remove_api_key" disabled="{missingKey}">Remove key</button><spacer grow="1" />
               <button size="sm" variant="ghost" on-press="close_settings">Close</button>
               <button size="sm" variant="primary" on-press="save_settings" disabled="{cannotSaveSettings}">Save</button>
+            </row>
+          </column>
+        </dialog>
+      </column>
+    </panel>
+  </if>
+
+  <if test="{shortcuts_open}">
+    <panel background="scrim" on-press="close_shortcuts" label="Keyboard shortcuts backdrop">
+      <column main="center" cross="center">
+        <dialog width="680" height="520" label="Keyboard shortcuts">
+          <column padding="24" gap="12">
+            <row gap="12" cross="center">
+              <column grow="1" gap="4">
+                <text size="heading">Keyboard shortcuts</text>
+                <text size="sm" foreground="text_muted">Move through Superchat without leaving the keyboard.</text>
+              </column>
+              <badge size="sm" variant="outline">Cmd + ,</badge>
+            </row>
+            <separator />
+            <scroll grow="1" label="All keyboard shortcuts">
+              <column gap="8">
+                <for each="shortcutHints" as="h">
+                  <row padding="6" gap="16" cross="center">
+                    <text grow="1">{h.action}</text>
+                    <badge size="sm" variant="secondary">{h.keys}</badge>
+                  </row>
+                </for>
+              </column>
+            </scroll>
+            <row main="end">
+              <button size="sm" variant="primary" on-press="close_shortcuts">Done</button>
             </row>
           </column>
         </dialog>
