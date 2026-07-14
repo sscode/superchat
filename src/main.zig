@@ -482,6 +482,7 @@ pub const ProjectSidebarRow = struct {
     id: u32,
     title: []const u8,
     prefix: []const u8,
+    is_project: bool,
     selected: bool,
 };
 
@@ -612,6 +613,7 @@ pub const cmd_stop = "workspace.stop";
 pub const cmd_auto_model = "workspace.model-auto";
 pub const cmd_codex_subscription = "workspace.model-codex-subscription";
 pub const cmd_settings = "workspace.settings";
+pub const cmd_shortcuts = "workspace.shortcuts";
 pub const cmd_fork_latest = "workspace.fork-latest";
 pub const cmd_copy_latest = "workspace.copy-latest";
 pub const cmd_rename_thread = "workspace.rename-thread";
@@ -810,6 +812,8 @@ pub const Msg = union(enum) {
     palette_action: PaletteAction,
     open_settings,
     close_settings,
+    open_shortcuts,
+    close_shortcuts,
     save_settings,
     remove_api_key,
     connect_codex,
@@ -983,6 +987,7 @@ pub const Model = struct {
     search_loading: bool = false,
     search_request_pending: bool = false,
     settings_open: bool = false,
+    shortcuts_open: bool = false,
     onboarding_open: bool = false,
     dev_mode: bool = false,
     force_onboarding: bool = false,
@@ -1231,7 +1236,7 @@ pub const Model = struct {
         .{ .action = "Quick model: Kimi K2.6", .keys = "Cmd + Shift + 8" },
         .{ .action = "Quick model: Kimi K2.7 Code", .keys = "Cmd + Shift + 9" },
         .{ .action = "Use Codex", .keys = "Cmd + Option + Shift + 1" },
-        .{ .action = "Open settings", .keys = "Cmd + ," },
+        .{ .action = "Open keyboard shortcuts", .keys = "Cmd + ," },
         .{ .action = "Fork latest response", .keys = "Cmd + Shift + F" },
         .{ .action = "Copy latest response", .keys = "Cmd + Shift + C" },
         .{ .action = "Retry latest response", .keys = "Cmd + Shift + T" },
@@ -1263,7 +1268,7 @@ pub const Model = struct {
         .{ .id = .export_thread, .label = "Export current chat", .shortcut = "Cmd + Shift + S" },
         .{ .id = .export_workspace, .label = "Export workspace backup", .shortcut = "Cmd + Opt + Shift + S" },
         .{ .id = .archive, .label = "Open archive", .shortcut = "Cmd + Shift + H" },
-        .{ .id = .settings, .label = "Settings and shortcuts", .shortcut = "Cmd + ," },
+        .{ .id = .settings, .label = "Settings", .shortcut = "Sidebar" },
     };
 
     pub fn paletteWorkspaceRows(model: *const Model, arena: std.mem.Allocator) []const PaletteWorkspaceRow {
@@ -1555,6 +1560,7 @@ pub const Model = struct {
                 .id = project.id,
                 .title = project.name(),
                 .prefix = "",
+                .is_project = true,
                 .selected = project.id == model.active_project_id,
             };
             count += 1;
@@ -1570,6 +1576,7 @@ pub const Model = struct {
                     else
                         thread.title(),
                     .prefix = "    ",
+                    .is_project = false,
                     .selected = thread.id == model.active_thread_id,
                 };
                 count += 1;
@@ -1706,7 +1713,7 @@ pub const Model = struct {
         const thread = model.activeThreadConst() orelse return "No model connection";
         if (thread.active_model_len > 0) {
             const active_model = thread.active_model_storage[0..thread.active_model_len];
-            return std.fmt.allocPrint(arena, "Connected · {s}", .{active_model}) catch active_model;
+            return std.fmt.allocPrint(arena, "Last response · {s}", .{active_model}) catch active_model;
         }
         return switch (thread.model_choice) {
             .codex_subscription => switch (model.codex_connection) {
@@ -3000,6 +3007,7 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, cmd_snippets)) return .open_snippets;
     if (std.mem.eql(u8, name, cmd_mcp_tools)) return .open_mcp_tools;
     if (std.mem.eql(u8, name, cmd_settings)) return .open_settings;
+    if (std.mem.eql(u8, name, cmd_shortcuts)) return .open_shortcuts;
     if (std.mem.eql(u8, name, cmd_fork_latest)) return .fork_latest;
     if (std.mem.eql(u8, name, cmd_copy_latest)) return .copy_latest;
     if (std.mem.eql(u8, name, cmd_rename_thread)) return .open_rename_thread;
@@ -3233,6 +3241,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .open_search => {
             model.model_picker_open = true;
             model.settings_open = false;
+            model.shortcuts_open = false;
             model.fork_open = false;
             model.rename_open = false;
             model.archive_open = false;
@@ -3320,12 +3329,25 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.move_open = false;
             model.clear_confirm_thread_id = 0;
             model.clearApiKeyInput();
+            model.shortcuts_open = false;
             model.settings_open = true;
         },
         .close_settings => {
             model.clearApiKeyInput();
             model.settings_open = false;
         },
+        .open_shortcuts => {
+            model.model_picker_open = false;
+            closeSearch(model, fx);
+            model.settings_open = false;
+            model.fork_open = false;
+            model.rename_open = false;
+            model.archive_open = false;
+            model.move_open = false;
+            model.clear_confirm_thread_id = 0;
+            model.shortcuts_open = true;
+        },
+        .close_shortcuts => model.shortcuts_open = false,
         .save_settings => {
             const thread = model.activeThread() orelse return;
             if (thread.model_buffer.isEmpty()) return;
@@ -3617,6 +3639,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .focus_composer => model.focusComposer(),
         .open_model_picker => {
             model.settings_open = false;
+            model.shortcuts_open = false;
             closeSearch(model, fx);
             model.fork_open = false;
             model.rename_open = false;
@@ -3629,6 +3652,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .close_overlay => {
             model.settings_open = false;
+            model.shortcuts_open = false;
             model.fork_open = false;
             model.rename_open = false;
             model.archive_open = false;

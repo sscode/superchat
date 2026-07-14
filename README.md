@@ -64,7 +64,7 @@ Development mode skips onboarding so you can get straight into the app. To exper
 npm run dev:onboarding
 ```
 
-Open **Settings** with `⌘,` to connect Codex or OpenRouter. Development builds also expose the experimental Claude adapter. OpenRouter keys are validated and stored in macOS Keychain—not in the chat database or source tree. CLI credentials remain owned by their providers.
+Open **Settings** from the sidebar to connect Codex or OpenRouter, or press `⌘,` for the dedicated keyboard-shortcuts guide. Development builds also expose the experimental Claude adapter. OpenRouter keys are validated and stored in macOS Keychain—not in the chat database or source tree. CLI credentials remain owned by their providers.
 
 Debug and locally packaged ad-hoc builds deliberately keep API keys in memory for the current session instead of reading or writing Keychain. This prevents rebuilt binaries from repeatedly asking for access to the release app's credential. Set `OPENROUTER_API_KEY` when launching a development build if you do not want to paste it again. Keychain persistence is enabled only in consistently Developer-ID-signed release builds.
 
