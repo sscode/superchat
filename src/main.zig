@@ -5254,7 +5254,7 @@ pub fn main(init: std.process.Init) !void {
         .app_name = "superchat",
         .window_title = "Superchat",
         .bundle_id = "dev.sscode.superchat",
-        .icon_path = "assets/icon.png",
+        .icon_path = "assets/icon-dev.png",
         .default_frame = geometry.RectF.init(0, 0, window_width, window_height),
         .restore_state = true,
         .js_window_api = false,

@@ -161,6 +161,8 @@ Archived items disappear from the main workspace immediately. You can restore th
 | `npm run build` | Create a release build |
 | `npm run package:macos` | Clean-build a universal, ad-hoc-signed `.app` and `.dmg` |
 
+Development runs and ad-hoc local packages use the violet `assets/icon-dev.png` icon so they are easy to distinguish from an installed release. Identity-signed packages replace it with the monochrome production icon from `assets/icon.png` before the final code-signing pass.
+
 You can also provide a key to a development process without saving it through the UI:
 
 ```bash

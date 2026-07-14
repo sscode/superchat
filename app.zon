@@ -5,7 +5,7 @@
     .description = "A fast, local-first chat client for OpenRouter and Codex.",
     .version = "0.1.0",
     .theme = "geist",
-    .icons = .{"assets/icon.png"},
+    .icons = .{"assets/icon-dev.png"},
     .platforms = .{"macos"},
     .permissions = .{ "command", "view", "network", "credentials", "clipboard", "filesystem", "dialog", "notifications" },
     .capabilities = .{ "native_views", "gpu_surfaces", "shortcuts", "file_drops" },

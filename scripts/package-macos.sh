@@ -18,6 +18,19 @@ SIGNING="${SUPERCHAT_SIGNING:-adhoc}"
 CREDENTIAL_STORE=false
 if [[ "$SIGNING" == "identity" ]]; then CREDENTIAL_STORE=true; fi
 
+install_production_icon() {
+  local source="$ROOT/assets/icon.png"
+  local iconset="$TEMP_ROOT/production.iconset"
+  local destination="$APP/Contents/Resources/AppIcon.icns"
+  mkdir -p "$iconset"
+  for size in 16 32 128 256 512; do
+    sips -z "$size" "$size" "$source" --out "$iconset/icon_${size}x${size}.png" >/dev/null
+    local retina=$((size * 2))
+    sips -z "$retina" "$retina" "$source" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+  done
+  iconutil -c icns "$iconset" -o "$destination"
+}
+
 npx native build --yes -Doptimize=ReleaseFast -Dtarget=aarch64-macos -Dcredential-store="$CREDENTIAL_STORE"
 cp "$ROOT/zig-out/bin/superchat" "$STAGE/superchat-arm64"
 npx native build --yes -Doptimize=ReleaseFast -Dtarget=x86_64-macos -Dcredential-store="$CREDENTIAL_STORE"
@@ -31,6 +44,9 @@ if [[ "$SIGNING" == "identity" ]]; then
   if [[ -n "${APPLE_TEAM_ID:-}" ]]; then ARGS+=(--team-id "$APPLE_TEAM_ID"); fi
 fi
 npx native package "${ARGS[@]}"
+if [[ "$SIGNING" == "identity" ]]; then
+  install_production_icon
+fi
 xattr -cr "$APP"
 if [[ "$SIGNING" == "identity" ]]; then
   codesign --force --deep --options runtime --timestamp --entitlements "$ROOT/packaging/entitlements.plist" --sign "$SUPERCHAT_SIGNING_IDENTITY" "$APP"
