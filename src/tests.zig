@@ -649,6 +649,8 @@ test "project chats are grouped directly beneath their project" {
     try testing.expectEqualStrings(projectWithId(&model, second_project).name(), rows[3].title);
     try testing.expect(rows[4].prefix.len > 0);
     try testing.expectEqual(second_project_thread, rows[4].id);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "{r.prefix} {r.title}") == null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Chat {r.title}\"") == null);
 
     main.update(&model, .{ .select_sidebar_row = rows[1].key }, &fx);
     try testing.expectEqual(first_project, model.active_project_id);

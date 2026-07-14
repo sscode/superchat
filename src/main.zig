@@ -814,6 +814,8 @@ pub const Msg = union(enum) {
     close_settings,
     open_shortcuts,
     close_shortcuts,
+    toggle_project_menu,
+    close_project_menu,
     save_settings,
     remove_api_key,
     connect_codex,
@@ -988,6 +990,7 @@ pub const Model = struct {
     search_request_pending: bool = false,
     settings_open: bool = false,
     shortcuts_open: bool = false,
+    project_menu_open: bool = false,
     onboarding_open: bool = false,
     dev_mode: bool = false,
     force_onboarding: bool = false,
@@ -3334,6 +3337,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.clear_confirm_thread_id = 0;
             model.clearApiKeyInput();
             model.shortcuts_open = false;
+            model.project_menu_open = false;
             model.settings_open = true;
         },
         .close_settings => {
@@ -3349,9 +3353,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.archive_open = false;
             model.move_open = false;
             model.clear_confirm_thread_id = 0;
+            model.project_menu_open = false;
             model.shortcuts_open = true;
         },
         .close_shortcuts => model.shortcuts_open = false,
+        .toggle_project_menu => {
+            if (model.cannotManageProject()) return;
+            model.project_menu_open = !model.project_menu_open;
+        },
+        .close_project_menu => model.project_menu_open = false,
         .save_settings => {
             const thread = model.activeThread() orelse return;
             if (thread.model_buffer.isEmpty()) return;
@@ -3415,7 +3425,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             for (model.threads[first_new_thread..model.thread_count]) |thread| model.markThreadMessagesDirty(thread.id);
         },
         .open_rename_thread => model.openRename(.thread),
-        .open_rename_project => model.openRename(.project),
+        .open_rename_project => {
+            model.project_menu_open = false;
+            model.openRename(.project);
+        },
         .save_rename => {
             model.saveRename();
             model.markStructureDirty();
@@ -3517,6 +3530,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
         },
         .archive_project => {
+            model.project_menu_open = false;
             if (model.archiveProject(fx)) {
                 model.showToast("Project archived", fx);
                 model.markStructureDirty();
@@ -3592,6 +3606,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.markStructureDirty();
         },
         .new_project_thread => {
+            model.project_menu_open = false;
             if (model.active_project_id == chats_project_id) return;
             const thread_id = model.addThread(model.active_project_id) orelse return;
             _ = model.activateThread(thread_id);
@@ -3644,6 +3659,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .open_model_picker => {
             model.settings_open = false;
             model.shortcuts_open = false;
+            model.project_menu_open = false;
             closeSearch(model, fx);
             model.fork_open = false;
             model.rename_open = false;
@@ -3657,6 +3673,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .close_overlay => {
             model.settings_open = false;
             model.shortcuts_open = false;
+            model.project_menu_open = false;
             model.fork_open = false;
             model.rename_open = false;
             model.archive_open = false;

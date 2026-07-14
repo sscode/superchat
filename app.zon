@@ -3,7 +3,7 @@
     .name = "superchat",
     .display_name = "Superchat",
     .description = "A fast, local-first chat client for OpenRouter and Codex.",
-    .version = "0.1.1",
+    .version = "0.1.2",
     .theme = "geist",
     .icons = .{"assets/icon-dev.png"},
     .platforms = .{"macos"},

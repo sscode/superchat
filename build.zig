@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) void {
     const artifacts = native_sdk.addAppArtifacts(b, b.dependency("native_sdk", .{}), .{ .name = "superchat" });
     const app_options = b.addOptions();
     app_options.addOption(bool, "credential_store", b.option(bool, "credential-store", "Persist credentials in the OS keychain (signed releases only)") orelse false);
-    app_options.addOption([]const u8, "version", "0.1.1");
+    app_options.addOption([]const u8, "version", "0.1.2");
     artifacts.exe.root_module.addOptions("superchat_options", app_options);
     artifacts.tests.root_module.addOptions("superchat_options", app_options);
     if (b.sysroot) |sysroot| {

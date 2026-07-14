@@ -20,43 +20,47 @@
     </row>
     <row grow="1">
       <column width="268" background="surface">
-        <row padding="16" gap="6" cross="center">
-          <text size="sm" foreground="text_muted" grow="1"><span weight="bold">CHATS</span></text>
+        <row padding="12" gap="6" cross="center">
+          <text size="sm" foreground="text_muted" grow="1">Chats</text>
           <button size="sm" variant="ghost" icon="archive" on-press="open_archive" label="Open archive"></button>
           <button size="sm" variant="ghost" icon="plus" on-press="new_thread" disabled="{cannotAddThread}" label="New top-level chat"></button>
         </row>
         <scroll grow="1" label="Chats and projects">
-          <column padding="12" gap="6">
+          <column padding="8" gap="2">
             <for each="topLevelThreadRows" key="id" as="t">
               <list-item on-press="select_thread:{t.id}" selected="{t.selected}" label="{t.title}">{t.title}</list-item>
             </for>
-            <separator />
-            <row padding="6" gap="6" cross="center">
-              <text size="sm" foreground="text_muted" grow="1"><span weight="bold">PROJECTS</span></text>
-              <button size="sm" variant="ghost" icon="edit" on-press="open_rename_project" disabled="{cannotManageProject}" label="Rename selected project"></button>
-              <button size="sm" variant="ghost" icon="archive" on-press="archive_project" disabled="{cannotManageProject}" label="Archive selected project"></button>
-              <button size="sm" variant="ghost" icon="plus" on-press="new_project_thread" disabled="{cannotManageProject}" label="New chat in selected project"></button>
-              <button size="sm" variant="ghost" icon="folder" on-press="new_project" disabled="{cannotAddProject}" label="New project"></button>
+            <row padding="8" gap="4" cross="center">
+              <text size="sm" foreground="text_muted" grow="1">Projects</text>
+              <stack width="28" height="28">
+                <button size="sm" variant="ghost" icon="ellipsis" on-press="toggle_project_menu" disabled="{cannotManageProject}" label="Selected project actions"></button>
+                <if test="{project_menu_open}">
+                  <dropdown-menu anchor="below" anchor-alignment="end" anchor-offset="6" width="176" height="112" on-dismiss="close_project_menu" label="Project actions">
+                    <menu-item icon="plus" on-press="new_project_thread">New chat</menu-item>
+                    <menu-item icon="edit" on-press="open_rename_project">Rename project</menu-item>
+                    <menu-item icon="archive" on-press="archive_project">Archive project</menu-item>
+                  </dropdown-menu>
+                </if>
+              </stack>
+              <button size="sm" variant="ghost" icon="plus" on-press="new_project" disabled="{cannotAddProject}" label="New project"></button>
             </row>
             <for each="projectSidebarRows" key="key" as="r">
               <if test="{r.is_project}">
-                <if test="{r.selected}">
-                  <button size="sm" grow="1" variant="secondary" icon="folder-open" on-press="select_sidebar_row:{r.key}" label="Selected project {r.title}">{r.title}</button>
-                </if>
-                <else>
-                  <button size="sm" grow="1" variant="ghost" icon="folder" on-press="select_sidebar_row:{r.key}" label="Project {r.title}">{r.title}</button>
-                </else>
+                <list-item icon="folder" on-press="select_sidebar_row:{r.key}" label="{r.title}">{r.title}</list-item>
               </if>
               <else>
-                <list-item on-press="select_sidebar_row:{r.key}" selected="{r.selected}" label="Chat {r.title}">{r.prefix} {r.title}</list-item>
+                <row gap="2">
+                  <spacer width="18" />
+                  <list-item grow="1" on-press="select_sidebar_row:{r.key}" selected="{r.selected}" label="{r.title}">{r.title}</list-item>
+                </row>
               </else>
             </for>
           </column>
         </scroll>
         <separator />
-        <column padding="12" gap="8" background="background">
-          <button size="sm" variant="outline" icon="terminal" on-press="open_shortcuts" label="Open keyboard shortcuts, Command comma">Keyboard shortcuts · Cmd + ,</button>
-          <button size="sm" variant="ghost" icon="settings" on-press="open_settings">Settings</button>
+        <column padding="8" gap="2" background="surface">
+          <list-item icon="terminal" on-press="open_shortcuts" label="Open keyboard shortcuts, Command comma">Keyboard shortcuts · Cmd + ,</list-item>
+          <list-item icon="settings" on-press="open_settings">Settings</list-item>
         </column>
       </column>
       <separator />
@@ -76,9 +80,15 @@
             <for each="messageRows" key="id" as="m">
               <if test="{m.isUser}">
                 <row main="end">
-                  <column gap="4" cross="end" label="You said">
-                    <text size="sm" foreground="text_muted">You</text>
-                    <text wrap="true">{m.content}  {m.attachmentSummary}</text>
+                  <column gap="2" cross="end">
+                    <bubble variant="secondary" min-width="96" label="You said">
+                      <column gap="6">
+                        <text wrap="true">{m.content}</text>
+                        <if test="{m.hasAttachments}">
+                          <text size="sm" foreground="text_muted" wrap="true">{m.attachmentSummary}</text>
+                        </if>
+                      </column>
+                    </bubble>
                     <button size="sm" variant="ghost" foreground="text_muted" on-press="edit_message:{m.id}">Edit</button>
                   </column>
                 </row>
