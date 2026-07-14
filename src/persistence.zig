@@ -1,5 +1,6 @@
 const std = @import("std");
 const storage = @import("storage.zig");
+const mcp = @import("mcp.zig");
 
 pub const max_project_name_bytes = 48;
 pub const max_thread_title_bytes = 80;
@@ -139,6 +140,35 @@ pub const SnippetSet = struct {
     count: usize = 0,
 };
 
+pub const McpServerRecord = struct {
+    id: u32 = 0,
+    name_storage: [mcp.max_server_name_bytes]u8 = undefined,
+    name_len: usize = 0,
+    command_storage: [mcp.max_command_bytes]u8 = undefined,
+    command_len: usize = 0,
+    enabled: bool = true,
+
+    pub fn from(server: anytype) McpServerRecord {
+        var record = McpServerRecord{ .id = server.id, .enabled = server.enabled };
+        record.name_len = copyText(&record.name_storage, server.name());
+        record.command_len = copyText(&record.command_storage, server.command());
+        return record;
+    }
+
+    pub fn name(record: *const McpServerRecord) []const u8 {
+        return record.name_storage[0..record.name_len];
+    }
+
+    pub fn command(record: *const McpServerRecord) []const u8 {
+        return record.command_storage[0..record.command_len];
+    }
+};
+
+pub const McpServerSet = struct {
+    servers: [mcp.max_servers]McpServerRecord = undefined,
+    count: usize = 0,
+};
+
 pub const ExportKind = enum { thread_markdown, workspace_json };
 
 pub const ExportRecord = struct {
@@ -205,6 +235,7 @@ pub const Command = union(enum) {
     search: SearchRequest,
     upsert_cached_model: CachedModelRecord,
     save_snippets: *SnippetSet,
+    save_mcp_servers: *McpServerSet,
     export_file: *ExportRecord,
 };
 
@@ -278,6 +309,10 @@ pub const Worker = struct {
 
     pub fn enqueueSnippets(worker: *Worker, record: SnippetSet) bool {
         return worker.enqueueOwned(record, .save_snippets);
+    }
+
+    pub fn enqueueMcpServers(worker: *Worker, record: McpServerSet) bool {
+        return worker.enqueueOwned(record, .save_mcp_servers);
     }
 
     pub fn enqueueExport(worker: *Worker, record: ExportRecord) bool {
@@ -455,6 +490,10 @@ pub const Worker = struct {
                 defer worker.allocator.destroy(record);
                 try worker.database.replaceSnippets(record.snippets[0..record.count]);
             },
+            .save_mcp_servers => |record| {
+                defer worker.allocator.destroy(record);
+                try worker.database.replaceMcpServers(record.servers[0..record.count]);
+            },
             .export_file => |record| {
                 defer worker.allocator.destroy(record);
                 const success = blk: {
@@ -478,6 +517,7 @@ pub const Worker = struct {
             .upsert_message => |record| worker.allocator.destroy(record),
             .reconcile => |record| worker.allocator.destroy(record),
             .save_snippets => |record| worker.allocator.destroy(record),
+            .save_mcp_servers => |record| worker.allocator.destroy(record),
             .export_file => |record| worker.allocator.destroy(record),
             else => {},
         }

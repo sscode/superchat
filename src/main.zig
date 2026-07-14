@@ -12,6 +12,8 @@ const native_sdk = @import("native_sdk");
 pub const workspace_storage = @import("storage.zig");
 const storage = workspace_storage;
 const persistence = @import("persistence.zig");
+pub const workspace_mcp = @import("mcp.zig");
+const mcp = workspace_mcp;
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -78,6 +80,9 @@ const max_attachment_name_bytes = 128;
 const max_attachment_total_bytes = 640 * 1024;
 const attachment_read_key_base: u64 = 1 << 56;
 const request_body_key_base: u64 = 1 << 55;
+const mcp_helper_key: u64 = (1 << 61) + 7;
+const mcp_timeout_key: u64 = (1 << 52) + 4;
+const mcp_timeout_ms: u64 = 20_000;
 
 fn utf8PrefixLen(text: []const u8, limit: usize) usize {
     var len = @min(text.len, limit);
@@ -135,8 +140,9 @@ pub const RenameKind = enum { project, thread };
 pub const ConnectionState = enum { disabled, checking, connected, disconnected, connecting, unavailable, failed };
 pub const UpdateState = enum { idle, checking, current, available, failed };
 pub const AttachmentKind = enum { image, pdf, text };
-pub const PaletteAction = enum { search, new_thread, new_project_thread, move_thread, attach, snippets, export_thread, export_workspace, archive, settings };
+pub const PaletteAction = enum { search, new_thread, new_project_thread, move_thread, attach, tools, snippets, export_thread, export_workspace, archive, settings };
 pub const ExportKind = enum { none, thread_markdown, workspace_json };
+pub const McpOperation = enum { none, discover, call };
 
 pub const Attachment = struct {
     kind: AttachmentKind = .text,
@@ -224,34 +230,6 @@ pub const Message = struct {
 
     pub fn responseModel(message: *const Message) []const u8 {
         return message.response_model_storage[0..message.response_model_len];
-    }
-
-    pub fn hasMetrics(message: *const Message) bool {
-        return message.role == .assistant and (message.response_model_len > 0 or message.latency_ms > 0 or message.prompt_tokens > 0 or message.completion_tokens > 0 or message.cost_micros > 0);
-    }
-
-    pub fn metricsLabel(message: *const Message, arena: std.mem.Allocator) []const u8 {
-        if (!message.hasMetrics()) return "";
-        var writer: std.Io.Writer.Allocating = .init(arena);
-        if (message.response_model_len > 0) writer.writer.writeAll(message.responseModel()) catch return "Response details";
-        if (message.latency_ms > 0) {
-            if (writer.written().len > 0) writer.writer.writeAll("  ·  ") catch return "Response details";
-            writer.writer.print("{d:.1}s", .{@as(f64, @floatFromInt(message.latency_ms)) / 1000.0}) catch return "Response details";
-        }
-        if (message.prompt_tokens > 0 or message.completion_tokens > 0) {
-            if (writer.written().len > 0) writer.writer.writeAll("  ·  ") catch return "Response details";
-            writer.writer.print("{d} in / {d} out", .{ message.prompt_tokens, message.completion_tokens }) catch return "Response details";
-        }
-        if (message.cost_micros > 0) {
-            if (writer.written().len > 0) writer.writer.writeAll("  ·  ") catch return "Response details";
-            writer.writer.print("${d:.4}", .{@as(f64, @floatFromInt(message.cost_micros)) / 1_000_000.0}) catch return "Response details";
-        }
-        return writer.written();
-    }
-
-    pub fn responseActionLabel(message: *const Message, arena: std.mem.Allocator) []const u8 {
-        if (!message.hasMetrics()) return "Copy";
-        return std.fmt.allocPrint(arena, "Copy  ·  {s}", .{message.metricsLabel(arena)}) catch "Copy";
     }
 
     pub fn hasAttachments(message: *const Message) bool {
@@ -342,6 +320,7 @@ pub const Thread = struct {
     request_prompt_tokens: u32 = 0,
     request_completion_tokens: u32 = 0,
     request_cost_micros: u64 = 0,
+    total_cost_micros: u64 = 0,
 
     pub fn title(thread: *const Thread) []const u8 {
         return thread.title_storage[0..thread.title_len];
@@ -435,6 +414,7 @@ pub const Thread = struct {
         cloned.id = next_message_id.*;
         thread.messages[thread.message_count] = cloned;
         thread.message_count += 1;
+        thread.total_cost_micros +|= cloned.cost_micros;
         next_message_id.* += 1;
         return true;
     }
@@ -559,6 +539,19 @@ pub const SnippetRow = struct {
     preview: []const u8,
 };
 
+pub const McpServerRow = struct {
+    id: u32,
+    name: []const u8,
+    detail: []const u8,
+    toggle_label: []const u8,
+};
+
+pub const McpToolRow = struct {
+    index: u8,
+    title: []const u8,
+    detail: []const u8,
+};
+
 const SearchEntry = struct {
     thread_id: u32 = 0,
     title_storage: [max_thread_title_bytes]u8 = undefined,
@@ -634,6 +627,7 @@ pub const cmd_move_thread = "workspace.move-thread";
 pub const cmd_export_thread = "workspace.export-thread";
 pub const cmd_export_workspace = "workspace.export-workspace";
 pub const cmd_snippets = "workspace.snippets";
+pub const cmd_mcp_tools = "workspace.mcp-tools";
 pub const project_slot_commands = [_][]const u8{
     "workspace.project-1",
     "workspace.project-2",
@@ -847,6 +841,16 @@ pub const Msg = union(enum) {
     save_snippet,
     use_snippet: u32,
     delete_snippet: u32,
+    mcp_server_name_edit: canvas.TextInputEvent,
+    mcp_server_command_edit: canvas.TextInputEvent,
+    add_mcp_server,
+    remove_mcp_server: u32,
+    toggle_mcp_server: u32,
+    refresh_mcp_server: u32,
+    open_mcp_tools,
+    select_mcp_tool: u8,
+    mcp_exit: native_sdk.EffectExit,
+    mcp_timeout: native_sdk.EffectTimer,
     export_thread,
     export_workspace,
     export_started,
@@ -906,6 +910,8 @@ pub const Msg = union(enum) {
         "search_timer",
         "persist_draft",
         "dismiss_toast",
+        "mcp_exit",
+        "mcp_timeout",
         "clipboard_result",
         "files_dropped",
         "attachment_file_result",
@@ -925,6 +931,7 @@ pub const Msg = union(enum) {
         "archive_project",
         "retry_latest",
         "stop",
+        "clear",
         "open_search",
         "check_updates",
         "open_archive",
@@ -936,6 +943,7 @@ pub const Msg = union(enum) {
         "open_file_picker",
         "open_move_thread",
         "open_snippets",
+        "open_mcp_tools",
         "export_thread",
         "export_workspace",
         "export_started",
@@ -997,6 +1005,21 @@ pub const Model = struct {
     snippet_name_buffer: canvas.TextBuffer(max_snippet_name_bytes) = .{},
     snippet_body_buffer: canvas.TextBuffer(max_snippet_body_bytes) = .{},
     snippets_dirty: bool = false,
+    mcp_servers: [mcp.max_servers]mcp.Server = undefined,
+    mcp_server_count: usize = 0,
+    next_mcp_server_id: u32 = 1,
+    mcp_tools: [mcp.max_tools]mcp.Tool = undefined,
+    mcp_tool_count: usize = 0,
+    mcp_server_name_buffer: canvas.TextBuffer(mcp.max_server_name_bytes) = .{},
+    mcp_server_command_buffer: canvas.TextBuffer(mcp.max_command_bytes) = .{},
+    mcp_arguments_buffer: canvas.TextBuffer(mcp.max_arguments_bytes) = .{},
+    mcp_selected_tool: usize = std.math.maxInt(usize),
+    mcp_operation: McpOperation = .none,
+    mcp_operation_server_id: u32 = 0,
+    mcp_operation_thread_id: u32 = 0,
+    mcp_servers_dirty: bool = false,
+    executable_path_storage: [std.Io.Dir.max_path_bytes]u8 = undefined,
+    executable_path_len: usize = 0,
     export_request: ExportKind = .none,
     export_thread_id: u32 = 0,
     export_pending: bool = false,
@@ -1075,6 +1098,7 @@ pub const Model = struct {
         "dev_mode",
         "composer_focus_flip",
         "hasMessages",
+        "cannotClear",
         "canSend",
         "forkCount",
         "credential_action",
@@ -1095,6 +1119,21 @@ pub const Model = struct {
         "snippet_name_buffer",
         "snippet_body_buffer",
         "snippets_dirty",
+        "mcp_servers",
+        "mcp_server_count",
+        "next_mcp_server_id",
+        "mcp_tools",
+        "mcp_tool_count",
+        "mcp_server_name_buffer",
+        "mcp_server_command_buffer",
+        "mcp_arguments_buffer",
+        "mcp_selected_tool",
+        "mcp_operation",
+        "mcp_operation_server_id",
+        "mcp_operation_thread_id",
+        "mcp_servers_dirty",
+        "executable_path_storage",
+        "executable_path_len",
         "export_request",
         "export_thread_id",
         "export_pending",
@@ -1178,6 +1217,7 @@ pub const Model = struct {
         .{ .action = "Next project", .keys = "Cmd + Option + Down" },
         .{ .action = "Focus message", .keys = "Cmd + L" },
         .{ .action = "Attach images or files", .keys = "Cmd + U" },
+        .{ .action = "Open MCP tools", .keys = "Cmd + Option + T" },
         .{ .action = "Choose model", .keys = "Cmd + K" },
         .{ .action = "Search every chat", .keys = "Cmd + F" },
         .{ .action = "Quick model: Auto", .keys = "Cmd + Shift + 0" },
@@ -1218,6 +1258,7 @@ pub const Model = struct {
         .{ .id = .new_project_thread, .label = "New chat in project", .shortcut = "Cmd + Opt + N" },
         .{ .id = .move_thread, .label = "Move current chat", .shortcut = "Cmd + Shift + M" },
         .{ .id = .attach, .label = "Attach files", .shortcut = "Cmd + U" },
+        .{ .id = .tools, .label = "MCP tools", .shortcut = "Cmd + Opt + T" },
         .{ .id = .snippets, .label = "Prompt snippets", .shortcut = "Cmd + Opt + P" },
         .{ .id = .export_thread, .label = "Export current chat", .shortcut = "Cmd + Shift + S" },
         .{ .id = .export_workspace, .label = "Export workspace backup", .shortcut = "Cmd + Opt + Shift + S" },
@@ -1290,6 +1331,63 @@ pub const Model = struct {
     pub fn cannotSaveSnippet(model: *const Model) bool {
         const name = std.mem.trim(u8, model.snippet_name_buffer.text(), " /\t\r\n");
         return name.len == 0 or model.snippet_body_buffer.isEmpty() or model.snippet_count == model.snippets.len;
+    }
+
+    pub fn mcpServerRows(model: *const Model, arena: std.mem.Allocator) []const McpServerRow {
+        const rows = arena.alloc(McpServerRow, model.mcp_server_count) catch return &.{};
+        for (model.mcp_servers[0..model.mcp_server_count], 0..) |*server, index| {
+            const state = switch (server.state) {
+                .idle => if (server.enabled) "Not checked" else "Disabled",
+                .connecting => "Connecting…",
+                .connected => std.fmt.allocPrint(arena, "{d} tool{s}", .{ server.tool_count, if (server.tool_count == 1) "" else "s" }) catch "Connected",
+                .failed => if (server.status_len > 0) server.status() else "Connection failed",
+            };
+            rows[index] = .{
+                .id = server.id,
+                .name = server.name(),
+                .detail = state,
+                .toggle_label = if (server.enabled) "Disable" else "Enable",
+            };
+        }
+        return rows;
+    }
+
+    pub fn mcpToolRows(model: *const Model, arena: std.mem.Allocator) []const McpToolRow {
+        const rows = arena.alloc(McpToolRow, model.mcp_tool_count) catch return &.{};
+        var count: usize = 0;
+        for (model.mcp_tools[0..model.mcp_tool_count], 0..) |*tool, index| {
+            const server = model.mcpServerByIdConst(tool.server_id) orelse continue;
+            if (!server.enabled) continue;
+            rows[count] = .{
+                .index = @intCast(index),
+                .title = tool.title(),
+                .detail = std.fmt.allocPrint(arena, "{s} · {s}", .{ server.name(), tool.name() }) catch tool.name(),
+            };
+            count += 1;
+        }
+        return rows[0..count];
+    }
+
+    pub fn mcpServerName(model: *const Model) []const u8 {
+        return model.mcp_server_name_buffer.text();
+    }
+
+    pub fn mcpServerCommand(model: *const Model) []const u8 {
+        return model.mcp_server_command_buffer.text();
+    }
+
+    fn mcpToolSelected(model: *const Model) bool {
+        return model.mcp_selected_tool < model.mcp_tool_count;
+    }
+
+    pub fn cannotAddMcpServer(model: *const Model) bool {
+        return model.mcp_server_count == model.mcp_servers.len or
+            std.mem.trim(u8, model.mcp_server_name_buffer.text(), " \t\r\n").len == 0 or
+            std.mem.trim(u8, model.mcp_server_command_buffer.text(), " \t\r\n").len == 0;
+    }
+
+    pub fn mcpBusy(model: *const Model) bool {
+        return model.mcp_operation != .none;
     }
 
     pub fn searchText(model: *const Model) []const u8 {
@@ -1471,7 +1569,7 @@ pub const Model = struct {
                         std.fmt.allocPrint(arena, "{s} · new", .{thread.title()}) catch thread.title()
                     else
                         thread.title(),
-                    .prefix = "    -",
+                    .prefix = "    ",
                     .selected = thread.id == model.active_thread_id,
                 };
                 count += 1;
@@ -1604,6 +1702,53 @@ pub const Model = struct {
         return "Custom model";
     }
 
+    pub fn headerConnectionLabel(model: *const Model, arena: std.mem.Allocator) []const u8 {
+        const thread = model.activeThreadConst() orelse return "No model connection";
+        if (thread.active_model_len > 0) {
+            const active_model = thread.active_model_storage[0..thread.active_model_len];
+            return std.fmt.allocPrint(arena, "Connected · {s}", .{active_model}) catch active_model;
+        }
+        return switch (thread.model_choice) {
+            .codex_subscription => switch (model.codex_connection) {
+                .connected => "Codex connected",
+                .checking => "Checking Codex…",
+                .connecting => "Connecting Codex…",
+                .disconnected => "Codex not connected",
+                .unavailable => "Codex unavailable",
+                .failed => "Codex connection failed",
+                .disabled => "Codex disabled",
+            },
+            .claude_subscription => switch (model.claude_connection) {
+                .connected => "Claude connected",
+                .checking => "Checking Claude…",
+                .connecting => "Connecting Claude…",
+                .disconnected => "Claude not connected",
+                .unavailable => "Claude unavailable",
+                .failed => "Claude connection failed",
+                .disabled => "Claude disabled",
+            },
+            else => if (model.api_key_len > 0) "OpenRouter connected" else "OpenRouter not connected",
+        };
+    }
+
+    pub fn hasThreadCost(model: *const Model) bool {
+        const thread = model.activeThreadConst() orelse return false;
+        const pending_cost = if (thread.sending) thread.request_cost_micros else 0;
+        return thread.total_cost_micros +| pending_cost > 0;
+    }
+
+    pub fn threadCostLabel(model: *const Model, arena: std.mem.Allocator) []const u8 {
+        const thread = model.activeThreadConst() orelse return "";
+        const pending_cost = if (thread.sending) thread.request_cost_micros else 0;
+        const cost_micros = thread.total_cost_micros +| pending_cost;
+        if (cost_micros == 0) return "";
+        const cost = @as(f64, @floatFromInt(cost_micros)) / 1_000_000.0;
+        return if (cost_micros < 10_000)
+            std.fmt.allocPrint(arena, "Thread · ${d:.6}", .{cost}) catch "Thread cost"
+        else
+            std.fmt.allocPrint(arena, "Thread · ${d:.4}", .{cost}) catch "Thread cost";
+    }
+
     pub fn modelSearch(model: *const Model) []const u8 {
         return model.model_search_buffer.text();
     }
@@ -1670,6 +1815,80 @@ pub const Model = struct {
         model.move_thread_id = 0;
         model.markStructureDirty();
         return true;
+    }
+
+    fn mcpServerById(model: *Model, id: u32) ?*mcp.Server {
+        for (model.mcp_servers[0..model.mcp_server_count]) |*server| if (server.id == id) return server;
+        return null;
+    }
+
+    fn mcpServerByIdConst(model: *const Model, id: u32) ?*const mcp.Server {
+        for (model.mcp_servers[0..model.mcp_server_count]) |*server| if (server.id == id) return server;
+        return null;
+    }
+
+    fn removeMcpToolsForServer(model: *Model, server_id: u32) void {
+        var write_index: usize = 0;
+        for (model.mcp_tools[0..model.mcp_tool_count]) |tool| {
+            if (tool.server_id == server_id) continue;
+            model.mcp_tools[write_index] = tool;
+            write_index += 1;
+        }
+        model.mcp_tool_count = write_index;
+        model.mcp_selected_tool = std.math.maxInt(usize);
+    }
+
+    fn addMcpServer(model: *Model) ?u32 {
+        if (model.cannotAddMcpServer()) return null;
+        const raw_name = std.mem.trim(u8, model.mcp_server_name_buffer.text(), " \t\r\n");
+        const raw_command = std.mem.trim(u8, model.mcp_server_command_buffer.text(), " \t\r\n");
+        for (model.mcp_servers[0..model.mcp_server_count]) |server| {
+            if (std.ascii.eqlIgnoreCase(server.name(), raw_name)) return null;
+        }
+        var server = mcp.Server{ .id = model.next_mcp_server_id };
+        model.next_mcp_server_id +|= 1;
+        server.setName(raw_name);
+        server.setCommand(raw_command);
+        server.setStatus("Ready to discover tools");
+        model.mcp_servers[model.mcp_server_count] = server;
+        model.mcp_server_count += 1;
+        model.mcp_server_name_buffer.clear();
+        model.mcp_server_command_buffer.clear();
+        model.mcp_servers_dirty = true;
+        return server.id;
+    }
+
+    fn removeMcpServer(model: *Model, id: u32) bool {
+        for (model.mcp_servers[0..model.mcp_server_count], 0..) |server, index| {
+            if (server.id != id or (model.mcp_operation != .none and model.mcp_operation_server_id == id)) continue;
+            model.removeMcpToolsForServer(id);
+            std.mem.copyForwards(mcp.Server, model.mcp_servers[index .. model.mcp_server_count - 1], model.mcp_servers[index + 1 .. model.mcp_server_count]);
+            model.mcp_server_count -= 1;
+            model.mcp_servers_dirty = true;
+            return true;
+        }
+        return false;
+    }
+
+    fn toggleMcpServer(model: *Model, id: u32) bool {
+        const server = model.mcpServerById(id) orelse return false;
+        if (model.mcp_operation != .none and model.mcp_operation_server_id == id) return false;
+        server.enabled = !server.enabled;
+        if (!server.enabled) {
+            server.state = .idle;
+            server.setStatus("Disabled");
+        }
+        model.mcp_servers_dirty = true;
+        return true;
+    }
+
+    pub fn setExecutablePath(model: *Model, path: []const u8) void {
+        model.executable_path_len = utf8PrefixLen(path, model.executable_path_storage.len);
+        @memcpy(model.executable_path_storage[0..model.executable_path_len], path[0..model.executable_path_len]);
+    }
+
+    fn executablePath(model: *const Model) []const u8 {
+        return model.executable_path_storage[0..model.executable_path_len];
     }
 
     fn snippetById(model: *Model, id: u32) ?*PromptSnippet {
@@ -1891,13 +2110,6 @@ pub const Model = struct {
         return !model.hasMessages();
     }
 
-    pub fn clearButtonLabel(model: *const Model) []const u8 {
-        return if (model.clear_confirm_thread_id != 0 and model.clear_confirm_thread_id == model.active_thread_id)
-            "Confirm clearing every message"
-        else
-            "Clear current chat";
-    }
-
     pub fn canSend(model: *const Model) bool {
         const thread = model.activeThreadConst() orelse return false;
         const has_connection = switch (thread.model_choice) {
@@ -1930,7 +2142,7 @@ pub const Model = struct {
         return !model.sending();
     }
 
-    pub fn statusLine(model: *const Model, arena: std.mem.Allocator) []const u8 {
+    pub fn statusLine(model: *const Model) []const u8 {
         const thread = model.activeThreadConst();
         if (thread) |active| {
             if (active.status_len > 0) return active.status_storage[0..active.status_len];
@@ -1940,18 +2152,17 @@ pub const Model = struct {
         }
         if (thread) |active| {
             switch (active.model_choice) {
-                .codex_subscription => return model.codexConnectionStatus(),
-                .claude_subscription => return model.claudeConnectionStatus(),
+                .codex_subscription => return if (model.codex_connection == .connected) "" else model.codexConnectionStatus(),
+                .claude_subscription => return if (model.claude_connection == .connected) "" else model.claudeConnectionStatus(),
                 else => {},
             }
         }
         if (model.api_key_len == 0) return "Add an OpenRouter API key in Settings";
-        if (thread) |active| {
-            if (active.active_model_len > 0) {
-                return std.fmt.allocPrint(arena, "Connected · {s}", .{active.active_model_storage[0..active.active_model_len]}) catch "Connected";
-            }
-        }
-        return "Connected · ready";
+        return "";
+    }
+
+    pub fn statusVisible(model: *const Model) bool {
+        return model.statusLine().len > 0;
     }
 
     fn setApiKey(model: *Model, key: []const u8) void {
@@ -2187,13 +2398,30 @@ pub const Model = struct {
         return false;
     }
 
+    fn stripLegacyForkModelSuffix(thread: *Thread) bool {
+        const model_label = if (thread.model_choice == .custom) thread.modelName() else blk: {
+            for (modelOptions) |option| {
+                if (option.choice == thread.model_choice) break :blk option.label;
+            }
+            break :blk "";
+        };
+        if (model_label.len == 0 or !std.mem.endsWith(u8, thread.title(), model_label)) return false;
+        const delimiter = " · ";
+        if (thread.title_len <= model_label.len + delimiter.len) return false;
+        const delimiter_start = thread.title_len - model_label.len - delimiter.len;
+        if (!std.mem.eql(u8, thread.title()[delimiter_start .. delimiter_start + delimiter.len], delimiter)) return false;
+        thread.title_len = delimiter_start;
+        return true;
+    }
+
     fn normalizeLoadedWorkspace(model: *Model) bool {
         if (!model.ensureChatsProject()) return false;
         var max_project_id: u32 = 0;
         var max_thread_id: u32 = 0;
         var max_message_id: u32 = 0;
         for (model.projects[0..model.project_count]) |project| max_project_id = @max(max_project_id, project.id);
-        for (model.threads[0..model.thread_count]) |thread| {
+        for (model.threads[0..model.thread_count]) |*thread| {
+            if (stripLegacyForkModelSuffix(thread)) model.persistence_structure_dirty = true;
             max_thread_id = @max(max_thread_id, thread.id);
             for (thread.messages[0..thread.message_count]) |message| max_message_id = @max(max_message_id, message.id);
         }
@@ -2584,6 +2812,12 @@ fn checkConnections(model: *Model, fx: *Effects) void {
 pub fn initEffects(model: *Model, fx: *Effects) void {
     checkConnections(model, fx);
     checkUpdates(model, fx);
+    for (model.mcp_servers[0..model.mcp_server_count]) |server| {
+        if (server.enabled and server.state == .idle) {
+            _ = startMcpHelper(model, server.id, null, fx);
+            break;
+        }
+    }
 }
 
 fn setUpdateStatus(model: *Model, value: []const u8) void {
@@ -2764,6 +2998,7 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, cmd_export_thread)) return .export_thread;
     if (std.mem.eql(u8, name, cmd_export_workspace)) return .export_workspace;
     if (std.mem.eql(u8, name, cmd_snippets)) return .open_snippets;
+    if (std.mem.eql(u8, name, cmd_mcp_tools)) return .open_mcp_tools;
     if (std.mem.eql(u8, name, cmd_settings)) return .open_settings;
     if (std.mem.eql(u8, name, cmd_fork_latest)) return .fork_latest;
     if (std.mem.eql(u8, name, cmd_copy_latest)) return .copy_latest;
@@ -2969,6 +3204,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.markThreadDirty(thread.id);
         },
         .api_key_edit => |edit| model.api_key_buffer.apply(edit),
+        .mcp_server_name_edit => |edit| model.mcp_server_name_buffer.apply(edit),
+        .mcp_server_command_edit => |edit| model.mcp_server_command_buffer.apply(edit),
         .model_search_edit => |edit| {
             model.model_search_buffer.apply(edit);
             fx.startTimer(.{ .key = model_search_timer, .interval_ms = 250, .on_fire = Effects.timerMsg(.model_search) });
@@ -3029,6 +3266,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 .new_project_thread => update(model, .new_project_thread, fx),
                 .move_thread => update(model, .open_move_thread, fx),
                 .attach => update(model, .open_file_picker, fx),
+                .tools => update(model, .open_mcp_tools, fx),
                 .snippets => update(model, .open_snippets, fx),
                 .export_thread => update(model, .export_thread, fx),
                 .export_workspace => update(model, .export_workspace, fx),
@@ -3179,6 +3417,56 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .save_snippet => if (model.saveSnippet()) model.showToast("Prompt snippet saved", fx),
         .use_snippet => |id| if (model.insertSnippet(id)) model.showToast("Prompt inserted", fx),
         .delete_snippet => |id| if (model.deleteSnippet(id)) model.showToast("Prompt snippet deleted", fx),
+        .add_mcp_server => {
+            const id = model.addMcpServer() orelse {
+                model.showToast("Use a unique name and command", fx);
+                return;
+            };
+            model.showToast("MCP server added", fx);
+            _ = startMcpHelper(model, id, null, fx);
+        },
+        .remove_mcp_server => |id| if (model.removeMcpServer(id)) model.showToast("MCP server removed", fx),
+        .toggle_mcp_server => |id| {
+            if (!model.toggleMcpServer(id)) return;
+            const server = model.mcpServerByIdConst(id) orelse return;
+            model.showToast(if (server.enabled) "MCP server enabled" else "MCP server disabled", fx);
+            if (server.enabled) _ = startMcpHelper(model, id, null, fx);
+        },
+        .refresh_mcp_server => |id| {
+            if (!startMcpHelper(model, id, null, fx)) model.showToast("Another MCP request is already running", fx);
+        },
+        .open_mcp_tools => {
+            model.model_picker_open = false;
+            model.settings_open = false;
+            model.fork_open = false;
+            model.rename_open = false;
+            model.archive_open = false;
+            model.move_open = false;
+            model.mcp_selected_tool = std.math.maxInt(usize);
+            model.mcp_arguments_buffer.set("{}");
+            model.settings_open = true;
+        },
+        .select_mcp_tool => |index| {
+            if (index >= model.mcp_tool_count) return;
+            const tool = &model.mcp_tools[index];
+            const server = model.mcpServerByIdConst(tool.server_id) orelse return;
+            if (!server.enabled) return;
+            const thread = model.activeThread() orelse return;
+            var draft: [max_draft_bytes]u8 = undefined;
+            const invocation = std.fmt.bufPrint(&draft, "/mcp {d} {s} {{}}", .{ server.id, tool.name() }) catch return;
+            thread.draft_buffer.set(invocation);
+            var status: [max_status_bytes]u8 = undefined;
+            var status_writer: std.Io.Writer = .fixed(&status);
+            if (tool.description_len > 0) {
+                status_writer.writeAll(tool.description()[0..utf8PrefixLen(tool.description(), 96)]) catch {};
+                status_writer.writeAll(" · ") catch {};
+            }
+            status_writer.writeAll(tool.schema()[0..utf8PrefixLen(tool.schema(), status.len - status_writer.buffered().len)]) catch {};
+            thread.setStatus(status_writer.buffered());
+            model.markThreadDirty(thread.id);
+            model.settings_open = false;
+            model.focusComposer();
+        },
         .export_thread => {
             if (model.export_pending) return;
             model.export_thread_id = model.active_thread_id;
@@ -3347,6 +3635,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.model_picker_open = false;
             model.move_open = false;
             model.move_thread_id = 0;
+            model.mcp_selected_tool = std.math.maxInt(usize);
+            model.mcp_arguments_buffer.clear();
             closeSearch(model, fx);
             model.clear_confirm_thread_id = 0;
             model.clearApiKeyInput();
@@ -3384,6 +3674,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
             for (thread.messages[0..thread.message_count]) |*message| message.deinit(model.allocator);
             thread.message_count = 0;
+            thread.total_cost_micros = 0;
             thread.active_model_len = 0;
             thread.stream_message_index = null;
             thread.stream_failed = false;
@@ -3416,6 +3707,28 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             markLatestAssistantDirty(model, thread_id);
         },
         .connection_exit => |exit_event| receiveConnectionExit(model, exit_event),
+        .mcp_exit => |exit_event| {
+            const was_call = model.mcp_operation == .call;
+            const completed = receiveMcpExit(model, exit_event, fx);
+            if (was_call or model.settings_open) {
+                model.showToast(if (completed and was_call)
+                    "Tool result inserted"
+                else if (completed)
+                    "MCP tools refreshed"
+                else
+                    "MCP request failed", fx);
+            }
+            for (model.mcp_servers[0..model.mcp_server_count]) |server| {
+                if (server.enabled and server.state == .idle) {
+                    _ = startMcpHelper(model, server.id, null, fx);
+                    break;
+                }
+            }
+        },
+        .mcp_timeout => |timer| {
+            if (timer.key != mcp_timeout_key or model.mcp_operation == .none) return;
+            fx.cancel(mcp_helper_key);
+        },
         .stream_flush => |timer| {
             const thread_id = streamFlushThreadId(timer.key) orelse return;
             const thread = model.threadById(thread_id) orelse return;
@@ -3488,6 +3801,9 @@ fn restoreUserMessageToDraft(model: *Model, thread: *Thread, user_index: usize) 
     }
     thread.draft_attachment_count = attachment_count;
     thread.messages[user_index].attachment_count = 0;
+    var removed_cost: u64 = 0;
+    for (thread.messages[user_index..thread.message_count]) |message| removed_cost +|= message.cost_micros;
+    thread.total_cost_micros -|= removed_cost;
     for (thread.messages[user_index..thread.message_count]) |*message| message.deinit(model.allocator);
     thread.message_count = user_index;
     thread.stream_message_index = null;
@@ -3555,7 +3871,7 @@ fn copyMessage(model: *Model, message_id: u32, fx: *Effects) void {
             .text = message.content(),
             .on_result = Effects.clipboardMsg(.clipboard_result),
         });
-        thread.setStatus("Response copied");
+        model.showToast("Response copied", fx);
         return;
     }
 }
@@ -3582,10 +3898,7 @@ fn createForks(model: *Model, fx: *Effects) void {
             if (!target.appendClonedMessage(model.allocator, &model.next_message_id, message)) return;
         }
         Model.configureThreadModel(target, option.choice, custom_slug);
-        var title_buffer: [max_thread_title_bytes]u8 = undefined;
-        const model_label = if (option.choice == .custom) custom_slug else option.label;
-        const title = std.fmt.bufPrint(&title_buffer, "{s} · {s}", .{ source.title(), model_label }) catch "Forked chat";
-        target.setTitle(title);
+        target.setTitle(source.title());
         if (seed.len > 0) target.draft_buffer.set(seed);
         if (first_thread_id == 0) first_thread_id = thread_id;
         if (seed.len > 0) sendThread(model, target, fx);
@@ -3686,11 +3999,171 @@ fn receiveConnectionExit(model: *Model, exit_event: native_sdk.EffectExit) void 
     }
 }
 
+fn startMcpHelper(model: *Model, server_id: u32, tool_index: ?usize, fx: *Effects) bool {
+    if (model.mcp_operation != .none or model.executable_path_len == 0) return false;
+    const server = model.mcpServerById(server_id) orelse return false;
+    if (!server.enabled) return false;
+    var input_storage: [native_sdk.max_effect_stdin_bytes]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&input_storage);
+    const mode: mcp.HelperMode = if (tool_index == null) .discover else .call;
+    const tool_name = if (tool_index) |index| model.mcp_tools[index].name() else "";
+    const arguments = if (tool_index != null) model.mcp_arguments_buffer.text() else "{}";
+    mcp.writeHelperInput(&writer, server.command(), tool_name, arguments) catch {
+        server.state = .failed;
+        server.setStatus("Command or arguments are too large");
+        return false;
+    };
+    fx.spawn(.{
+        .key = mcp_helper_key,
+        .argv = &.{ model.executablePath(), "--mcp-helper", @tagName(mode) },
+        .stdin = writer.buffered(),
+        .output = .collect,
+        .on_exit = Effects.exitMsg(.mcp_exit),
+    });
+    fx.startTimer(.{ .key = mcp_timeout_key, .interval_ms = mcp_timeout_ms, .on_fire = Effects.timerMsg(.mcp_timeout) });
+    model.mcp_operation = if (mode == .discover) .discover else .call;
+    model.mcp_operation_server_id = server_id;
+    model.mcp_operation_thread_id = model.active_thread_id;
+    server.state = .connecting;
+    server.setStatus(if (mode == .discover) "Discovering tools…" else "Running tool…");
+    return true;
+}
+
+fn receiveMcpExit(model: *Model, exit_event: native_sdk.EffectExit, fx: *Effects) bool {
+    if (exit_event.key != mcp_helper_key or model.mcp_operation == .none) return false;
+    fx.cancelTimer(mcp_timeout_key);
+    const operation = model.mcp_operation;
+    const server_id = model.mcp_operation_server_id;
+    const thread_id = model.mcp_operation_thread_id;
+    model.mcp_operation = .none;
+    model.mcp_operation_server_id = 0;
+    model.mcp_operation_thread_id = 0;
+    const server = model.mcpServerById(server_id) orelse return false;
+    if (exit_event.reason != .exited or exit_event.code != 0 or exit_event.output_truncated) {
+        server.state = .failed;
+        const detail = std.mem.trim(u8, exit_event.stderr_tail, " \t\r\n");
+        server.setStatus(if (exit_event.reason == .cancelled)
+            "Connection timed out"
+        else if (detail.len > 0)
+            detail[0..utf8PrefixLen(detail, 120)]
+        else
+            "MCP server could not complete the request");
+        return false;
+    }
+    switch (operation) {
+        .discover => {
+            var discovered: [mcp.max_tools]mcp.Tool = undefined;
+            const count = mcp.parseTools(model.allocator, exit_event.output, server_id, &discovered) catch {
+                server.state = .failed;
+                server.setStatus("Server returned an invalid tool list");
+                return false;
+            };
+            model.removeMcpToolsForServer(server_id);
+            const available = model.mcp_tools.len - model.mcp_tool_count;
+            const accepted = @min(count, available);
+            @memcpy(model.mcp_tools[model.mcp_tool_count..][0..accepted], discovered[0..accepted]);
+            model.mcp_tool_count += accepted;
+            server.tool_count = accepted;
+            server.state = .connected;
+            server.setStatus(if (accepted == count) "Connected" else "Connected · some tools omitted");
+            return true;
+        },
+        .call => {
+            if (!model.mcpToolSelected()) return false;
+            const tool = model.mcp_tools[model.mcp_selected_tool];
+            var result_storage: [mcp.max_result_bytes]u8 = undefined;
+            const result = mcp.formatCallResult(model.allocator, exit_event.output, &result_storage) catch {
+                server.state = .failed;
+                server.setStatus("Server returned an invalid tool result");
+                return false;
+            };
+            server.state = .connected;
+            server.setStatus("Connected");
+            if (result.is_error) {
+                const thread = model.threadById(thread_id) orelse return false;
+                thread.setStatus(result_storage[0..result.len]);
+                return false;
+            }
+            const thread = model.threadById(thread_id) orelse return false;
+            var draft_storage: [max_draft_bytes]u8 = undefined;
+            var draft_writer: std.Io.Writer = .fixed(&draft_storage);
+            const raw_existing = std.mem.trim(u8, thread.draft(), " \t\r\n");
+            const existing = if (std.mem.startsWith(u8, raw_existing, "/mcp ")) "" else raw_existing;
+            if (existing.len > 0) {
+                draft_writer.writeAll(existing) catch {};
+                draft_writer.writeAll("\n\n") catch {};
+            }
+            draft_writer.print("[MCP result · {s}.{s}]\n", .{ server.name(), tool.name() }) catch {};
+            const remaining = draft_storage.len - draft_writer.buffered().len;
+            const result_len = utf8PrefixLen(result_storage[0..result.len], remaining);
+            draft_writer.writeAll(result_storage[0..result_len]) catch {};
+            thread.draft_buffer.set(draft_writer.buffered());
+            model.markThreadDirty(thread.id);
+            model.settings_open = false;
+            model.mcp_selected_tool = std.math.maxInt(usize);
+            model.mcp_arguments_buffer.clear();
+            thread.clearStatus();
+            model.focusComposer();
+            return true;
+        },
+        .none => return false,
+    }
+}
+
 fn submitDraft(model: *Model, fx: *Effects) void {
+    if (startMcpDraft(model, fx)) return;
     const thread_id = model.active_thread_id;
     const before = model.next_message_id;
     send(model, fx);
     if (model.next_message_id != before) model.markMessageDirty(thread_id, before);
+}
+
+fn startMcpDraft(model: *Model, fx: *Effects) bool {
+    const thread = model.activeThread() orelse return false;
+    const draft = std.mem.trim(u8, thread.draft(), " \t\r\n");
+    if (!std.mem.startsWith(u8, draft, "/mcp ")) return false;
+    if (model.mcp_operation != .none) {
+        thread.setStatus("Another MCP request is already running");
+        return true;
+    }
+    var parts = std.mem.tokenizeScalar(u8, draft[5..], ' ');
+    const server_text = parts.next() orelse {
+        thread.setStatus("Use /mcp <server id> <tool name> <JSON object>");
+        return true;
+    };
+    const tool_name = parts.next() orelse {
+        thread.setStatus("Choose an MCP tool from Settings first");
+        return true;
+    };
+    const arguments = std.mem.trim(u8, parts.rest(), " \t\r\n");
+    const server_id = std.fmt.parseInt(u32, server_text, 10) catch {
+        thread.setStatus("The MCP server id is invalid");
+        return true;
+    };
+    var tool_index: ?usize = null;
+    for (model.mcp_tools[0..model.mcp_tool_count], 0..) |*tool, index| {
+        if (tool.server_id == server_id and std.mem.eql(u8, tool.name(), tool_name)) tool_index = index;
+    }
+    const index = tool_index orelse {
+        thread.setStatus("That MCP tool is no longer available; refresh it in Settings");
+        return true;
+    };
+    var parsed = std.json.parseFromSlice(std.json.Value, model.allocator, arguments, .{}) catch {
+        thread.setStatus("MCP arguments must be a valid JSON object");
+        return true;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        thread.setStatus("MCP arguments must be a JSON object");
+        return true;
+    }
+    model.mcp_arguments_buffer.set(arguments);
+    model.mcp_selected_tool = index;
+    if (startMcpHelper(model, server_id, index, fx))
+        thread.setStatus("Running MCP tool…")
+    else
+        thread.setStatus("Could not start the MCP tool");
+    return true;
 }
 
 fn searchModels(model: *Model, fx: *Effects) void {
@@ -4141,7 +4614,9 @@ fn finalizeResponseMetrics(model: *Model, thread: *Thread) void {
     message.latency_ms = @intCast(@min(elapsed, std.math.maxInt(u32)));
     message.prompt_tokens = thread.request_prompt_tokens;
     message.completion_tokens = thread.request_completion_tokens;
+    thread.total_cost_micros -|= message.cost_micros;
     message.cost_micros = thread.request_cost_micros;
+    thread.total_cost_micros +|= message.cost_micros;
 }
 
 fn receiveHarnessExit(model: *Model, exit_event: native_sdk.EffectExit, fx: *Effects) bool {
@@ -4536,6 +5011,14 @@ const SecureChatApp = struct {
             for (self.chat.model.snippets[0..self.chat.model.snippet_count], 0..) |*snippet, index| set.snippets[index] = persistence.SnippetRecord.from(snippet);
             if (self.persistence_worker.enqueueSnippets(set)) self.chat.model.snippets_dirty = false;
         }
+        if (self.chat.model.mcp_servers_dirty) {
+            var set = persistence.McpServerSet{};
+            set.count = self.chat.model.mcp_server_count;
+            for (self.chat.model.mcp_servers[0..self.chat.model.mcp_server_count], 0..) |*server, index| {
+                set.servers[index] = persistence.McpServerRecord.from(server);
+            }
+            if (self.persistence_worker.enqueueMcpServers(set)) self.chat.model.mcp_servers_dirty = false;
+        }
         const action = self.chat.model.credential_action;
         self.chat.model.credential_action = .none;
         if (!usesPersistentCredentialStore(self.chat.model.dev_mode)) {
@@ -4687,6 +5170,25 @@ const SecureChatApp = struct {
 // -------------------------------------------------------------------- app
 
 pub fn main(init: std.process.Init) !void {
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "--mcp-helper")) {
+        const mode = std.meta.stringToEnum(mcp.HelperMode, args[2]) orelse return error.InvalidArguments;
+        var input: [native_sdk.max_effect_stdin_bytes]u8 = undefined;
+        var input_len: usize = 0;
+        while (input_len < input.len) {
+            const slices: [1][]u8 = .{input[input_len..]};
+            const count = std.Io.File.stdin().readStreaming(init.io, &slices) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            if (count == 0) break;
+            input_len += count;
+        }
+        var output: std.Io.Writer.Allocating = .init(init.arena.allocator());
+        try mcp.runHelper(init.io, init.arena.allocator(), mode, input[0..input_len], &output.writer);
+        try std.Io.File.stdout().writeStreamingAll(init.io, output.written());
+        return;
+    }
     const api_key = init.environ_map.get("OPENROUTER_API_KEY") orelse "";
     const dev_mode_value = init.environ_map.get("SUPERCHAT_DEV_MODE") orelse "";
     const dev_mode = builtin.mode == .Debug or std.mem.eql(u8, dev_mode_value, "1") or std.ascii.eqlIgnoreCase(dev_mode_value, "true");
@@ -4741,6 +5243,9 @@ pub fn main(init: std.process.Init) !void {
         app_state.model = initialModelWithOptions(api_key, dev_mode, force_onboarding);
         try database.save(&app_state.model);
     }
+    var executable_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const executable_path_len = try std.process.executablePath(init.io, &executable_path_buffer);
+    app_state.model.setExecutablePath(executable_path_buffer[0..executable_path_len]);
     const persistence_worker = try persistence.Worker.create(std.heap.page_allocator, database, init.io);
     database_owned = false;
     var secure_app = SecureChatApp{ .inner = app_state.app(), .chat = app_state, .persistence_worker = persistence_worker };

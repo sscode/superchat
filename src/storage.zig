@@ -88,7 +88,7 @@ pub const Database = struct {
         errdefer database.close();
         try database.configure();
         const version = try database.schemaVersion();
-        if (version > 0 and version < 5) try database.backup(path, version);
+        if (version > 0 and version < 6) try database.backup(path, version);
         try database.migrate(version);
         return database;
     }
@@ -169,6 +169,13 @@ pub const Database = struct {
             \\  body TEXT NOT NULL,
             \\  position INTEGER NOT NULL
             \\);
+            \\CREATE TABLE IF NOT EXISTS mcp_servers (
+            \\  id INTEGER PRIMARY KEY,
+            \\  name TEXT NOT NULL UNIQUE,
+            \\  command TEXT NOT NULL,
+            \\  enabled INTEGER NOT NULL DEFAULT 1,
+            \\  position INTEGER NOT NULL
+            \\);
             \\COMMIT;
         );
         if (previous_version > 0 and previous_version < 4) {
@@ -178,7 +185,7 @@ pub const Database = struct {
             if (!try database.hasColumn("messages", "completion_tokens")) try database.exec("ALTER TABLE messages ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0;");
             if (!try database.hasColumn("messages", "cost_micros")) try database.exec("ALTER TABLE messages ADD COLUMN cost_micros INTEGER NOT NULL DEFAULT 0;");
         }
-        try database.exec("PRAGMA user_version = 5;");
+        try database.exec("PRAGMA user_version = 6;");
     }
 
     fn backup(database: *Database, path: []const u8, version: i64) Error!void {
@@ -472,6 +479,21 @@ pub const Database = struct {
         }
     }
 
+    pub fn replaceMcpServers(database: *Database, servers: anytype) Error!void {
+        try database.exec("DELETE FROM mcp_servers;");
+        const statement = try database.prepare("INSERT INTO mcp_servers(id,name,command,enabled,position) VALUES(?1,?2,?3,?4,?5);");
+        defer _ = c.sqlite3_finalize(statement);
+        for (servers, 0..) |*server, position| {
+            try bindInt(statement, 1, server.id);
+            try bindText(statement, 2, server.name());
+            try bindText(statement, 3, server.command());
+            try bindInt(statement, 4, @intFromBool(server.enabled));
+            try bindInt(statement, 5, position);
+            try stepDone(statement);
+            reset(statement);
+        }
+    }
+
     pub fn replaceAttachments(database: *Database, thread_id: u32, message_id: u32, attachments: anytype) Error!void {
         const clear = try database.prepare("DELETE FROM attachments WHERE thread_id=?1 AND message_id=?2;");
         defer _ = c.sqlite3_finalize(clear);
@@ -645,6 +667,7 @@ pub const Database = struct {
         try stepDone(meta);
         try database.savePreferences(model.notifications_enabled);
         try database.replaceSnippets(model.snippets[0..model.snippet_count]);
+        try database.replaceMcpServers(model.mcp_servers[0..model.mcp_server_count]);
         try database.exec("COMMIT;");
     }
 
@@ -668,7 +691,11 @@ pub const Database = struct {
         }
         if (model.project_count == 0) return false;
 
-        const threads = try database.prepare("SELECT id,project_id,title,archived_at_ms,draft,model_choice,model_slug,active_model FROM threads ORDER BY position,id;");
+        const threads = try database.prepare(
+            "SELECT t.id,t.project_id,t.title,t.archived_at_ms,t.draft,t.model_choice,t.model_slug,t.active_model," ++
+                "COALESCE((SELECT SUM(m.cost_micros) FROM messages AS m WHERE m.thread_id=t.id),0) " ++
+                "FROM threads AS t ORDER BY t.position,t.id;",
+        );
         defer _ = c.sqlite3_finalize(threads);
         while (true) {
             const result = c.sqlite3_step(threads);
@@ -687,6 +714,7 @@ pub const Database = struct {
             thread.model_choice = @enumFromInt(choice_value);
             thread.model_buffer.set(textColumn(threads, 6));
             setFixed(&thread.active_model_storage, &thread.active_model_len, textColumn(threads, 7));
+            thread.total_cost_micros = intColumn(u64, threads, 8);
             model.threads[model.thread_count] = thread;
             model.thread_count += 1;
         }
@@ -793,6 +821,25 @@ pub const Database = struct {
             model.next_snippet_id = @max(model.next_snippet_id, snippet.id +| 1);
         }
         model.ensureDefaultSnippets();
+        const mcp_servers = try database.prepare("SELECT id,name,command,enabled FROM mcp_servers ORDER BY position,id;");
+        defer _ = c.sqlite3_finalize(mcp_servers);
+        model.mcp_server_count = 0;
+        model.next_mcp_server_id = 1;
+        while (model.mcp_server_count < model.mcp_servers.len) {
+            const result = c.sqlite3_step(mcp_servers);
+            if (result == c.SQLITE_DONE) break;
+            if (result != c.SQLITE_ROW) return error.SqlFailed;
+            var server: @TypeOf(model.mcp_servers[0]) = .{
+                .id = intColumn(u32, mcp_servers, 0),
+                .enabled = c.sqlite3_column_int(mcp_servers, 3) != 0,
+            };
+            server.setName(textColumn(mcp_servers, 1));
+            server.setCommand(textColumn(mcp_servers, 2));
+            server.setStatus(if (server.enabled) "Not checked" else "Disabled");
+            model.mcp_servers[model.mcp_server_count] = server;
+            model.mcp_server_count += 1;
+            model.next_mcp_server_id = @max(model.next_mcp_server_id, server.id +| 1);
+        }
         return true;
     }
 
@@ -853,7 +900,7 @@ pub const Database = struct {
         var output: std.Io.Writer.Allocating = .init(allocator);
         defer output.deinit();
         const writer = &output.writer;
-        try writer.writeAll("{\"format\":\"superchat-workspace\",\"version\":1,\"meta\":");
+        try writer.writeAll("{\"format\":\"superchat-workspace\",\"version\":2,\"meta\":");
         const meta = try database.prepare("SELECT active_project_id,active_thread_id,next_project_id,next_thread_id,next_message_id FROM workspace_meta WHERE singleton=1;");
         defer _ = c.sqlite3_finalize(meta);
         if (c.sqlite3_step(meta) == c.SQLITE_ROW) {
@@ -967,6 +1014,25 @@ pub const Database = struct {
             try writer.writeAll(",\"body\":");
             try std.json.Stringify.value(textColumn(snippets, 2), .{}, writer);
             try writer.print(",\"position\":{d}}}", .{intColumn(usize, snippets, 3)});
+        }
+        try writer.writeAll("],\"mcp_servers\":[");
+        const mcp_servers = try database.prepare("SELECT id,name,command,enabled,position FROM mcp_servers ORDER BY position,id;");
+        defer _ = c.sqlite3_finalize(mcp_servers);
+        first = true;
+        while (true) {
+            const result = c.sqlite3_step(mcp_servers);
+            if (result == c.SQLITE_DONE) break;
+            if (result != c.SQLITE_ROW) return error.SqlFailed;
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.print("{{\"id\":{d},\"name\":", .{intColumn(u32, mcp_servers, 0)});
+            try std.json.Stringify.value(textColumn(mcp_servers, 1), .{}, writer);
+            try writer.writeAll(",\"command\":");
+            try std.json.Stringify.value(textColumn(mcp_servers, 2), .{}, writer);
+            try writer.print(",\"enabled\":{s},\"position\":{d}}}", .{
+                if (c.sqlite3_column_int(mcp_servers, 3) != 0) "true" else "false",
+                intColumn(usize, mcp_servers, 4),
+            });
         }
         try writer.writeAll("]}");
         try writeExport(io, path, output.written());

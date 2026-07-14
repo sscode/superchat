@@ -4,6 +4,7 @@
   "license": "MIT",
   "version": "0.1.0",
   "scripts": {
+    "postinstall": "node scripts/patch-native-sdk.mjs",
     "dev": "SUPERCHAT_DEV_MODE=1 native dev",
     "dev:onboarding": "SUPERCHAT_FORCE_ONBOARDING=1 native dev",
     "check": "native check --strict",
@@ -12,6 +13,6 @@
     "package:macos": "bash scripts/package-macos.sh"
   },
   "devDependencies": {
-    "@native-sdk/cli": "0.4.4"
+    "@native-sdk/cli": "^0.5.1"
   }
 }

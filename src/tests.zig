@@ -64,7 +64,7 @@ fn streamLine(model: *main.Model, fx: *main.Effects, key: u64, line: []const u8)
 fn removeTestDatabase(path: []const u8) void {
     std.Io.Dir.deleteFileAbsolute(testing.io, path) catch {};
     var buffer: [256]u8 = undefined;
-    for ([_][]const u8{ "-wal", "-shm", ".backup-v1", ".backup-v2", ".backup-v3", ".backup-v4" }) |suffix| {
+    for ([_][]const u8{ "-wal", "-shm", ".backup-v1", ".backup-v2", ".backup-v3", ".backup-v4", ".backup-v5" }) |suffix| {
         const sidecar = std.fmt.bufPrint(&buffer, "{s}{s}", .{ path, suffix }) catch continue;
         std.Io.Dir.deleteFileAbsolute(testing.io, sidecar) catch {};
     }
@@ -82,7 +82,7 @@ test "schema migrations create a recoverable pre-migration backup" {
     {
         var migrated = try main.workspace_storage.Database.open(path);
         defer migrated.close();
-        try testing.expectEqual(@as(i64, 5), try migrated.schemaVersion());
+        try testing.expectEqual(@as(i64, 6), try migrated.schemaVersion());
     }
     var backup = try std.Io.Dir.openFileAbsolute(testing.io, path ++ ".backup-v1", .{});
     backup.close(testing.io);
@@ -640,6 +640,7 @@ test "project chats are grouped directly beneath their project" {
     try testing.expectEqual(first_project, rows[0].id);
     try testing.expectEqualStrings(projectWithId(&model, first_project).name(), rows[0].title);
     try testing.expect(rows[1].prefix.len > 0);
+    try testing.expect(std.mem.indexOfScalar(u8, rows[1].prefix, '-') == null);
     try testing.expectEqual(first_project_thread, rows[1].id);
     try testing.expect(rows[2].prefix.len > 0);
     try testing.expectEqual(second_first_project_thread, rows[2].id);
@@ -670,6 +671,19 @@ test "loading repairs a stale active project from the active chat" {
     try testing.expect(main.normalizeLoadedWorkspace(&model));
     try testing.expectEqual(project_id, model.active_project_id);
     try testing.expectEqual(project_thread_id, model.active_thread_id);
+}
+
+test "loading removes model suffixes from legacy fork titles" {
+    var model = main.initialModel("test-key");
+    const legacy_title = "hi · Claude Sonnet 5";
+    const thread = activeThread(&model);
+    thread.model_choice = .claude_sonnet;
+    @memcpy(thread.title_storage[0..legacy_title.len], legacy_title);
+    thread.title_len = legacy_title.len;
+
+    try testing.expect(main.normalizeLoadedWorkspace(&model));
+    try testing.expectEqualStrings("hi", thread.title());
+    try testing.expect(model.persistence_structure_dirty);
 }
 
 test "projects and chats can be renamed without changing their identity" {
@@ -815,6 +829,7 @@ test "SQLite restores the workspace after reopening and purges expired archives"
     const persisted_thread_id = model.active_thread_id;
     try testing.expect(model.appendMessage(.user, "Persist this conversation"));
     try testing.expect(model.appendMessage(.assistant, "Stored locally in SQLite."));
+    activeThread(model).messages[1].cost_micros = 789;
     activeThread(model).draft_buffer.set("An unfinished local draft");
     main.update(model, .{ .select_model = .gemini }, &fx);
     main.update(model, .open_rename_project, &fx);
@@ -830,7 +845,7 @@ test "SQLite restores the workspace after reopening and purges expired archives"
     {
         var database = try main.workspace_storage.Database.open(path);
         defer database.close();
-        try testing.expectEqual(@as(i64, 5), try database.schemaVersion());
+        try testing.expectEqual(@as(i64, 6), try database.schemaVersion());
         try database.save(model);
     }
 
@@ -849,6 +864,7 @@ test "SQLite restores the workspace after reopening and purges expired archives"
         try testing.expectEqual(main.ModelChoice.gemini, thread.model_choice);
         try testing.expectEqual(@as(usize, 2), thread.message_count);
         try testing.expectEqualStrings("Stored locally in SQLite.", thread.messages[1].content());
+        try testing.expectEqual(@as(u64, 789), thread.total_cost_micros);
         try testing.expect(!restored.notifications_enabled);
         try testing.expect(projectWithId(restored, archived_project_id).isArchived());
 
@@ -957,6 +973,11 @@ test "complete SQLite exports include full chat history and a portable workspace
     assistant.prompt_tokens = 12;
     assistant.completion_tokens = 34;
     assistant.cost_micros = 456;
+    var mcp_server = main.workspace_mcp.Server{ .id = 1 };
+    mcp_server.setName("Local tools");
+    mcp_server.setCommand("local-tools --stdio");
+    model.mcp_servers[0] = mcp_server;
+    model.mcp_server_count = 1;
 
     var database = try main.workspace_storage.Database.open(database_path);
     defer database.close();
@@ -972,7 +993,10 @@ test "complete SQLite exports include full chat history and a portable workspace
     const json = try std.Io.Dir.cwd().readFileAlloc(testing.io, json_path, testing.allocator, .limited(256 * 1024));
     defer testing.allocator.free(json);
     try testing.expect(std.mem.indexOf(u8, json, "\"format\":\"superchat-workspace\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"version\":2") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"snippets\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"mcp_servers\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "local-tools --stdio") != null);
     try testing.expect(std.mem.indexOf(u8, json, "Export this question") != null);
 }
 
@@ -1192,7 +1216,7 @@ test "assistant responses can be copied as a whole" {
     const request = fx.pendingClipboardAt(0) orelse return error.TestExpectedClipboardWrite;
     try testing.expectEqual(native_sdk.EffectClipboardOp.write, request.op);
     try testing.expectEqualStrings("A complete response to copy.", request.text);
-    try testing.expectEqualStrings("Response copied", activeThread(&model).status_storage[0..activeThread(&model).status_len]);
+    try testing.expectEqualStrings("Response copied", model.toastText());
 }
 
 test "one response can fork into several model-specific chats" {
@@ -1229,6 +1253,7 @@ test "one response can fork into several model-specific chats" {
     try testing.expectEqual(@as(usize, 2), fx.activeCount());
     const gpt_thread = activeThread(&model);
     try testing.expectEqual(main.ModelChoice.gpt, gpt_thread.model_choice);
+    try testing.expectEqualStrings("Design the API", gpt_thread.title());
     try testing.expect(gpt_thread.sending);
     try testing.expectEqual(@as(usize, 3), gpt_thread.message_count);
     try testing.expectEqualStrings("Start with a small provider interface.", gpt_thread.messages[1].content());
@@ -1364,6 +1389,7 @@ test "the global shortcut map reaches creation navigation focus and settings" {
         main.cmd_load_older,
         main.cmd_move_thread,
         main.cmd_snippets,
+        main.cmd_mcp_tools,
         main.cmd_export_thread,
         main.cmd_export_workspace,
         main.cmd_settings,
@@ -1414,6 +1440,85 @@ test "the global shortcut map reaches creation navigation focus and settings" {
     try testing.expect(model.settings_open);
     main.update(&model, main.onCommand(main.cmd_close_overlay).?, &fx);
     try testing.expect(!model.settings_open and !model.model_picker_open);
+}
+
+test "MCP servers persist and discovered tools become keyboard-editable composer commands" {
+    const path = "/tmp/superchat-mcp.sqlite3";
+    removeTestDatabase(path);
+    defer removeTestDatabase(path);
+
+    var model = main.initialModel("test-key");
+    defer model.deinit();
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    model.mcp_server_name_buffer.set("Weather");
+    model.mcp_server_command_buffer.set("weather-mcp --stdio");
+    main.update(&model, .add_mcp_server, &fx);
+    try testing.expectEqual(@as(usize, 1), model.mcp_server_count);
+
+    const response =
+        \\{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"forecast","title":"Forecast","description":"Get a forecast","inputSchema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]}}
+    ;
+    model.mcp_tool_count = try main.workspace_mcp.parseTools(testing.allocator, response, model.mcp_servers[0].id, &model.mcp_tools);
+    model.settings_open = true;
+    main.update(&model, .{ .select_mcp_tool = 0 }, &fx);
+    try testing.expectEqualStrings("/mcp 1 forecast {}", activeThread(&model).draft());
+    try testing.expect(!model.settings_open);
+
+    {
+        var database = try main.workspace_storage.Database.open(path);
+        defer database.close();
+        try database.save(&model);
+    }
+    var restored = main.initialModel("test-key");
+    defer restored.deinit();
+    {
+        var database = try main.workspace_storage.Database.open(path);
+        defer database.close();
+        try testing.expect(try database.load(&restored));
+    }
+    try testing.expectEqual(@as(usize, 1), restored.mcp_server_count);
+    try testing.expectEqualStrings("Weather", restored.mcp_servers[0].name());
+    try testing.expectEqualStrings("weather-mcp --stdio", restored.mcp_servers[0].command());
+}
+
+test "MCP composer commands launch the bounded helper with explicit JSON arguments" {
+    var model = main.initialModel("test-key");
+    defer model.deinit();
+    model.setExecutablePath("/tmp/superchat");
+    var server = main.workspace_mcp.Server{ .id = 3 };
+    server.setName("Weather");
+    server.setCommand("weather-mcp --stdio");
+    model.mcp_servers[0] = server;
+    model.mcp_server_count = 1;
+    const response =
+        \\{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"forecast","inputSchema":{"type":"object"}}]}}
+    ;
+    model.mcp_tool_count = try main.workspace_mcp.parseTools(testing.allocator, response, 3, &model.mcp_tools);
+    activeThread(&model).draft_buffer.set("/mcp 3 forecast {\"city\":\"Melbourne\"}");
+
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    main.update(&model, .send, &fx);
+
+    const request = fx.pendingSpawnAt(0) orelse return error.TestExpectedSpawn;
+    try testing.expectEqualStrings("/tmp/superchat", request.argv[0]);
+    try testing.expectEqualStrings("--mcp-helper", request.argv[1]);
+    try testing.expectEqualStrings("call", request.argv[2]);
+    try testing.expect(std.mem.indexOf(u8, request.stdin, "\"tool\":\"forecast\"") != null);
+    try testing.expect(std.mem.indexOf(u8, request.stdin, "\"city\":\"Melbourne\"") != null);
+    try testing.expectEqual(main.McpOperation.call, model.mcp_operation);
+
+    main.update(&model, .{ .mcp_exit = .{
+        .key = request.key,
+        .code = 0,
+        .output = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"18 C and sunny\"}],\"isError\":false}}",
+    } }, &fx);
+    try testing.expectEqual(main.McpOperation.none, model.mcp_operation);
+    try testing.expect(std.mem.indexOf(u8, activeThread(&model).draft(), "[MCP result · Weather.forecast]") != null);
+    try testing.expect(std.mem.indexOf(u8, activeThread(&model).draft(), "18 C and sunny") != null);
 }
 
 test "number shortcuts select top-level chats projects threads and models" {
@@ -1526,6 +1631,14 @@ test "OpenRouter usage and timing are attached to the assistant response" {
     try testing.expectEqual(@as(u32, 21), assistant.prompt_tokens);
     try testing.expectEqual(@as(u32, 8), assistant.completion_tokens);
     try testing.expectEqual(@as(u64, 1250), assistant.cost_micros);
+    try testing.expectEqual(@as(u64, 1250), activeThread(&model).total_cost_micros);
+    const connection_label = model.headerConnectionLabel(testing.allocator);
+    defer testing.allocator.free(connection_label);
+    try testing.expectEqualStrings("Connected · openai/measured", connection_label);
+    const cost_label = model.threadCostLabel(testing.allocator);
+    defer testing.allocator.free(cost_label);
+    try testing.expectEqualStrings("Thread · $0.001250", cost_label);
+    try testing.expect(!model.statusVisible());
 }
 
 test "modal forms can submit without a mouse" {
@@ -1535,13 +1648,14 @@ test "modal forms can submit without a mouse" {
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "on-submit=\"create_forks\"") != null);
 }
 
-test "modal layouts fit the minimum window and long archives scroll" {
-    try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"520\"") == null);
+test "modal layouts fit the 560 point minimum window and long content scrolls" {
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"610\"") == null);
-    try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"500\"") == null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"530\"") == null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"560\"") == null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"520\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Archived items\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Command palette\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Settings and keyboard shortcuts\"") != null);
 }
 
 test "first-run onboarding is bypassed by credentials completion or dev mode" {
