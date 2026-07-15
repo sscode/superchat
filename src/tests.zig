@@ -261,7 +261,7 @@ test "the empty and populated views build and lay out" {
     var model = main.initialModel("");
     var tree = try buildTree(arena_state.allocator(), &model);
     try testing.expect(findByKind(tree.root, .textarea) != null);
-    try testing.expect(findByKind(tree.root, .status_bar) != null);
+    try testing.expect(findByKind(tree.root, .input_group) != null);
 
     var nodes: [240]canvas.WidgetLayoutNode = undefined;
     const empty_layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, main.window_width, main.window_height), &nodes);
@@ -273,7 +273,7 @@ test "the empty and populated views build and lay out" {
     try testing.expect(model.appendMessage(.assistant, "Yes — with **Markdown** too."));
     _ = arena_state.reset(.retain_capacity);
     tree = try buildTree(arena_state.allocator(), &model);
-    try testing.expect(findByKind(tree.root, .bubble) != null);
+    try testing.expect(findByKind(tree.root, .avatar) != null);
 }
 
 test "the release-compiled view builds and lays out" {
@@ -1147,7 +1147,7 @@ test "GitHub release responses expose a newer version in Settings" {
     } }, &fx);
     try testing.expectEqual(main.UpdateState.failed, model.update_state);
     try testing.expect(!model.updateAvailable());
-    try testing.expect(std.mem.indexOf(u8, main.app_markup, ">Update available</button>") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "A Superchat update is available") != null);
 }
 
 test "background responses return to their owning thread while navigation stays live" {
@@ -1643,7 +1643,7 @@ test "OpenRouter usage and timing are attached to the assistant response" {
     try testing.expectEqual(@as(u64, 1250), activeThread(&model).total_cost_micros);
     const connection_label = model.headerConnectionLabel(testing.allocator);
     defer testing.allocator.free(connection_label);
-    try testing.expectEqualStrings("Last response · openai/measured", connection_label);
+    try testing.expectEqualStrings("openai/measured", connection_label);
     const cost_label = model.threadCostLabel(testing.allocator);
     defer testing.allocator.free(cost_label);
     try testing.expectEqualStrings("Thread · $0.001250", cost_label);
@@ -1657,11 +1657,11 @@ test "modal forms can submit without a mouse" {
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "on-submit=\"create_forks\"") != null);
 }
 
-test "modal layouts fit the 560 point minimum window and long content scrolls" {
-    try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"610\"") == null);
-    try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"530\"") == null);
-    try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"560\"") == null);
-    try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"520\"") != null);
+test "modal layouts fit the 680 point minimum window and long content scrolls" {
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"700\"") == null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"680\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"640\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"580\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Archived items\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Command palette\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Settings\"") != null);

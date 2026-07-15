@@ -232,6 +232,25 @@ pub const Message = struct {
         return message.response_model_storage[0..message.response_model_len];
     }
 
+    pub fn responseLabel(message: *const Message) []const u8 {
+        return if (message.response_model_len > 0) message.responseModel() else "Superchat";
+    }
+
+    pub fn responseMeta(message: *const Message, arena: std.mem.Allocator) []const u8 {
+        if (message.latency_ms == 0 and message.cost_micros == 0) return "";
+        if (message.latency_ms > 0 and message.cost_micros > 0) {
+            const seconds = @as(f64, @floatFromInt(message.latency_ms)) / 1000.0;
+            const cost = @as(f64, @floatFromInt(message.cost_micros)) / 1_000_000.0;
+            return std.fmt.allocPrint(arena, "{d:.1}s · ${d:.4}", .{ seconds, cost }) catch "";
+        }
+        if (message.latency_ms > 0) {
+            const seconds = @as(f64, @floatFromInt(message.latency_ms)) / 1000.0;
+            return std.fmt.allocPrint(arena, "{d:.1}s", .{seconds}) catch "";
+        }
+        const cost = @as(f64, @floatFromInt(message.cost_micros)) / 1_000_000.0;
+        return std.fmt.allocPrint(arena, "${d:.4}", .{cost}) catch "";
+    }
+
     pub fn hasAttachments(message: *const Message) bool {
         return message.attachment_count > 0;
     }
@@ -475,6 +494,8 @@ pub const ThreadRow = struct {
     id: u32,
     title: []const u8,
     selected: bool,
+    sending: bool,
+    unread: bool,
 };
 
 pub const ProjectSidebarRow = struct {
@@ -484,6 +505,8 @@ pub const ProjectSidebarRow = struct {
     prefix: []const u8,
     is_project: bool,
     selected: bool,
+    sending: bool,
+    unread: bool,
 };
 
 pub const ShortcutHint = struct {
@@ -1174,6 +1197,7 @@ pub const Model = struct {
         "pending_attachment_count",
         "next_attachment_read_key",
         "file_picker_requested",
+        "header_height",
         "clear_confirm_thread_id",
         "delete_kind",
         "delete_id",
@@ -1184,6 +1208,7 @@ pub const Model = struct {
         "modelOptions",
         "activeModelChoice",
         "archiveEmpty",
+        "cannotStop",
     };
 
     pub const quickModels = [_]QuickModel{
@@ -1265,21 +1290,17 @@ pub const Model = struct {
         .{ .id = .new_thread, .label = "New top-level chat", .shortcut = "Cmd + N" },
         .{ .id = .new_project_thread, .label = "New chat in project", .shortcut = "Cmd + Opt + N" },
         .{ .id = .move_thread, .label = "Move current chat", .shortcut = "Cmd + Shift + M" },
-        .{ .id = .attach, .label = "Attach files", .shortcut = "Cmd + U" },
         .{ .id = .tools, .label = "MCP tools", .shortcut = "Cmd + Opt + T" },
         .{ .id = .snippets, .label = "Prompt snippets", .shortcut = "Cmd + Opt + P" },
-        .{ .id = .export_thread, .label = "Export current chat", .shortcut = "Cmd + Shift + S" },
-        .{ .id = .export_workspace, .label = "Export workspace backup", .shortcut = "Cmd + Opt + Shift + S" },
-        .{ .id = .archive, .label = "Open archive", .shortcut = "Cmd + Shift + H" },
-        .{ .id = .settings, .label = "Settings", .shortcut = "Sidebar" },
     };
 
     pub fn paletteWorkspaceRows(model: *const Model, arena: std.mem.Allocator) []const PaletteWorkspaceRow {
         const rows = arena.alloc(PaletteWorkspaceRow, max_palette_workspace_results) catch return &.{};
         const query = std.mem.trim(u8, model.model_search_buffer.text(), " \t\r\n");
+        const result_limit: usize = if (query.len == 0) 4 else rows.len;
         var count: usize = 0;
         for (model.threads[0..model.thread_count]) |*thread| {
-            if (count == rows.len or thread.isArchived()) break;
+            if (count == result_limit or thread.isArchived()) break;
             const project = model.projectByIdConst(thread.project_id) orelse continue;
             if (project.isArchived()) continue;
             if (query.len > 0 and std.ascii.indexOfIgnoreCase(thread.title(), query) == null and std.ascii.indexOfIgnoreCase(project.name(), query) == null) continue;
@@ -1290,8 +1311,8 @@ pub const Model = struct {
             };
             count += 1;
         }
-        if (count < rows.len) for (model.projects[0..model.project_count]) |*project| {
-            if (count == rows.len) break;
+        if (count < result_limit) for (model.projects[0..model.project_count]) |*project| {
+            if (count == result_limit) break;
             if (project.id == chats_project_id or project.isArchived()) continue;
             if (query.len > 0 and std.ascii.indexOfIgnoreCase(project.name(), query) == null) continue;
             rows[count] = .{ .key = project.id, .title = project.name(), .detail = "Project" };
@@ -1568,7 +1589,9 @@ pub const Model = struct {
                 .title = project.name(),
                 .prefix = "",
                 .is_project = true,
-                .selected = project.id == model.active_project_id,
+                .selected = false,
+                .sending = false,
+                .unread = false,
             };
             count += 1;
             for (model.threads[0..model.thread_count]) |*thread| {
@@ -1576,15 +1599,12 @@ pub const Model = struct {
                 out[count] = .{
                     .key = (@as(u64, 1) << 32) | thread.id,
                     .id = thread.id,
-                    .title = if (thread.sending)
-                        std.fmt.allocPrint(arena, "{s} · responding", .{thread.title()}) catch thread.title()
-                    else if (thread.unread)
-                        std.fmt.allocPrint(arena, "{s} · new", .{thread.title()}) catch thread.title()
-                    else
-                        thread.title(),
+                    .title = thread.title(),
                     .prefix = "    ",
                     .is_project = false,
                     .selected = thread.id == model.active_thread_id,
+                    .sending = thread.sending,
+                    .unread = thread.unread,
                 };
                 count += 1;
             }
@@ -1599,13 +1619,10 @@ pub const Model = struct {
             if (thread.project_id != chats_project_id or thread.isArchived()) continue;
             out[count] = .{
                 .id = thread.id,
-                .title = if (thread.sending)
-                    std.fmt.allocPrint(arena, "{s} · responding", .{thread.title()}) catch thread.title()
-                else if (thread.unread)
-                    std.fmt.allocPrint(arena, "{s} · new", .{thread.title()}) catch thread.title()
-                else
-                    thread.title(),
+                .title = thread.title(),
                 .selected = thread.id == model.active_thread_id,
+                .sending = thread.sending,
+                .unread = thread.unread,
             };
             count += 1;
         }
@@ -1617,6 +1634,12 @@ pub const Model = struct {
             if (thread.id == model.active_thread_id) return thread.title();
         }
         return "New chat";
+    }
+
+    pub fn activeThreadContext(model: *const Model) []const u8 {
+        const thread = model.activeThreadConst() orelse return "Local conversation";
+        const project = model.projectByIdConst(thread.project_id) orelse return "Local conversation";
+        return if (project.id == chats_project_id) "Top-level chat" else project.name();
     }
 
     pub fn cannotAddProject(model: *const Model) bool {
@@ -1720,7 +1743,7 @@ pub const Model = struct {
         const thread = model.activeThreadConst() orelse return "No model connection";
         if (thread.active_model_len > 0) {
             const active_model = thread.active_model_storage[0..thread.active_model_len];
-            return std.fmt.allocPrint(arena, "Last response · {s}", .{active_model}) catch active_model;
+            return std.fmt.allocPrint(arena, "{s}", .{active_model}) catch active_model;
         }
         return switch (thread.model_choice) {
             .codex_subscription => switch (model.codex_connection) {
@@ -2004,15 +2027,21 @@ pub const Model = struct {
         const capacity = modelOptions.len - @intFromBool(!include_custom) - @intFromBool(!model.dev_mode);
         const rows = arena.alloc(ForkModelRow, capacity) catch return &.{};
         var count: usize = 0;
-        for (modelOptions) |option| {
-            if (option.choice == .custom and !include_custom) continue;
-            if (option.choice == .claude_subscription and !model.dev_mode) continue;
-            rows[count] = .{
-                .choice = option.choice,
-                .label = if (option.choice == .custom) source.?.modelName() else option.label,
-                .selected = model.fork_model_mask & forkChoiceBit(option.choice) != 0,
-            };
-            count += 1;
+        // Keep the source model visible at the top of the branch panel; the
+        // full catalog can remain scrollable without hiding the current choice.
+        for ([_]bool{ true, false }) |selected_pass| {
+            for (modelOptions) |option| {
+                if (option.choice == .custom and !include_custom) continue;
+                if (option.choice == .claude_subscription and !model.dev_mode) continue;
+                const selected = model.fork_model_mask & forkChoiceBit(option.choice) != 0;
+                if (selected != selected_pass) continue;
+                rows[count] = .{
+                    .choice = option.choice,
+                    .label = if (option.choice == .custom) source.?.modelName() else option.label,
+                    .selected = selected,
+                };
+                count += 1;
+            }
         }
         return rows[0..count];
     }
@@ -2023,7 +2052,7 @@ pub const Model = struct {
 
     pub fn forkCountLabel(model: *const Model, arena: std.mem.Allocator) []const u8 {
         const count = model.forkCount();
-        return std.fmt.allocPrint(arena, "Create {d} {s}", .{ count, if (count == 1) "chat" else "chats" }) catch "Create forks";
+        return std.fmt.allocPrint(arena, "Create {d} {s}", .{ count, if (count == 1) "branch" else "branches" }) catch "Create branches";
     }
 
     pub fn cannotCreateForks(model: *const Model) bool {
