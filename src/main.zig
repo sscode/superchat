@@ -21,10 +21,10 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 const canvas_label = "chat-canvas";
-pub const window_width: f32 = 940;
-pub const window_height: f32 = 680;
-pub const window_min_width: f32 = 720;
-pub const window_min_height: f32 = 480;
+pub const window_width: f32 = 1280;
+pub const window_height: f32 = 820;
+pub const window_min_width: f32 = 1000;
+pub const window_min_height: f32 = 680;
 pub const header_natural_height: f32 = 56;
 
 const openrouter_url = "https://openrouter.ai/api/v1/chat/completions";
@@ -114,7 +114,7 @@ const shell_windows = [_]native_sdk.ShellWindow{.{
     .min_height = window_min_height,
     .restore_state = true,
     .restore_policy = .center_on_primary,
-    .titlebar = .standard,
+    .titlebar = .hidden_inset_tall,
     .views = &shell_views,
 }};
 const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
@@ -233,7 +233,7 @@ pub const Message = struct {
     }
 
     pub fn responseLabel(message: *const Message) []const u8 {
-        return if (message.response_model_len > 0) message.responseModel() else "Superchat";
+        return if (message.response_model_len > 0) message.responseModel() else "Assistant";
     }
 
     pub fn responseMeta(message: *const Message, arena: std.mem.Allocator) []const u8 {
@@ -839,6 +839,8 @@ pub const Msg = union(enum) {
     close_shortcuts,
     toggle_project_menu,
     close_project_menu,
+    toggle_thread_menu,
+    close_thread_menu,
     save_settings,
     remove_api_key,
     connect_codex,
@@ -1014,6 +1016,7 @@ pub const Model = struct {
     settings_open: bool = false,
     shortcuts_open: bool = false,
     project_menu_open: bool = false,
+    thread_menu_open: bool = false,
     onboarding_open: bool = false,
     dev_mode: bool = false,
     force_onboarding: bool = false,
@@ -1063,6 +1066,8 @@ pub const Model = struct {
     composer_focus_flip: bool = false,
     credential_action: CredentialAction = .none,
     header_height: f32 = header_natural_height,
+    header_inset_left: f32 = 0,
+    header_inset_right: f32 = 0,
     toast_storage: [max_toast_bytes]u8 = undefined,
     toast_len: usize = 0,
     notifications_enabled: bool = true,
@@ -1197,7 +1202,6 @@ pub const Model = struct {
         "pending_attachment_count",
         "next_attachment_read_key",
         "file_picker_requested",
-        "header_height",
         "clear_confirm_thread_id",
         "delete_kind",
         "delete_id",
@@ -1209,6 +1213,11 @@ pub const Model = struct {
         "activeModelChoice",
         "archiveEmpty",
         "cannotStop",
+        "activeThreadContext",
+        "headerConnectionLabel",
+        "hasThreadCost",
+        "threadCostLabel",
+        "statusVisible",
     };
 
     pub const quickModels = [_]QuickModel{
@@ -2206,6 +2215,10 @@ pub const Model = struct {
 
     pub fn statusVisible(model: *const Model) bool {
         return model.statusLine().len > 0;
+    }
+
+    pub fn statusNeedsAttention(model: *const Model) bool {
+        return model.statusVisible() and !model.missingKey();
     }
 
     fn setApiKey(model: *Model, key: []const u8) void {
@@ -3367,6 +3380,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.clearApiKeyInput();
             model.shortcuts_open = false;
             model.project_menu_open = false;
+            model.thread_menu_open = false;
             model.settings_open = true;
         },
         .close_settings => {
@@ -3383,14 +3397,22 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.move_open = false;
             model.clear_confirm_thread_id = 0;
             model.project_menu_open = false;
+            model.thread_menu_open = false;
             model.shortcuts_open = true;
         },
         .close_shortcuts => model.shortcuts_open = false,
         .toggle_project_menu => {
             if (model.cannotManageProject()) return;
+            model.thread_menu_open = false;
             model.project_menu_open = !model.project_menu_open;
         },
         .close_project_menu => model.project_menu_open = false,
+        .toggle_thread_menu => {
+            if (model.active_thread_id == 0) return;
+            model.project_menu_open = false;
+            model.thread_menu_open = !model.thread_menu_open;
+        },
+        .close_thread_menu => model.thread_menu_open = false,
         .save_settings => {
             const thread = model.activeThread() orelse return;
             if (thread.model_buffer.isEmpty()) return;
@@ -3453,7 +3475,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             createForks(model, fx);
             for (model.threads[first_new_thread..model.thread_count]) |thread| model.markThreadMessagesDirty(thread.id);
         },
-        .open_rename_thread => model.openRename(.thread),
+        .open_rename_thread => {
+            model.thread_menu_open = false;
+            model.openRename(.thread);
+        },
         .open_rename_project => {
             model.project_menu_open = false;
             model.openRename(.project);
@@ -3468,6 +3493,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.rename_buffer.clear();
         },
         .open_move_thread => {
+            model.thread_menu_open = false;
             closeSearch(model, fx);
             model.openMoveThread();
         },
@@ -3553,6 +3579,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.showToast(if (success) "Export saved" else "Export failed", fx);
         },
         .archive_thread => {
+            model.thread_menu_open = false;
             if (model.archiveThread(fx)) {
                 model.showToast("Chat archived", fx);
                 model.markStructureDirty();
@@ -3689,6 +3716,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.settings_open = false;
             model.shortcuts_open = false;
             model.project_menu_open = false;
+            model.thread_menu_open = false;
             closeSearch(model, fx);
             model.fork_open = false;
             model.rename_open = false;
@@ -3703,6 +3731,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.settings_open = false;
             model.shortcuts_open = false;
             model.project_menu_open = false;
+            model.thread_menu_open = false;
             model.fork_open = false;
             model.rename_open = false;
             model.archive_open = false;
@@ -3850,6 +3879,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .chrome_changed => |chrome| {
             model.header_height = @max(header_natural_height, chrome.insets.top);
+            model.header_inset_left = chrome.insets.left;
+            model.header_inset_right = chrome.insets.right;
         },
     }
 }
@@ -5300,6 +5331,8 @@ pub fn main(init: std.process.Init) !void {
         .init_fx = initEffects,
         .on_chrome = onChrome,
         .on_command = onCommand,
+        .theme = runner.manifestThemePack(),
+        .theme_accent = runner.manifestThemeAccent(),
         .view = CompiledAppView.build,
         .markup = if (builtin.mode == .Debug)
             .{ .source = app_markup, .watch_path = "src/app.native", .io = init.io }

@@ -1,9 +1,17 @@
 <!-- A calm local workspace: navigation supports the work, the conversation is the artifact. -->
 <stack background="background">
   <row grow="1">
-    <column width="284" background="surface_subtle">
-      <row height="64" padding="16" gap="10" cross="center" label="Superchat navigation">
-        <text grow="1"><span scale="1.16" weight="bold">{brandLabel}</span></text>
+    <panel width="260" background="surface_subtle" border-color="surface_subtle" radius="sm">
+    <column grow="1">
+      <row height="{header_height}" padding="12" cross="center" window-drag="true" label="Window controls">
+        <spacer width="{header_inset_left}" />
+        <spacer grow="1" />
+      </row>
+      <row height="56" padding="16" gap="8" cross="center" label="Superchat navigation">
+        <text grow="1"><span scale="1.16" weight="bold">Superchat</span></text>
+        <if test="{dev_mode}">
+          <badge size="sm" variant="outline">Dev</badge>
+        </if>
         <if test="{updateAvailable}">
           <button size="sm" variant="ghost" icon="download" on-press="open_update" label="A Superchat update is available"></button>
         </if>
@@ -19,7 +27,7 @@
       <scroll grow="1" label="Chats and projects">
         <column padding="10" gap="2">
           <row padding="8" gap="4" cross="center">
-            <text size="sm" foreground="text_muted" grow="1"><span weight="medium">CHATS</span></text>
+            <text size="sm" foreground="text_muted" grow="1"><span weight="medium">Chats</span></text>
             <button size="sm" variant="ghost" icon="plus" on-press="new_thread" disabled="{cannotAddThread}" label="New top-level chat"></button>
           </row>
           <for each="topLevelThreadRows" key="id" as="t">
@@ -37,7 +45,7 @@
           </for>
 
           <row padding="8" gap="4" cross="center">
-            <text size="sm" foreground="text_muted" grow="1"><span weight="medium">PROJECTS</span></text>
+            <text size="sm" foreground="text_muted" grow="1"><span weight="medium">Projects</span></text>
             <stack width="28" height="28">
               <button size="sm" variant="ghost" icon="ellipsis" on-press="toggle_project_menu" disabled="{cannotManageProject}" label="Selected project actions"></button>
               <if test="{project_menu_open}">
@@ -75,69 +83,75 @@
       </scroll>
 
       <separator />
-      <row padding="12" gap="10" cross="center" background="surface">
+      <row padding="12" gap="8" cross="center" background="surface">
         <avatar size="sm">SC</avatar>
         <column gap="2" grow="1">
-          <text><span weight="medium">Local workspace</span></text>
-          <text size="sm" foreground="text_muted">Private on this Mac</text>
+          <text><span weight="medium">On this Mac</span></text>
+          <text size="sm" foreground="text_muted">Private workspace</text>
         </column>
         <button size="sm" variant="ghost" icon="terminal" on-press="open_shortcuts" label="Keyboard shortcuts, Command comma"></button>
         <button size="sm" variant="ghost" icon="settings" on-press="open_settings" label="Settings"></button>
       </row>
     </column>
+    </panel>
 
     <separator />
 
     <column grow="1" background="background">
-      <row height="72" padding="16" gap="10" cross="center">
-        <column gap="4" grow="1">
-          <row gap="8" cross="center">
-            <icon name="folder" width="18" height="18" foreground="text_muted" />
-            <text><span scale="1.12" weight="bold">{activeThreadTitle}</span></text>
-          </row>
-          <text size="sm" foreground="text_muted">{activeThreadContext} · {headerConnectionLabel}</text>
-        </column>
-        <if test="{hasThreadCost}">
-          <badge size="sm" variant="secondary">{threadCostLabel}</badge>
-        </if>
-        <button size="sm" variant="ghost" icon="edit" on-press="open_rename_thread" label="Rename chat"></button>
-        <button size="sm" variant="ghost" icon="archive" on-press="archive_thread" label="Archive chat"></button>
+      <row height="{header_height}" padding="16" gap="10" cross="center" window-drag="true">
+        <icon name="folder" width="18" height="18" foreground="text_muted" />
+        <text grow="1"><span scale="1.08" weight="bold">{activeThreadTitle}</span></text>
+        <stack width="28" height="28">
+          <button size="sm" variant="ghost" icon="ellipsis" on-press="toggle_thread_menu" label="Chat actions"></button>
+          <if test="{thread_menu_open}">
+            <dropdown-menu anchor="below" anchor-alignment="end" anchor-offset="6" width="190" height="124" on-dismiss="close_thread_menu" label="Chat actions">
+              <menu-item icon="edit" on-press="open_rename_thread">Rename chat</menu-item>
+              <menu-item icon="folder" on-press="open_move_thread">Move to project</menu-item>
+              <menu-item icon="archive" on-press="archive_thread">Archive chat</menu-item>
+            </dropdown-menu>
+          </if>
+        </stack>
+        <spacer width="{header_inset_right}" />
       </row>
       <separator />
 
       <scroll grow="1" label="Conversation">
         <row main="center">
-          <column width="720" padding="32" gap="32">
+          <column width="680" padding="32" gap="44">
             <if test="{canLoadOlder}">
-              <row main="center"><button size="sm" variant="outline" on-press="load_older">Load earlier messages</button></row>
+              <row main="center"><button size="sm" variant="ghost" on-press="load_older">Load earlier messages</button></row>
             </if>
             <if test="{hasMessages}">
               <for each="messageRows" key="id" as="m">
                 <if test="{m.isUser}">
-                  <column gap="10" padding="16" background="surface_subtle" radius="lg" label="You said">
-                    <row gap="8" cross="center">
-                      <text size="sm" foreground="text_muted" grow="1"><span weight="bold">You</span></text>
-                      <button size="sm" variant="ghost" foreground="text_muted" icon="edit" on-press="edit_message:{m.id}" label="Edit message"></button>
-                    </row>
-                    <text wrap="true">{m.content}</text>
-                    <if test="{m.hasAttachments}">
-                      <text size="sm" foreground="text_muted" wrap="true">{m.attachmentSummary}</text>
-                    </if>
-                  </column>
-                </if>
-                <else>
-                  <column gap="12" label="Assistant said">
-                    <row gap="10" cross="center">
-                      <avatar size="sm">S</avatar>
-                      <column gap="2" grow="1">
-                        <text><span weight="bold">{m.responseLabel}</span></text>
-                        <if test="{m.responseMeta}">
-                          <text size="sm" foreground="text_muted">{m.responseMeta}</text>
+                  <row main="end">
+                    <bubble padding="14" radius="lg" label="You said">
+                      <column gap="8">
+                        <row gap="8" cross="center">
+                          <text wrap="true" grow="1">{m.content}</text>
+                          <button size="sm" variant="ghost" foreground="text_muted" icon="edit" on-press="edit_message:{m.id}" label="Edit message"></button>
+                        </row>
+                        <if test="{m.hasAttachments}">
+                          <text size="sm" foreground="text_muted" wrap="true">{m.attachmentSummary}</text>
                         </if>
                       </column>
+                    </bubble>
+                  </row>
+                </if>
+                <else>
+                  <column gap="16" label="Assistant said">
+                    <row gap="8" cross="center">
+                      <if test="{m.responseMeta}">
+                        <text size="sm" foreground="text_muted"><span weight="medium">Worked for {m.responseMeta}</span></text>
+                      </if>
+                      <else>
+                        <text size="sm" foreground="text_muted"><span weight="medium">Response complete</span></text>
+                      </else>
+                      <text size="sm" foreground="text_muted">· {m.responseLabel}</text>
                     </row>
+                    <separator />
                     <markdown source="{m.content}" />
-                    <row gap="4">
+                    <row gap="2">
                       <button size="sm" variant="ghost" foreground="text_muted" icon="copy" on-press="copy_message:{m.id}" label="Copy full response">Copy</button>
                       <button size="sm" variant="ghost" foreground="text_muted" icon="refresh-cw" on-press="retry_message:{m.id}">Retry</button>
                       <button size="sm" variant="ghost" foreground="text_muted" icon="git-branch" on-press="open_fork:{m.id}" label="Fork from this response">Fork</button>
@@ -147,32 +161,34 @@
               </for>
             </if>
             <else>
-              <column gap="10" padding="32" cross="center">
-                <avatar size="lg">S</avatar>
-                <text size="heading" text-alignment="center">Start a conversation</text>
-                <text foreground="text_muted" wrap="true" text-alignment="center">Ask one model, then fork the strongest response to compare how others continue the thought.</text>
+              <column gap="8" padding="48" cross="center">
+                <text size="heading" text-alignment="center">What are you working on?</text>
+                <text foreground="text_muted" wrap="true" text-alignment="center">Start with one model. Branch the response when another perspective would help.</text>
               </column>
             </else>
             <if test="{sending}">
-              <row gap="10" padding="12" cross="center" background="surface_subtle" radius="md" label="Assistant is thinking">
-                <spinner size="sm" />
-                <text size="sm" foreground="text_muted">Working on the next response…</text>
-              </row>
+              <column gap="12" label="Assistant is thinking">
+                <row gap="10" cross="center">
+                  <spinner size="sm" />
+                  <text size="sm" foreground="text_muted"><span weight="medium">Working on the next response…</span></text>
+                </row>
+                <separator />
+              </column>
             </if>
           </column>
         </row>
       </scroll>
 
       <row main="center" background="background">
-        <column width="720" padding="16" gap="8">
+        <column width="640" padding="16" gap="8">
           <for each="draftAttachmentRows" key="index" as="a">
             <button size="sm" variant="outline" icon="x" on-press="remove_attachment:{a.index}" label="Remove {a.name}">{a.detail} · {a.name}</button>
           </for>
-          <input-group key="{composerKey}" height="132" label="Message">
+          <input-group key="{composerKey}" height="112" label="Message">
             <textarea text="{draft}" on-input="draft_edit" on-submit="composer_newline" autofocus="true" placeholder="Ask any model, or drop images and files…" label="Message" />
             <input-group-actions gap="8">
               <button size="sm" variant="ghost" icon="plus" on-press="open_file_picker" label="Attach images or files, Command U"></button>
-              <select size="sm" width="210" on-press="toggle_model_picker" label="Model for the next response">{selectedModelLabel}</select>
+              <select size="sm" width="190" on-press="toggle_model_picker" label="Model for the next response">{selectedModelLabel}</select>
               <spacer grow="1" />
               <if test="{missingKey}">
                 <button size="sm" variant="outline" icon="settings" on-press="open_settings">Connect</button>
@@ -185,11 +201,10 @@
               </else>
             </input-group-actions>
           </input-group>
-          <if test="{statusVisible}">
-            <row gap="8" padding="8" cross="center" background="surface_subtle" radius="md">
-              <icon name="info" width="16" height="16" foreground="text_muted" />
+          <if test="{statusNeedsAttention}">
+            <alert variant="outline" padding="10" label="Composer status">
               <text size="sm" foreground="text_muted" wrap="true">{statusLine}</text>
-            </row>
+            </alert>
           </if>
         </column>
       </row>
@@ -248,7 +263,7 @@
             <scroll grow="1" label="Commands, chats, projects, and models">
               <column gap="16">
                 <column padding="12" gap="8" background="surface_subtle" radius="lg">
-                  <text size="sm" foreground="text_muted"><span weight="bold">MODELS FOR THE NEXT RESPONSE</span></text>
+                  <text size="sm" foreground="text_muted"><span weight="medium">Models for the next response</span></text>
                   <grid columns="3" gap="6">
                     <for each="quickModels" as="q">
                       <button size="sm" variant="outline" on-press="select_quick_model:{q.number}" label="{q.slug}">{q.number} · {q.label}</button>
@@ -258,13 +273,13 @@
                   </grid>
                 </column>
                 <column padding="12" gap="6" background="surface_subtle" radius="lg">
-                  <text size="sm" foreground="text_muted"><span weight="bold">WORKSPACE</span></text>
+                  <text size="sm" foreground="text_muted"><span weight="medium">Workspace</span></text>
                   <for each="paletteWorkspaceRows" as="w">
                     <list-item size="sm" on-press="select_palette_workspace:{w.key}">{w.title} · {w.detail}</list-item>
                   </for>
                 </column>
                 <column padding="12" gap="8" background="surface_subtle" radius="lg">
-                  <text size="sm" foreground="text_muted"><span weight="bold">ACTIONS</span></text>
+                  <text size="sm" foreground="text_muted"><span weight="medium">Actions</span></text>
                   <grid columns="2" gap="6">
                     <for each="paletteActionRows" as="a">
                       <button size="sm" variant="ghost" on-press="palette_action:{a.id}">{a.label} · {a.shortcut}</button>
@@ -418,12 +433,12 @@
   <if test="{fork_open}">
     <panel background="scrim" on-press="close_fork" label="Fork conversation backdrop">
     <row main="end" cross="center" padding="24">
-    <dialog width="520" height="680" label="Fork conversation">
+    <sheet width="520" height="680" label="Compare with other models">
       <column padding="28" gap="18">
         <row gap="12" cross="center">
           <column gap="4" grow="1">
-            <text size="heading">Create model branches</text>
-            <text size="sm" foreground="text_muted">Compare continuations without losing your place.</text>
+            <text size="heading">Compare with other models</text>
+            <text size="sm" foreground="text_muted">Continue this conversation in parallel.</text>
           </column>
           <button size="sm" variant="ghost" icon="x" on-press="close_fork" label="Close branching panel"></button>
         </row>
@@ -434,16 +449,16 @@
             <text grow="1"><span weight="bold">{activeThreadTitle}</span></text>
             <badge size="sm" variant="secondary">Source</badge>
           </row>
-          <text size="sm" foreground="text_muted" wrap="true">Each branch includes the conversation through this response, then continues independently.</text>
+          <text size="sm" foreground="text_muted" wrap="true">Each branch starts after this response and continues independently.</text>
         </column>
 
         <column gap="8">
-          <text size="sm" foreground="text_muted"><span weight="bold">OPTIONAL FOLLOW-UP</span></text>
+          <text size="sm" foreground="text_muted"><span weight="medium">Shared follow-up</span></text>
           <textarea text="{forkSeed}" on-input="fork_seed_edit" on-submit="create_forks" height="108" placeholder="Give every selected model the same next instruction…" label="Branch follow-up message" />
         </column>
 
         <column gap="8" grow="1">
-          <text size="sm" foreground="text_muted"><span weight="bold">MODELS TO COMPARE</span></text>
+          <text size="sm" foreground="text_muted"><span weight="medium">Choose models</span></text>
           <scroll grow="1" label="Models available for branching">
             <column padding="10" gap="4" background="surface_subtle" radius="lg">
               <for each="forkModelRows" as="m">
@@ -460,7 +475,7 @@
           <button grow="2" variant="primary" icon="git-branch" on-press="create_forks" disabled="{cannotCreateForks}">{forkCountLabel}</button>
         </row>
       </column>
-    </dialog>
+    </sheet>
     </row>
     </panel>
   </if>
@@ -560,35 +575,41 @@
             </column>
 
             <grid columns="2" gap="12">
-              <column padding="16" gap="10" background="surface_subtle" radius="lg">
-                <row><avatar size="sm">C</avatar></row>
-                <text><span weight="bold">Codex</span></text>
-                <text size="sm" foreground="text_muted" wrap="true">Use the models included with your ChatGPT account.</text>
-                <spacer grow="1" />
-                <button size="sm" variant="outline" on-press="connect_codex" disabled="{codexConnectionBusy}">{codexConnectionButtonText}</button>
-              </column>
-              <column padding="16" gap="10" background="surface_subtle" radius="lg">
-                <row><avatar size="sm">A</avatar></row>
-                <text><span weight="bold">Claude</span></text>
-                <text size="sm" foreground="text_muted" wrap="true">Connect the experimental local Claude subscription bridge.</text>
-                <spacer grow="1" />
-                <button size="sm" variant="outline" on-press="connect_claude" disabled="{claudeSubscriptionDisabled}">{claudeConnectionButtonText}</button>
-              </column>
+              <card padding="16" background="surface_subtle">
+                <column gap="10">
+                  <row><avatar size="sm">C</avatar></row>
+                  <text><span weight="bold">Codex</span></text>
+                  <text size="sm" foreground="text_muted" wrap="true">Use the models included with your ChatGPT account.</text>
+                  <spacer grow="1" />
+                  <button size="sm" variant="outline" on-press="connect_codex" disabled="{codexConnectionBusy}">{codexConnectionButtonText}</button>
+                </column>
+              </card>
+              <card padding="16" background="surface_subtle">
+                <column gap="10">
+                  <row><avatar size="sm">A</avatar></row>
+                  <text><span weight="bold">Claude</span></text>
+                  <text size="sm" foreground="text_muted" wrap="true">Connect the experimental local Claude subscription bridge.</text>
+                  <spacer grow="1" />
+                  <button size="sm" variant="outline" on-press="connect_claude" disabled="{claudeSubscriptionDisabled}">{claudeConnectionButtonText}</button>
+                </column>
+              </card>
             </grid>
 
-            <column padding="16" gap="10" background="surface_subtle" radius="lg">
-              <row gap="8" cross="center">
-                <avatar size="sm">O</avatar>
-                <column gap="2" grow="1">
-                  <text><span weight="bold">OpenRouter API key</span></text>
-                  <text size="sm" foreground="text_muted">One key for the broader model catalog.</text>
-                </column>
-              </row>
-              <row gap="8" cross="end">
-                <text-field grow="1" text="{apiKeyField}" on-input="api_key_edit" on-submit="finish_onboarding" placeholder="sk-or-v1-…" autofocus="true" label="API key" />
-                <button variant="primary" on-press="finish_onboarding" disabled="{cannotFinishOnboarding}">Connect</button>
-              </row>
-            </column>
+            <card padding="16" background="surface_subtle">
+              <column gap="10">
+                <row gap="8" cross="center">
+                  <avatar size="sm">O</avatar>
+                  <column gap="2" grow="1">
+                    <text><span weight="bold">OpenRouter API key</span></text>
+                    <text size="sm" foreground="text_muted">One key for the broader model catalog.</text>
+                  </column>
+                </row>
+                <row gap="8" cross="end">
+                  <text-field grow="1" text="{apiKeyField}" on-input="api_key_edit" on-submit="finish_onboarding" placeholder="sk-or-v1-…" autofocus="true" label="API key" />
+                  <button variant="primary" on-press="finish_onboarding" disabled="{cannotFinishOnboarding}">Connect</button>
+                </row>
+              </column>
+            </card>
 
             <if test="{statusVisible}">
               <text size="sm" foreground="text_muted" wrap="true">{statusLine}</text>
@@ -605,10 +626,12 @@
 
   <if test="{toastVisible}">
     <column main="end" cross="center" padding="32">
-      <row padding="12" gap="8" cross="center" background="surface" radius="lg" label="Notification">
-        <icon name="check" width="18" height="18" foreground="success" />
-        <text size="sm"><span weight="medium">{toastText}</span></text>
-      </row>
+      <panel background="surface" radius="lg" label="Notification">
+        <row padding="12" gap="8" cross="center">
+          <icon name="check" width="18" height="18" foreground="success" />
+          <text size="sm"><span weight="medium">{toastText}</span></text>
+        </row>
+      </panel>
     </column>
   </if>
 </stack>

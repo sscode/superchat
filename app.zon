@@ -5,7 +5,7 @@
     .description = "A fast, local-first chat client for OpenRouter and Codex.",
     .version = "0.1.3",
     .theme = "geist",
-    .theme_accent = "#7157F6",
+    .theme_accent = "#6E56CF",
     .icons = .{"assets/icon-dev.png"},
     .platforms = .{"macos"},
     .permissions = .{ "command", "view", "network", "credentials", "clipboard", "filesystem", "dialog", "notifications" },
@@ -82,7 +82,7 @@
                 .min_height = 680,
                 .restore_state = true,
                 .restore_policy = "center_on_primary",
-                .titlebar = "standard",
+                .titlebar = "hidden_inset_tall",
                 .views = .{
                     .{ .label = "chat-canvas", .kind = "gpu_surface", .fill = true, .role = "Chat canvas", .accessibility_label = "Superchat", .gpu_backend = "metal", .gpu_pixel_format = "bgra8_unorm", .gpu_present_mode = "timer", .gpu_alpha_mode = "opaque", .gpu_color_space = "srgb", .gpu_vsync = true },
                 },
