@@ -16,7 +16,9 @@ fn buildTree(arena: std.mem.Allocator, model: *const main.Model) !main.AppUi.Tre
         }
         return err;
     };
-    return ui.finalize(node);
+    var presented_node = node;
+    main.applyAppPresentation(&presented_node);
+    return ui.finalize(presented_node);
 }
 
 fn buildCompiledTree(arena: std.mem.Allocator, model: *const main.Model) !main.AppUi.Tree {
@@ -25,7 +27,7 @@ fn buildCompiledTree(arena: std.mem.Allocator, model: *const main.Model) !main.A
         _ = main.CompiledAppView.document;
     }
     var ui = main.AppUi.init(arena);
-    return ui.finalize(main.CompiledAppView.build(&ui, model));
+    return ui.finalize(main.buildAppView(&ui, model));
 }
 
 fn findByKind(widget: canvas.Widget, kind: canvas.WidgetKind) ?canvas.Widget {
@@ -127,6 +129,8 @@ test "send creates a typed OpenRouter fetch and preserves the user turn" {
     try testing.expectEqual(@as(usize, 1), thread.message_count);
     try testing.expectEqualStrings("Hello from Native SDK", thread.messages[0].content());
     try testing.expect(thread.draft_buffer.isEmpty());
+    try testing.expect(thread.conversation_stick_to_bottom);
+    try testing.expect(thread.conversation_scroll_offset > 90_000);
 
     const request = fx.pendingFetchAt(0) orelse return error.TestExpectedFetch;
     try testing.expectEqual(std.http.Method.POST, request.method);
@@ -136,6 +140,41 @@ test "send creates a typed OpenRouter fetch and preserves the user turn" {
     try testing.expect(std.mem.indexOf(u8, request.body, "\"stream\":true") != null);
     try testing.expect(std.mem.indexOf(u8, request.body, "Hello from Native SDK") != null);
     try testing.expect(std.mem.indexOf(u8, request.body, "test-key") == null);
+}
+
+test "conversation follows sent and streamed turns until the reader scrolls away" {
+    var model = main.initialModel("test-key");
+    defer model.deinit();
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    activeThread(&model).draft_buffer.set("Keep this turn in view");
+    main.update(&model, .send, &fx);
+    const thread = activeThread(&model);
+
+    main.update(&model, .{ .conversation_scrolled = .{
+        .offset = 240,
+        .viewport_extent = 400,
+        .content_extent = 640,
+    } }, &fx);
+    try testing.expect(thread.conversation_stick_to_bottom);
+
+    streamLine(&model, &fx, 1001, "data: {\"choices\":[{\"delta\":{\"content\":\"Streaming answer\"}}]}");
+    const timer = fx.pendingTimerAt(0) orelse return error.TestExpectedTimer;
+    main.update(&model, .{ .stream_flush = .{ .key = timer.key } }, &fx);
+    try testing.expect(thread.conversation_scroll_offset > 90_000);
+
+    main.update(&model, .{ .conversation_scrolled = .{
+        .offset = 40,
+        .viewport_extent = 400,
+        .content_extent = 900,
+    } }, &fx);
+    try testing.expect(!thread.conversation_stick_to_bottom);
+    const reader_offset = thread.conversation_scroll_offset;
+    streamLine(&model, &fx, 1001, "data: {\"choices\":[{\"delta\":{\"content\":\" more\"}}]}");
+    main.update(&model, .{ .stream_flush = .{ .key = timer.key } }, &fx);
+    try testing.expectEqual(reader_offset, thread.conversation_scroll_offset);
 }
 
 test "dropped images become removable multimodal OpenRouter attachments" {
@@ -384,6 +423,7 @@ test "Codex subscription threads run through the signed-in CLI without an API ke
     try testing.expectEqualStrings("Codex answer", activeThread(&model).messages[1].content());
     try testing.expect(!activeThread(&model).sending);
     try testing.expectEqual(main.ConnectionState.connected, model.codex_connection);
+    try testing.expectEqual(@as(f32, 100_000), activeThread(&model).conversation_scroll_offset);
 }
 
 test "Claude subscription threads stream text deltas through Claude Code" {
@@ -1186,6 +1226,7 @@ test "edit and retry safely rewrite a transcript from the selected turn" {
     const follow_up_id = thread.messages[2].id;
     main.update(&model, .{ .edit_message = follow_up_id }, &fx);
     try testing.expectEqualStrings("Follow-up", thread.draft());
+    try testing.expect(!model.toastVisible());
     try testing.expectEqual(@as(usize, 2), thread.message_count);
     try testing.expectEqual(@as(usize, 1), model.persistence_truncate_count);
     try testing.expectEqual(follow_up_id, model.persistence_truncations[0].from_message_id);
@@ -1217,10 +1258,13 @@ test "background completions become unread until their chat is opened" {
     main.update(&model, .send, &fx);
     var tree = try buildTree(arena_state.allocator(), &model);
     const working_row = findListItemContainingText(tree.root, "Work in the background") orelse return error.TestExpectedWorkingSidebarRow;
-    try testing.expectEqual(@as(usize, 2), working_row.children.len);
-    try testing.expectEqual(canvas.WidgetKind.text, working_row.children[0].kind);
-    try testing.expectEqual(@as(f32, 1), working_row.children[0].layout.grow);
-    try testing.expectEqual(canvas.WidgetKind.spinner, working_row.children[1].kind);
+    try testing.expectEqual(@as(usize, 3), working_row.children.len);
+    try testing.expectEqual(canvas.WidgetKind.stack, working_row.children[0].kind);
+    try testing.expectEqual(@as(f32, 24), working_row.children[0].layout.min_size.width);
+    try testing.expectEqual(@as(f32, 24), working_row.children[0].layout.max_size.width);
+    try testing.expectEqual(canvas.WidgetKind.text, working_row.children[1].kind);
+    try testing.expectEqual(@as(f32, 1), working_row.children[1].layout.grow);
+    try testing.expectEqual(canvas.WidgetKind.spinner, working_row.children[2].kind);
 
     var layout_nodes: [360]canvas.WidgetLayoutNode = undefined;
     const layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, main.window_width, main.window_height), &layout_nodes);
@@ -1229,8 +1273,8 @@ test "background completions become unread until their chat is opened" {
     var status_frame: ?native_sdk.geometry.RectF = null;
     for (layout.nodes) |node| {
         if (node.widget.id == working_row.id) row_frame = node.frame;
-        if (node.widget.id == working_row.children[0].id) title_frame = node.frame;
-        if (node.widget.id == working_row.children[1].id) status_frame = node.frame;
+        if (node.widget.id == working_row.children[1].id) title_frame = node.frame;
+        if (node.widget.id == working_row.children[2].id) status_frame = node.frame;
     }
     const row_bounds = row_frame orelse return error.TestExpectedWorkingSidebarLayout;
     const title_bounds = title_frame orelse return error.TestExpectedWorkingTitleLayout;
@@ -1250,16 +1294,16 @@ test "background completions become unread until their chat is opened" {
     _ = arena_state.reset(.retain_capacity);
     tree = try buildTree(arena_state.allocator(), &model);
     const unread_row = findListItemContainingText(tree.root, "Work in the background") orelse return error.TestExpectedUnreadSidebarRow;
-    try testing.expectEqual(@as(usize, 2), unread_row.children.len);
-    try testing.expectEqual(canvas.WidgetKind.icon, unread_row.children[1].kind);
-    try testing.expectEqualStrings("circle-dot", unread_row.children[1].text);
+    try testing.expectEqual(@as(usize, 3), unread_row.children.len);
+    try testing.expectEqual(canvas.WidgetKind.icon, unread_row.children[2].kind);
+    try testing.expectEqualStrings("circle-dot", unread_row.children[2].text);
 
     const unread_layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, main.window_width, main.window_height), &layout_nodes);
     title_frame = null;
     status_frame = null;
     for (unread_layout.nodes) |node| {
-        if (node.widget.id == unread_row.children[0].id) title_frame = node.frame;
-        if (node.widget.id == unread_row.children[1].id) status_frame = node.frame;
+        if (node.widget.id == unread_row.children[1].id) title_frame = node.frame;
+        if (node.widget.id == unread_row.children[2].id) status_frame = node.frame;
     }
     const unread_title_bounds = title_frame orelse return error.TestExpectedUnreadTitleLayout;
     const unread_status_bounds = status_frame orelse return error.TestExpectedUnreadStatusLayout;
@@ -1272,7 +1316,7 @@ test "background completions become unread until their chat is opened" {
     _ = arena_state.reset(.retain_capacity);
     tree = try buildTree(arena_state.allocator(), &model);
     const read_row = findListItemContainingText(tree.root, "Work in the background") orelse return error.TestExpectedReadSidebarRow;
-    try testing.expectEqual(@as(usize, 1), read_row.children.len);
+    try testing.expectEqual(@as(usize, 2), read_row.children.len);
 }
 
 test "SQLite search covers messages outside the hydrated UI window" {
@@ -1389,6 +1433,40 @@ test "assistant responses can be copied as a whole" {
     try testing.expectEqual(native_sdk.EffectClipboardOp.write, request.op);
     try testing.expectEqualStrings("A complete response to copy.", request.text);
     try testing.expectEqualStrings("Response copied", model.toastText());
+}
+
+test "user messages can be copied as a whole" {
+    var model = main.initialModel("test-key");
+    try testing.expect(model.appendMessage(.user, "Copy my complete message."));
+    const message_id = activeThread(&model).messages[0].id;
+
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    main.update(&model, .{ .copy_message = message_id }, &fx);
+
+    const request = fx.pendingClipboardAt(0) orelse return error.TestExpectedClipboardWrite;
+    try testing.expectEqual(native_sdk.EffectClipboardOp.write, request.op);
+    try testing.expectEqualStrings("Copy my complete message.", request.text);
+    try testing.expectEqualStrings("Message copied", model.toastText());
+}
+
+test "message utility actions keep a restrained hierarchy" {
+    var model = main.initialModel("test-key");
+    try testing.expect(model.appendMessage(.user, "A message with utility actions"));
+    try testing.expect(model.appendMessage(.assistant, "A response with quiet labeled actions"));
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const tree = try buildTree(arena_state.allocator(), &model);
+    const user_actions = findByLabel(tree.root, "User message actions") orelse return error.TestExpectedUserMessageActions;
+    const response_actions = findByLabel(tree.root, "Response actions") orelse return error.TestExpectedResponseActions;
+    try testing.expectEqual(@as(f32, 0.5), response_actions.opacity);
+    try testing.expectEqual(@as(usize, 2), user_actions.children.len);
+    try testing.expectEqual(@as(usize, 3), response_actions.children.len);
+    try testing.expectEqualStrings("Copy", response_actions.children[0].text);
+    try testing.expectEqualStrings("Retry", response_actions.children[1].text);
+    try testing.expectEqualStrings("Fork", response_actions.children[2].text);
 }
 
 test "one response can fork into several model-specific chats" {
@@ -1876,6 +1954,13 @@ test "modal forms can submit without a mouse" {
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "on-submit=\"save_rename\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "on-submit=\"finish_onboarding\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "on-submit=\"create_forks\"") != null);
+}
+
+test "action menus use compact inset rows and separate archive actions" {
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "width=\"180\" height=\"100\" padding=\"4\" gap=\"2\" on-dismiss=\"close_thread_menu\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "width=\"196\" height=\"100\" padding=\"4\" gap=\"2\" on-dismiss=\"close_project_menu\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "<menu-item size=\"sm\" icon=\"edit\" on-press=\"open_rename_thread\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "<separator />\n              <menu-item size=\"sm\" icon=\"archive\" on-press=\"archive_thread\"") != null);
 }
 
 test "modal layouts fit the 680 point minimum window and long content scrolls" {

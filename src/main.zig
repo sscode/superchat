@@ -335,6 +335,8 @@ pub const Thread = struct {
     stream_pending_storage: []u8 = @constCast(&[_]u8{}),
     stream_pending_len: usize = 0,
     stream_flush_scheduled: bool = false,
+    conversation_scroll_offset: f32 = 0,
+    conversation_stick_to_bottom: bool = false,
     has_older_messages: bool = false,
     history_loading: bool = false,
     request_path_storage: [128]u8 = undefined,
@@ -384,6 +386,21 @@ pub const Thread = struct {
         thread.status_len = 0;
     }
 
+    fn requestConversationBottom(thread: *Thread, force: bool) void {
+        if (force) thread.conversation_stick_to_bottom = true;
+        if (!thread.conversation_stick_to_bottom) return;
+        // Alternate two deliberately out-of-range, but renderer-safe,
+        // source values so every appended turn is an explicit programmatic
+        // scroll. The runtime clamps both to the live max offset; an
+        // on-scroll echo replaces the sentinel with the applied offset and
+        // lets a reader scrolling upward release it. Avoid f32 max here:
+        // native drawing APIs can observe the source position before the
+        // scroll driver reports its clamped value.
+        const end_a: f32 = 100_000;
+        const end_b: f32 = 99_999;
+        thread.conversation_scroll_offset = if (thread.conversation_scroll_offset == end_a) end_b else end_a;
+    }
+
     fn setActiveModel(thread: *Thread, text: []const u8) void {
         const len = utf8PrefixLen(text, max_model_bytes);
         @memcpy(thread.active_model_storage[0..len], text[0..len]);
@@ -420,6 +437,7 @@ pub const Thread = struct {
         thread.message_count += 1;
         next_message_id.* += 1;
         if (role == .user and thread.message_count == 1) thread.setTitle(if (trimmed.len > 0) trimmed else message.attachments[0].name());
+        if (role == .user) thread.requestConversationBottom(true);
         return true;
     }
 
@@ -462,6 +480,7 @@ pub const Thread = struct {
             allocator.realloc(message.content_storage, message.content_len + copy_len) catch return false;
         @memcpy(message.content_storage[message.content_len..][0..copy_len], delta[0..copy_len]);
         message.content_len += copy_len;
+        thread.requestConversationBottom(false);
         return copy_len == delta.len;
     }
 
@@ -813,6 +832,7 @@ const RemoteModels = struct { data: []const RemoteModel = &.{} };
 pub const Msg = union(enum) {
     draft_edit: canvas.TextInputEvent,
     composer_newline,
+    conversation_scrolled: canvas.ScrollState,
     open_file_picker,
     files_dropped: native_sdk.platform.FileDropEvent,
     attachment_file_result: native_sdk.EffectFileResult,
@@ -2230,6 +2250,11 @@ pub const Model = struct {
         return model.messageRows().len > 0;
     }
 
+    pub fn conversationScrollOffset(model: *const Model) f32 {
+        const thread = model.activeThreadConst() orelse return 0;
+        return thread.conversation_scroll_offset;
+    }
+
     pub fn cannotClear(model: *const Model) bool {
         return !model.hasMessages();
     }
@@ -2290,7 +2315,10 @@ pub const Model = struct {
     }
 
     pub fn statusNeedsAttention(model: *const Model) bool {
-        return model.statusVisible() and !model.missingKey();
+        // The Stop affordance is sufficient progress feedback. Transient
+        // request phases should not create a second box beneath the composer;
+        // actionable failures appear once the request is no longer active.
+        return model.statusVisible() and !model.missingKey() and !model.sending();
     }
 
     fn setApiKey(model: *Model, key: []const u8) void {
@@ -3303,6 +3331,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 .on_fire = Effects.timerMsg(.persist_draft),
             });
         },
+        .conversation_scrolled => |scroll| {
+            const thread = model.activeThread() orelse return;
+            thread.conversation_scroll_offset = scroll.offset;
+            thread.conversation_stick_to_bottom = scroll.maxOffset() - scroll.offset <= 1;
+        },
         .open_file_picker => model.file_picker_requested = true,
         .files_dropped => |drop| {
             const thread = model.activeThread() orelse return;
@@ -3872,7 +3905,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .send => submitDraft(model, fx),
         .stop => stopActiveRequest(model, fx),
-        .edit_message => |message_id| editMessage(model, message_id, fx),
+        .edit_message => |message_id| editMessage(model, message_id),
         .retry_message => |message_id| retryMessage(model, message_id, fx),
         .retry_latest => {
             const message_id = model.latestAssistantMessageId() orelse return;
@@ -3972,7 +4005,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .chrome_changed => |chrome| {
             model.header_height = @max(header_natural_height, chrome.insets.top);
-            model.sidebar_header_height = @max(sidebar_header_natural_height, chrome.insets.top);
+            model.sidebar_header_height = sidebar_header_natural_height;
             model.header_inset_left = chrome.insets.left;
             model.header_inset_right = chrome.insets.right;
         },
@@ -4014,13 +4047,12 @@ fn restoreUserMessageToDraft(model: *Model, thread: *Thread, user_index: usize) 
     return true;
 }
 
-fn editMessage(model: *Model, message_id: u32, fx: *Effects) void {
+fn editMessage(model: *Model, message_id: u32) void {
     const thread = model.activeThread() orelse return;
     for (thread.messages[0..thread.message_count], 0..) |message, index| {
         if (message.id != message_id or message.role != .user) continue;
         if (restoreUserMessageToDraft(model, thread, index)) {
             model.focusComposer();
-            model.showToast("Message ready to edit", fx);
         }
         return;
     }
@@ -4064,13 +4096,13 @@ fn markLatestAssistantDirty(model: *Model, thread_id: u32) void {
 fn copyMessage(model: *Model, message_id: u32, fx: *Effects) void {
     const thread = model.activeThread() orelse return;
     for (thread.messages[0..thread.message_count]) |*message| {
-        if (message.id != message_id or message.role != .assistant) continue;
+        if (message.id != message_id) continue;
         fx.writeClipboard(.{
             .key = clipboardKey(message.id),
             .text = message.content(),
             .on_result = Effects.clipboardMsg(.clipboard_result),
         });
-        model.showToast("Response copied", fx);
+        model.showToast(if (message.role == .user) "Message copied" else "Response copied", fx);
         return;
     }
 }
@@ -4816,6 +4848,10 @@ fn finalizeResponseMetrics(model: *Model, thread: *Thread) void {
     thread.total_cost_micros -|= message.cost_micros;
     message.cost_micros = thread.request_cost_micros;
     thread.total_cost_micros +|= message.cost_micros;
+    // Completion reveals the elapsed-time header and response actions,
+    // which add height after the last streamed text delta. Keep those final
+    // controls in view when the reader is still following the response.
+    thread.requestConversationBottom(false);
 }
 
 fn receiveHarnessExit(model: *Model, exit_event: native_sdk.EffectExit, fx: *Effects) bool {
@@ -4975,6 +5011,19 @@ pub const CompiledAppView = blk: {
     _ = View.document;
     break :blk View;
 };
+
+pub fn applyAppPresentation(node: *AppUi.Node) void {
+    if (std.mem.eql(u8, node.widget.semantics.label, "Response actions")) {
+        node.widget.opacity = 0.5;
+    }
+    for (@constCast(node.nodes)) |*child| applyAppPresentation(child);
+}
+
+pub fn buildAppView(ui: *AppUi, model: *const Model) AppUi.Node {
+    var node = CompiledAppView.build(ui, model);
+    applyAppPresentation(&node);
+    return node;
+}
 
 fn findWidgetByLabel(widget: canvas.Widget, label: []const u8) ?canvas.Widget {
     if (std.mem.eql(u8, widget.semantics.label, label)) return widget;
@@ -5473,7 +5522,7 @@ pub fn main(init: std.process.Init) !void {
         .on_command = onCommand,
         .theme = runner.manifestThemePack(),
         .theme_accent = runner.manifestThemeAccent(),
-        .view = CompiledAppView.build,
+        .view = buildAppView,
         .animations = toastAnimations,
         .markup = if (builtin.mode == .Debug)
             .{ .source = app_markup, .watch_path = "src/app.native", .io = init.io }

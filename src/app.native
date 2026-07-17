@@ -37,6 +37,7 @@
           </row>
           <for each="topLevelThreadRows" key="id" as="t">
             <list-item gap="8" cross="center" on-press="select_thread:{t.id}" selected="{t.selected}" label="{t.title}">
+              <spacer width="24" />
               <text grow="1">{t.title}</text>
               <if test="{t.sending}">
                 <spinner size="sm" />
@@ -54,10 +55,11 @@
             <stack width="28" height="28">
               <button size="sm" variant="ghost" icon="ellipsis" on-press="toggle_project_menu" disabled="{cannotManageProject}" label="Selected project actions"></button>
               <if test="{project_menu_open}">
-                <dropdown-menu anchor="below" anchor-alignment="end" anchor-offset="6" width="196" height="124" on-dismiss="close_project_menu" label="Project actions">
-                  <menu-item icon="plus" on-press="new_project_thread">New chat in project</menu-item>
-                  <menu-item icon="edit" on-press="open_rename_project">Rename project</menu-item>
-                  <menu-item icon="archive" on-press="archive_project">Archive project</menu-item>
+                <dropdown-menu anchor="below" anchor-alignment="end" anchor-offset="6" width="196" height="100" padding="4" gap="2" on-dismiss="close_project_menu" label="Project actions">
+                  <menu-item size="sm" icon="plus" on-press="new_project_thread">New chat in project</menu-item>
+                  <menu-item size="sm" icon="edit" on-press="open_rename_project">Rename project</menu-item>
+                  <separator />
+                  <menu-item size="sm" icon="archive" on-press="archive_project">Archive project</menu-item>
                 </dropdown-menu>
               </if>
             </stack>
@@ -107,10 +109,11 @@
         <stack width="28" height="28">
           <button size="sm" variant="ghost" icon="ellipsis" on-press="toggle_thread_menu" label="Chat actions"></button>
           <if test="{thread_menu_open}">
-            <dropdown-menu anchor="below" anchor-alignment="end" anchor-offset="6" width="190" height="124" on-dismiss="close_thread_menu" label="Chat actions">
-              <menu-item icon="edit" on-press="open_rename_thread">Rename chat</menu-item>
-              <menu-item icon="folder" on-press="open_move_thread">Move to project</menu-item>
-              <menu-item icon="archive" on-press="archive_thread">Archive chat</menu-item>
+            <dropdown-menu anchor="below" anchor-alignment="end" anchor-offset="6" width="180" height="100" padding="4" gap="2" on-dismiss="close_thread_menu" label="Chat actions">
+              <menu-item size="sm" icon="edit" on-press="open_rename_thread">Rename chat</menu-item>
+              <menu-item size="sm" icon="folder" on-press="open_move_thread">Move to project</menu-item>
+              <separator />
+              <menu-item size="sm" icon="archive" on-press="archive_thread">Archive chat</menu-item>
             </dropdown-menu>
           </if>
         </stack>
@@ -118,7 +121,7 @@
       </row>
       <separator />
 
-      <scroll grow="1" label="Conversation">
+      <scroll grow="1" value="{conversationScrollOffset}" on-scroll="conversation_scrolled" label="Conversation">
         <row main="center">
           <column width="680" padding="32" gap="44">
             <if test="{canLoadOlder}">
@@ -128,36 +131,35 @@
               <for each="messageRows" key="id" as="m">
                 <if test="{m.isUser}">
                   <row main="end">
-                    <bubble padding="14" radius="lg" label="You said">
-                      <column gap="8">
-                        <row gap="8" cross="center">
-                          <text wrap="true" grow="1">{m.content}</text>
-                          <button size="sm" variant="ghost" foreground="text_muted" icon="edit" on-press="edit_message:{m.id}" label="Edit message"></button>
-                        </row>
-                        <if test="{m.hasAttachments}">
-                          <text size="sm" foreground="text_muted" wrap="true">{m.attachmentSummary}</text>
-                        </if>
-                      </column>
-                    </bubble>
+                    <column cross="end" gap="4" label="User message group">
+                      <bubble min-width="220" padding="14" radius="lg" label="You said">
+                        <column gap="8">
+                          <text wrap="true">{m.content}</text>
+                          <if test="{m.hasAttachments}">
+                            <text size="sm" foreground="text_muted" wrap="true">{m.attachmentSummary}</text>
+                          </if>
+                        </column>
+                      </bubble>
+                      <row gap="0" main="end" cross="center" label="User message actions">
+                        <button size="sm" variant="ghost" foreground="text_muted" icon="copy" on-press="copy_message:{m.id}" label="Copy message"></button>
+                        <button size="sm" variant="ghost" foreground="text_muted" icon="edit" on-press="edit_message:{m.id}" label="Edit message"></button>
+                      </row>
+                    </column>
                   </row>
                 </if>
                 <else>
-                  <column gap="16" label="Assistant said">
-                    <row gap="8" cross="center">
-                      <if test="{m.responseMeta}">
-                        <text size="sm" foreground="text_muted"><span weight="medium">Worked for {m.responseMeta}</span></text>
-                      </if>
-                      <else>
-                        <text size="sm" foreground="text_muted"><span weight="medium">Response complete</span></text>
-                      </else>
-                      <text size="sm" foreground="text_muted">· {m.responseLabel}</text>
-                    </row>
-                    <separator />
+                  <column gap="12" label="Assistant said">
+                    <if test="{m.responseMeta}">
+                      <column gap="10">
+                        <text size="sm" foreground="text_muted">Worked for {m.responseMeta}</text>
+                        <separator />
+                      </column>
+                    </if>
                     <markdown source="{m.content}" />
-                    <row gap="2">
-                      <button size="sm" variant="ghost" foreground="text_muted" icon="copy" on-press="copy_message:{m.id}" label="Copy full response">Copy</button>
+                    <row gap="0" label="Response actions">
+                      <button size="sm" variant="ghost" foreground="text_muted" icon="copy" on-press="copy_message:{m.id}">Copy</button>
                       <button size="sm" variant="ghost" foreground="text_muted" icon="refresh-cw" on-press="retry_message:{m.id}">Retry</button>
-                      <button size="sm" variant="ghost" foreground="text_muted" icon="git-branch" on-press="open_fork:{m.id}" label="Fork from this response">Fork</button>
+                      <button size="sm" variant="ghost" foreground="text_muted" icon="git-branch" on-press="open_fork:{m.id}">Fork</button>
                     </row>
                   </column>
                 </else>
@@ -169,15 +171,6 @@
                 <text foreground="text_muted" wrap="true" text-alignment="center">Start with one model. Branch the response when another perspective would help.</text>
               </column>
             </else>
-            <if test="{sending}">
-              <column gap="12" label="Assistant is thinking">
-                <row gap="10" cross="center">
-                  <spinner size="sm" />
-                  <text size="sm" foreground="text_muted"><span weight="medium">Working on the next response…</span></text>
-                </row>
-                <separator />
-              </column>
-            </if>
           </column>
         </row>
       </scroll>
