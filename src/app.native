@@ -3,7 +3,7 @@
   <row grow="1">
     <panel width="260" background="surface_subtle" border-color="surface_subtle" radius="sm">
     <column grow="1">
-      <row height="{header_height}" padding="12" cross="center" window-drag="true" label="Window controls">
+      <row height="{sidebar_header_height}" padding="12" cross="center" window-drag="true" label="Window controls">
         <spacer width="{header_inset_left}" />
         <spacer grow="1" />
       </row>
@@ -18,30 +18,35 @@
         <button size="sm" variant="ghost" icon="search" on-press="open_search" label="Search every chat, Command F"></button>
       </row>
 
-      <column padding="10" gap="2">
-        <list-item size="lg" icon="edit" on-press="new_thread" disabled="{cannotAddThread}" label="New top-level chat">New chat</list-item>
+      <column padding="10" gap="2" label="Pinned sidebar actions">
+        <list-item size="lg" icon="edit" on-press="new_thread" disabled="{cannotAddThread}" label="New chat in the current location">New chat</list-item>
         <list-item icon="search" on-press="open_search">Search</list-item>
         <list-item icon="archive" on-press="open_archive">Archive</list-item>
+      </column>
+
+      <separator label="Workspace list boundary" />
+      <column height="7">
+        <panel height="1" background="surface_subtle" border-color="surface_subtle" radius="sm"></panel>
       </column>
 
       <scroll grow="1" label="Chats and projects">
         <column padding="10" gap="2">
           <row padding="8" gap="4" cross="center">
             <text size="sm" foreground="text_muted" grow="1"><span weight="medium">Chats</span></text>
-            <button size="sm" variant="ghost" icon="plus" on-press="new_thread" disabled="{cannotAddThread}" label="New top-level chat"></button>
+            <button size="sm" variant="ghost" icon="plus" on-press="new_top_level_thread" disabled="{cannotAddThread}" label="New top-level chat"></button>
           </row>
           <for each="topLevelThreadRows" key="id" as="t">
-            <if test="{t.sending}">
-              <list-item icon="circle-dot" foreground="success" on-press="select_thread:{t.id}" selected="{t.selected}" label="{t.title}">{t.title}</list-item>
-            </if>
-            <else>
-              <if test="{t.unread}">
-                <list-item icon="circle-dot" foreground="info" on-press="select_thread:{t.id}" selected="{t.selected}" label="{t.title}">{t.title}</list-item>
+            <list-item gap="8" cross="center" on-press="select_thread:{t.id}" selected="{t.selected}" label="{t.title}">
+              <text grow="1">{t.title}</text>
+              <if test="{t.sending}">
+                <spinner size="sm" />
               </if>
               <else>
-                <list-item on-press="select_thread:{t.id}" selected="{t.selected}" label="{t.title}">{t.title}</list-item>
+                <if test="{t.unread}">
+                  <icon name="circle-dot" width="12" height="12" foreground="info" />
+                </if>
               </else>
-            </else>
+            </list-item>
           </for>
 
           <row padding="8" gap="4" cross="center">
@@ -63,20 +68,18 @@
               <list-item size="lg" icon="folder" on-press="select_sidebar_row:{r.key}" selected="{r.selected}" label="{r.title}">{r.title}</list-item>
             </if>
             <else>
-              <row gap="2">
+              <list-item gap="8" cross="center" on-press="select_sidebar_row:{r.key}" selected="{r.selected}" label="{r.title}">
                 <spacer width="24" />
+                <text grow="1">{r.title}</text>
                 <if test="{r.sending}">
-                  <list-item grow="1" icon="circle-dot" foreground="success" on-press="select_sidebar_row:{r.key}" selected="{r.selected}" label="{r.title}">{r.title}</list-item>
+                  <spinner size="sm" />
                 </if>
                 <else>
                   <if test="{r.unread}">
-                    <list-item grow="1" icon="circle-dot" foreground="info" on-press="select_sidebar_row:{r.key}" selected="{r.selected}" label="{r.title}">{r.title}</list-item>
+                    <icon name="circle-dot" width="12" height="12" foreground="info" />
                   </if>
-                  <else>
-                    <list-item grow="1" on-press="select_sidebar_row:{r.key}" selected="{r.selected}" label="{r.title}">{r.title}</list-item>
-                  </else>
                 </else>
-              </row>
+              </list-item>
             </else>
           </for>
         </column>
@@ -190,9 +193,6 @@
               <button size="sm" variant="ghost" icon="plus" on-press="open_file_picker" label="Attach images or files, Command U"></button>
               <select size="sm" width="190" on-press="toggle_model_picker" label="Model for the next response">{selectedModelLabel}</select>
               <spacer grow="1" />
-              <if test="{missingKey}">
-                <button size="sm" variant="outline" icon="settings" on-press="open_settings">Connect</button>
-              </if>
               <if test="{sending}">
                 <button size="sm" variant="outline" icon="x" on-press="stop">Stop</button>
               </if>
@@ -405,23 +405,36 @@
           <column padding="28" gap="16">
             <row gap="12" cross="center">
               <column grow="1" gap="4">
-                <text size="heading">Keyboard shortcuts</text>
+                <row gap="8" cross="center">
+                  <text size="heading">Keyboard shortcuts</text>
+                  <row gap="4" cross="center">
+                    <badge size="sm" variant="secondary">Cmd</badge>
+                    <badge size="sm" variant="secondary">,</badge>
+                  </row>
+                </row>
                 <text size="sm" foreground="text_muted">Move through Superchat without leaving the keyboard.</text>
               </column>
-              <badge size="sm" variant="outline">Cmd + ,</badge>
               <button size="sm" variant="ghost" icon="x" on-press="close_shortcuts" label="Close keyboard shortcuts"></button>
             </row>
-            <scroll grow="1" label="All keyboard shortcuts">
+            <search-field size="sm" text="{shortcutSearch}" on-input="shortcut_search_edit" placeholder="Search shortcuts…" autofocus="true" label="Search keyboard shortcuts" />
+            <scroll grow="1" label="Keyboard shortcuts list. Use Arrow keys, Page Up, Page Down, Home, or End to scroll.">
               <column padding="12" gap="4" background="surface_subtle" radius="lg">
-                <for each="shortcutHints" as="h">
+                <for each="shortcutRows" as="h">
                   <row padding="10" gap="16" cross="center">
                     <text grow="1">{h.action}</text>
                     <badge size="sm" variant="secondary">{h.keys}</badge>
                   </row>
                 </for>
+                <if test="{shortcutSearchEmpty}">
+                  <column padding="24" gap="4" cross="center">
+                    <text><span weight="bold">No shortcuts found</span></text>
+                    <text size="sm" foreground="text_muted">Try an action or key combination.</text>
+                  </column>
+                </if>
               </column>
             </scroll>
-            <row main="end">
+            <row gap="12" cross="center">
+              <text size="sm" foreground="text_muted" grow="1">Tab to the list · ↑ ↓ or Page Up / Page Down to scroll</text>
               <button size="sm" variant="primary" on-press="close_shortcuts">Done</button>
             </row>
           </column>
@@ -625,11 +638,11 @@
   </if>
 
   <if test="{toastVisible}">
-    <column main="end" cross="center" padding="32">
-      <panel background="surface" radius="lg" label="Notification">
-        <row padding="12" gap="8" cross="center">
-          <icon name="check" width="18" height="18" foreground="success" />
-          <text size="sm"><span weight="medium">{toastText}</span></text>
+    <column main="end" cross="end" padding="24">
+      <panel min-width="260" background="surface" border-color="accent" radius="lg" label="Notification">
+        <row padding="14" gap="10" cross="center">
+          <icon name="check" width="22" height="22" foreground="accent" />
+          <text>{toastText}</text>
         </row>
       </panel>
     </column>

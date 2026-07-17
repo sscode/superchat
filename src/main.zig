@@ -26,6 +26,7 @@ pub const window_height: f32 = 820;
 pub const window_min_width: f32 = 1000;
 pub const window_min_height: f32 = 680;
 pub const header_natural_height: f32 = 56;
+pub const sidebar_header_natural_height: f32 = 40;
 
 const openrouter_url = "https://openrouter.ai/api/v1/chat/completions";
 const openrouter_key_url = "https://openrouter.ai/api/v1/key";
@@ -48,12 +49,16 @@ const draft_save_key_base: u64 = 1 << 48;
 const database_poll_key: u64 = 1 << 52;
 const toast_timer_key: u64 = (1 << 52) + 2;
 const search_timer_key: u64 = (1 << 52) + 3;
+const toast_enter_timer_key: u64 = (1 << 52) + 5;
+const toast_hide_timer_key: u64 = (1 << 52) + 6;
 const updates_request: u64 = (1 << 61) + 6;
 const updates_url = "https://api.github.com/repos/sscode/superchat/releases/latest";
 const releases_url_prefix = "https://github.com/sscode/superchat/releases/";
 const stream_flush_interval_ms: u64 = 16;
 const draft_save_interval_ms: u64 = 300;
-const toast_duration_ms: u64 = 2200;
+const toast_duration_ms: u64 = 4000;
+const toast_enter_duration_ms: u64 = 240;
+const toast_exit_duration_ms: u64 = 180;
 const archive_retention_ms: i64 = 30 * 24 * 60 * 60 * 1000;
 const day_ms: i64 = 24 * 60 * 60 * 1000;
 const provider_context_messages = 12;
@@ -122,6 +127,7 @@ const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 // ------------------------------------------------------------------ model
 
 pub const Role = enum { user, assistant };
+pub const ToastPhase = enum { hidden, entering, visible, exiting };
 
 pub const ModelChoice = enum {
     auto,
@@ -816,6 +822,7 @@ pub const Msg = union(enum) {
     api_key_edit: canvas.TextInputEvent,
     model_search_edit: canvas.TextInputEvent,
     search_edit: canvas.TextInputEvent,
+    shortcut_search_edit: canvas.TextInputEvent,
     fork_seed_edit: canvas.TextInputEvent,
     toggle_model_picker,
     select_model: ModelChoice,
@@ -898,6 +905,7 @@ pub const Msg = union(enum) {
     cancel_delete,
     new_project,
     new_thread,
+    new_top_level_thread,
     new_project_thread,
     select_top_level_chats,
     select_project_slot: u8,
@@ -921,7 +929,9 @@ pub const Msg = union(enum) {
     connection_exit: native_sdk.EffectExit,
     stream_flush: native_sdk.EffectTimer,
     persist_draft: native_sdk.EffectTimer,
+    toast_entered: native_sdk.EffectTimer,
     dismiss_toast: native_sdk.EffectTimer,
+    toast_hidden: native_sdk.EffectTimer,
     toggle_notifications,
     check_updates,
     open_update,
@@ -940,7 +950,9 @@ pub const Msg = union(enum) {
         "model_search",
         "search_timer",
         "persist_draft",
+        "toast_entered",
         "dismiss_toast",
+        "toast_hidden",
         "mcp_exit",
         "mcp_timeout",
         "clipboard_result",
@@ -1015,6 +1027,7 @@ pub const Model = struct {
     search_request_pending: bool = false,
     settings_open: bool = false,
     shortcuts_open: bool = false,
+    shortcut_search_buffer: canvas.TextBuffer(96) = .{},
     project_menu_open: bool = false,
     thread_menu_open: bool = false,
     onboarding_open: bool = false,
@@ -1066,10 +1079,12 @@ pub const Model = struct {
     composer_focus_flip: bool = false,
     credential_action: CredentialAction = .none,
     header_height: f32 = header_natural_height,
+    sidebar_header_height: f32 = sidebar_header_natural_height,
     header_inset_left: f32 = 0,
     header_inset_right: f32 = 0,
     toast_storage: [max_toast_bytes]u8 = undefined,
     toast_len: usize = 0,
+    toast_phase: ToastPhase = .hidden,
     notifications_enabled: bool = true,
     pending_notification_thread_id: u32 = 0,
     update_state: UpdateState = .idle,
@@ -1127,6 +1142,8 @@ pub const Model = struct {
         "search_loading",
         "update_state",
         "search_buffer",
+        "shortcut_search_buffer",
+        "shortcutHints",
         "search_results",
         "search_result_count",
         "search_generation",
@@ -1176,6 +1193,7 @@ pub const Model = struct {
         "clock",
         "toast_storage",
         "toast_len",
+        "toast_phase",
         "pending_notification_thread_id",
         "update_status_storage",
         "update_status_len",
@@ -1215,6 +1233,7 @@ pub const Model = struct {
         "cannotStop",
         "activeThreadContext",
         "headerConnectionLabel",
+        "brandLabel",
         "hasThreadCost",
         "threadCostLabel",
         "statusVisible",
@@ -1247,7 +1266,7 @@ pub const Model = struct {
     pub const shortcutHints = [_]ShortcutHint{
         .{ .action = "Move keyboard focus", .keys = "Tab / Shift + Tab" },
         .{ .action = "Activate focused control", .keys = "Enter / Space" },
-        .{ .action = "New top-level chat", .keys = "Cmd + N" },
+        .{ .action = "New chat in current location", .keys = "Cmd + N" },
         .{ .action = "New chat in project", .keys = "Cmd + Option + N" },
         .{ .action = "New project", .keys = "Cmd + Shift + N" },
         .{ .action = "Previous chat", .keys = "Cmd + [" },
@@ -1280,8 +1299,8 @@ pub const Model = struct {
         .{ .action = "Stop response", .keys = "Cmd + ." },
         .{ .action = "Rename chat", .keys = "Cmd + Shift + R" },
         .{ .action = "Rename project", .keys = "Cmd + Option + R" },
-        .{ .action = "Archive chat", .keys = "Cmd + Shift + E" },
-        .{ .action = "Archive project", .keys = "Cmd + Option + E" },
+        .{ .action = "Archive chat", .keys = "Cmd + A" },
+        .{ .action = "Archive project", .keys = "Cmd + Shift + A" },
         .{ .action = "Open archive", .keys = "Cmd + Shift + H" },
         .{ .action = "Clear current chat", .keys = "Cmd + Shift + Backspace" },
         .{ .action = "Load earlier messages", .keys = "Cmd + Option + L" },
@@ -1294,9 +1313,57 @@ pub const Model = struct {
         .{ .action = "Close overlay", .keys = "Escape" },
     };
 
+    pub fn shortcutSearch(model: *const Model) []const u8 {
+        return model.shortcut_search_buffer.text();
+    }
+
+    fn shortcutKeyTokenMatches(keys: []const u8, term: []const u8) bool {
+        var key_tokens = std.mem.tokenizeAny(u8, keys, " \t\r\n+/,.-[]()–");
+        while (key_tokens.next()) |key_token| {
+            if (std.ascii.eqlIgnoreCase(key_token, term)) return true;
+        }
+        return false;
+    }
+
+    fn shortcutTermMatches(hint: ShortcutHint, term: []const u8) bool {
+        if (term.len == 1) return shortcutKeyTokenMatches(hint.keys, term);
+        if (std.ascii.indexOfIgnoreCase(hint.action, term) != null or std.ascii.indexOfIgnoreCase(hint.keys, term) != null) return true;
+        if (std.ascii.eqlIgnoreCase(term, "command")) return std.ascii.indexOfIgnoreCase(hint.keys, "Cmd") != null;
+        if (std.ascii.eqlIgnoreCase(term, "alt")) return std.ascii.indexOfIgnoreCase(hint.keys, "Option") != null;
+        if (std.ascii.eqlIgnoreCase(term, "return")) return std.ascii.indexOfIgnoreCase(hint.keys, "Enter") != null;
+        return false;
+    }
+
+    fn shortcutMatchesQuery(hint: ShortcutHint, query: []const u8) bool {
+        var terms = std.mem.tokenizeAny(u8, query, " \t\r\n+/,.");
+        while (terms.next()) |term| {
+            if (!shortcutTermMatches(hint, term)) return false;
+        }
+        return true;
+    }
+
+    pub fn shortcutRows(model: *const Model, arena: std.mem.Allocator) []const ShortcutHint {
+        const rows = arena.alloc(ShortcutHint, shortcutHints.len) catch return &.{};
+        const query = std.mem.trim(u8, model.shortcut_search_buffer.text(), " \t\r\n");
+        var count: usize = 0;
+        for (shortcutHints) |hint| {
+            if (!shortcutMatchesQuery(hint, query)) continue;
+            rows[count] = hint;
+            count += 1;
+        }
+        return rows[0..count];
+    }
+
+    pub fn shortcutSearchEmpty(model: *const Model) bool {
+        const query = std.mem.trim(u8, model.shortcut_search_buffer.text(), " \t\r\n");
+        if (query.len == 0) return false;
+        for (shortcutHints) |hint| if (shortcutMatchesQuery(hint, query)) return false;
+        return true;
+    }
+
     pub const paletteActionRows = [_]PaletteActionRow{
         .{ .id = .search, .label = "Search every chat", .shortcut = "Cmd + F" },
-        .{ .id = .new_thread, .label = "New top-level chat", .shortcut = "Cmd + N" },
+        .{ .id = .new_thread, .label = "New chat", .shortcut = "Cmd + N" },
         .{ .id = .new_project_thread, .label = "New chat in project", .shortcut = "Cmd + Opt + N" },
         .{ .id = .move_thread, .label = "Move current chat", .shortcut = "Cmd + Shift + M" },
         .{ .id = .tools, .label = "MCP tools", .shortcut = "Cmd + Opt + T" },
@@ -1584,6 +1651,11 @@ pub const Model = struct {
         const len = utf8PrefixLen(message, max_toast_bytes);
         @memcpy(model.toast_storage[0..len], message[0..len]);
         model.toast_len = len;
+        model.toast_phase = .entering;
+        fx.cancelTimer(toast_enter_timer_key);
+        fx.cancelTimer(toast_timer_key);
+        fx.cancelTimer(toast_hide_timer_key);
+        fx.startTimer(.{ .key = toast_enter_timer_key, .interval_ms = toast_enter_duration_ms, .on_fire = Effects.timerMsg(.toast_entered) });
         fx.startTimer(.{ .key = toast_timer_key, .interval_ms = toast_duration_ms, .on_fire = Effects.timerMsg(.dismiss_toast) });
     }
 
@@ -3275,6 +3347,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.search_loading = false;
             fx.startTimer(.{ .key = search_timer_key, .interval_ms = 180, .on_fire = Effects.timerMsg(.search_timer) });
         },
+        .shortcut_search_edit => |edit| model.shortcut_search_buffer.apply(edit),
         .search_timer => |timer| {
             if (timer.key != search_timer_key) return;
             const query = std.mem.trim(u8, model.search_buffer.text(), " \t\r\n");
@@ -3398,9 +3471,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.clear_confirm_thread_id = 0;
             model.project_menu_open = false;
             model.thread_menu_open = false;
+            model.shortcut_search_buffer.clear();
             model.shortcuts_open = true;
         },
-        .close_shortcuts => model.shortcuts_open = false,
+        .close_shortcuts => {
+            model.shortcut_search_buffer.clear();
+            model.shortcuts_open = false;
+        },
         .toggle_project_menu => {
             if (model.cannotManageProject()) return;
             model.thread_menu_open = false;
@@ -3656,6 +3733,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.markStructureDirty();
         },
         .new_thread => {
+            const thread_id = model.addThread(model.active_project_id) orelse return;
+            _ = model.activateThread(thread_id);
+            model.focusComposer();
+            model.markStructureDirty();
+        },
+        .new_top_level_thread => {
             const thread_id = model.addThread(chats_project_id) orelse return;
             _ = model.activateThread(thread_id);
             model.focusComposer();
@@ -3845,9 +3928,19 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const thread_id = draftSaveThreadId(timer.key) orelse return;
             if (model.threadByIdConst(thread_id) != null) model.markThreadDirty(thread_id);
         },
+        .toast_entered => |timer| {
+            if (timer.key == toast_enter_timer_key and model.toast_phase == .entering) model.toast_phase = .visible;
+        },
         .dismiss_toast => |timer| {
-            if (timer.key == toast_timer_key) {
+            if (timer.key == toast_timer_key and model.toast_len > 0) {
+                model.toast_phase = .exiting;
+                fx.startTimer(.{ .key = toast_hide_timer_key, .interval_ms = toast_exit_duration_ms, .on_fire = Effects.timerMsg(.toast_hidden) });
+            }
+        },
+        .toast_hidden => |timer| {
+            if (timer.key == toast_hide_timer_key and model.toast_phase == .exiting) {
                 model.toast_len = 0;
+                model.toast_phase = .hidden;
                 model.clear_confirm_thread_id = 0;
             }
         },
@@ -3879,6 +3972,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .chrome_changed => |chrome| {
             model.header_height = @max(header_natural_height, chrome.insets.top);
+            model.sidebar_header_height = @max(sidebar_header_natural_height, chrome.insets.top);
             model.header_inset_left = chrome.insets.left;
             model.header_inset_right = chrome.insets.right;
         },
@@ -4882,6 +4976,52 @@ pub const CompiledAppView = blk: {
     break :blk View;
 };
 
+fn findWidgetByLabel(widget: canvas.Widget, label: []const u8) ?canvas.Widget {
+    if (std.mem.eql(u8, widget.semantics.label, label)) return widget;
+    for (widget.children) |child| {
+        if (findWidgetByLabel(child, label)) |found| return found;
+    }
+    return null;
+}
+
+fn findWidgetByKind(widget: canvas.Widget, kind: canvas.WidgetKind) ?canvas.Widget {
+    if (widget.kind == kind) return widget;
+    for (widget.children) |child| {
+        if (findWidgetByKind(child, kind)) |found| return found;
+    }
+    return null;
+}
+
+pub fn toastAnimations(model: *const Model, tree: *const AppUi.Tree, start_ns: u64, out: []canvas.CanvasRenderAnimation) usize {
+    if (model.toast_phase == .hidden or model.toast_phase == .visible) return 0;
+    const panel = findWidgetByLabel(tree.root, "Notification") orelse return 0;
+    const icon = findWidgetByKind(panel, .icon) orelse return 0;
+    const text = findWidgetByKind(panel, .text) orelse return 0;
+    const parts = [_]canvas.WidgetCommandPart{
+        .{ .widget_id = panel.id, .slot = 1 },
+        .{ .widget_id = panel.id, .slot = 2 },
+        .{ .widget_id = panel.id, .slot = 3 },
+        .{ .widget_id = icon.id, .slot = 1 },
+        .{ .widget_id = text.id, .slot = 1 },
+    };
+    if (out.len < parts.len) return 0;
+
+    const entering = model.toast_phase == .entering;
+    for (parts, 0..) |part, index| {
+        out[index] = .{
+            .id = canvas.widgetCommandPartId(part),
+            .start_ns = start_ns,
+            .duration_ms = if (entering) @intCast(toast_enter_duration_ms) else @intCast(toast_exit_duration_ms),
+            .easing = if (entering) .emphasized else .standard,
+            .from_opacity = if (entering) 0 else 1,
+            .to_opacity = if (entering) 1 else 0,
+            .from_transform = if (entering) canvas.Affine.translate(12, 8) else canvas.Affine.identity(),
+            .to_transform = if (entering) canvas.Affine.identity() else canvas.Affine.translate(8, 4),
+        };
+    }
+    return parts.len;
+}
+
 // UiApp deliberately keeps update pure of platform services. This thin
 // wrapper handles the OS-bound credential concerns around it: the
 // OpenRouter key and the non-secret first-run completion marker.
@@ -5334,6 +5474,7 @@ pub fn main(init: std.process.Init) !void {
         .theme = runner.manifestThemePack(),
         .theme_accent = runner.manifestThemeAccent(),
         .view = CompiledAppView.build,
+        .animations = toastAnimations,
         .markup = if (builtin.mode == .Debug)
             .{ .source = app_markup, .watch_path = "src/app.native", .io = init.io }
         else

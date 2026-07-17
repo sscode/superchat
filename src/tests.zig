@@ -36,6 +36,30 @@ fn findByKind(widget: canvas.Widget, kind: canvas.WidgetKind) ?canvas.Widget {
     return null;
 }
 
+fn findByLabel(widget: canvas.Widget, label: []const u8) ?canvas.Widget {
+    if (std.mem.eql(u8, widget.semantics.label, label)) return widget;
+    for (widget.children) |child| {
+        if (findByLabel(child, label)) |found| return found;
+    }
+    return null;
+}
+
+fn containsText(widget: canvas.Widget, text: []const u8) bool {
+    if (widget.kind == .text and std.mem.eql(u8, widget.text, text)) return true;
+    for (widget.children) |child| {
+        if (containsText(child, text)) return true;
+    }
+    return false;
+}
+
+fn findListItemContainingText(widget: canvas.Widget, text: []const u8) ?canvas.Widget {
+    if (widget.kind == .list_item and containsText(widget, text)) return widget;
+    for (widget.children) |child| {
+        if (findListItemContainingText(child, text)) |found| return found;
+    }
+    return null;
+}
+
 fn activeThread(model: *main.Model) *main.Thread {
     for (model.threads[0..model.thread_count]) |*thread| {
         if (thread.id == model.active_thread_id) return thread;
@@ -262,10 +286,27 @@ test "the empty and populated views build and lay out" {
     var tree = try buildTree(arena_state.allocator(), &model);
     try testing.expect(findByKind(tree.root, .textarea) != null);
     try testing.expect(findByKind(tree.root, .input_group) != null);
+    const pinned_actions = findByLabel(tree.root, "Pinned sidebar actions") orelse return error.TestExpectedPinnedSidebarActions;
+    const list_boundary = findByLabel(tree.root, "Workspace list boundary") orelse return error.TestExpectedWorkspaceListBoundary;
+    const workspace_list = findByLabel(tree.root, "Chats and projects") orelse return error.TestExpectedWorkspaceList;
+    try testing.expectEqual(canvas.WidgetKind.separator, list_boundary.kind);
 
-    var nodes: [240]canvas.WidgetLayoutNode = undefined;
+    var nodes: [280]canvas.WidgetLayoutNode = undefined;
     const empty_layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, main.window_width, main.window_height), &nodes);
     try testing.expect(empty_layout.nodes.len > 0);
+    var actions_frame: ?native_sdk.geometry.RectF = null;
+    var boundary_frame: ?native_sdk.geometry.RectF = null;
+    var list_frame: ?native_sdk.geometry.RectF = null;
+    for (empty_layout.nodes) |node| {
+        if (node.widget.id == pinned_actions.id) actions_frame = node.frame;
+        if (node.widget.id == list_boundary.id) boundary_frame = node.frame;
+        if (node.widget.id == workspace_list.id) list_frame = node.frame;
+    }
+    const actions_bounds = actions_frame orelse return error.TestExpectedPinnedSidebarActionsLayout;
+    const boundary_bounds = boundary_frame orelse return error.TestExpectedWorkspaceListBoundaryLayout;
+    const list_bounds = list_frame orelse return error.TestExpectedWorkspaceListLayout;
+    try testing.expect(boundary_bounds.y >= actions_bounds.y + actions_bounds.height);
+    try testing.expect(list_bounds.y - (boundary_bounds.y + boundary_bounds.height) >= 7);
     const minimum_layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, main.window_min_width, main.window_min_height), &nodes);
     try testing.expect(minimum_layout.nodes.len > 0);
 
@@ -579,7 +620,7 @@ test "projects and threads preserve independent conversations" {
     try testing.expectEqual(@as(usize, 2), rows.len);
 }
 
-test "top-level and project chats have distinct creation paths" {
+test "new chat follows the active location while top-level creation stays explicit" {
     var model = main.initialModel("test-key");
     var fx = main.Effects.init(testing.allocator);
     defer fx.deinit();
@@ -606,11 +647,18 @@ test "top-level and project chats have distinct creation paths" {
 
     main.update(&model, .new_thread, &fx);
     try testing.expect(model.composer_focus_flip);
+    try testing.expectEqual(project_id, model.active_project_id);
+    try testing.expectEqual(project_id, activeThread(&model).project_id);
+    _ = arena_state.reset(.retain_capacity);
+    try testing.expectEqual(@as(usize, 1), model.topLevelThreadRows(arena_state.allocator()).len);
+    try testing.expectEqual(@as(usize, 4), model.projectSidebarRows(arena_state.allocator()).len);
+
+    main.update(&model, .new_top_level_thread, &fx);
     try testing.expectEqual(main.chats_project_id, model.active_project_id);
     try testing.expectEqual(main.chats_project_id, activeThread(&model).project_id);
     _ = arena_state.reset(.retain_capacity);
     try testing.expectEqual(@as(usize, 2), model.topLevelThreadRows(arena_state.allocator()).len);
-    try testing.expectEqual(@as(usize, 3), model.projectSidebarRows(arena_state.allocator()).len);
+    try testing.expectEqual(@as(usize, 4), model.projectSidebarRows(arena_state.allocator()).len);
 
     main.update(&model, .open_rename_project, &fx);
     try testing.expect(!model.rename_open);
@@ -633,6 +681,10 @@ test "project chats are grouped directly beneath their project" {
     main.update(&model, .new_project, &fx);
     const second_project = model.active_project_id;
     const second_project_thread = model.active_thread_id;
+    const selected_thread_title = "Second project chat";
+    const selected_thread = threadWithId(&model, second_project_thread);
+    @memcpy(selected_thread.title_storage[0..selected_thread_title.len], selected_thread_title);
+    selected_thread.title_len = selected_thread_title.len;
 
     const rows = model.projectSidebarRows(arena_state.allocator());
     try testing.expectEqual(@as(usize, 5), rows.len);
@@ -658,6 +710,34 @@ test "project chats are grouped directly beneath their project" {
     main.update(&model, .{ .select_sidebar_row = rows[3].key }, &fx);
     try testing.expectEqual(second_project, model.active_project_id);
     try testing.expectEqual(second_project_thread, model.active_thread_id);
+
+    _ = arena_state.reset(.retain_capacity);
+    const tree = try buildTree(arena_state.allocator(), &model);
+    const project_row = findByLabel(tree.root, projectWithId(&model, second_project).name()) orelse return error.TestExpectedProjectSidebarRow;
+    const chat_row = findByLabel(tree.root, selected_thread_title) orelse return error.TestExpectedProjectChatSidebarRow;
+    try testing.expectEqual(canvas.WidgetKind.list_item, project_row.kind);
+    try testing.expectEqual(canvas.WidgetKind.list_item, chat_row.kind);
+    try testing.expectEqual(canvas.WidgetKind.stack, chat_row.children[0].kind);
+
+    var layout_nodes: [360]canvas.WidgetLayoutNode = undefined;
+    const layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, main.window_width, main.window_height), &layout_nodes);
+    var project_frame: ?native_sdk.geometry.RectF = null;
+    var chat_frame: ?native_sdk.geometry.RectF = null;
+    var chat_indent_frame: ?native_sdk.geometry.RectF = null;
+    var chat_title_frame: ?native_sdk.geometry.RectF = null;
+    for (layout.nodes) |node| {
+        if (node.widget.id == project_row.id) project_frame = node.frame;
+        if (node.widget.id == chat_row.id) chat_frame = node.frame;
+        if (node.widget.id == chat_row.children[0].id) chat_indent_frame = node.frame;
+        if (node.widget.id == chat_row.children[1].id) chat_title_frame = node.frame;
+    }
+    const project_bounds = project_frame orelse return error.TestExpectedProjectSidebarLayout;
+    const chat_bounds = chat_frame orelse return error.TestExpectedProjectChatSidebarLayout;
+    const chat_indent_bounds = chat_indent_frame orelse return error.TestExpectedProjectChatIndentLayout;
+    const chat_title_bounds = chat_title_frame orelse return error.TestExpectedProjectChatTitleLayout;
+    try testing.expect(@abs(project_bounds.x - chat_bounds.x) <= 1);
+    try testing.expectEqual(@as(f32, 24), chat_indent_bounds.width);
+    try testing.expect(chat_title_bounds.x - chat_bounds.x >= 24);
 }
 
 test "loading repairs a stale active project from the active chat" {
@@ -730,14 +810,49 @@ test "archived chats leave the workspace and can be restored" {
     try testing.expect(threadWithId(&model, archived_id).isArchived());
     try testing.expect(model.toastVisible());
     try testing.expectEqualStrings("Chat archived", model.toastText());
-    const toast_timer = fx.pendingTimerAt(0) orelse return error.TestExpectedTimer;
-    try testing.expectEqual(@as(u64, 2200), toast_timer.interval_ms);
+    try testing.expectEqual(main.ToastPhase.entering, model.toast_phase);
+    const enter_timer = fx.pendingTimerAt(0) orelse return error.TestExpectedToastEnterTimer;
+    const toast_timer = fx.pendingTimerAt(1) orelse return error.TestExpectedToastTimer;
+    try testing.expectEqual(@as(u64, 240), enter_timer.interval_ms);
+    try testing.expectEqual(@as(u64, 4000), toast_timer.interval_ms);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var toast_tree = try buildTree(arena_state.allocator(), &model);
+    const toast = findByLabel(toast_tree.root, "Notification") orelse return error.TestExpectedToast;
+    var animations: [8]canvas.CanvasRenderAnimation = undefined;
+    const enter_animations = main.toastAnimations(&model, &toast_tree, 100, &animations);
+    try testing.expectEqual(@as(usize, 5), enter_animations);
+    try testing.expectEqual(@as(?f32, 0), animations[0].from_opacity);
+    try testing.expectEqualDeep(canvas.Affine.translate(12, 8), animations[0].from_transform.?);
+
+    var layout_nodes: [360]canvas.WidgetLayoutNode = undefined;
+    const toast_layout = try canvas.layoutWidgetTree(toast_tree.root, native_sdk.geometry.RectF.init(0, 0, main.window_width, main.window_height), &layout_nodes);
+    var toast_frame: ?native_sdk.geometry.RectF = null;
+    for (toast_layout.nodes) |node| {
+        if (node.widget.id == toast.id) toast_frame = node.frame;
+    }
+    const toast_bounds = toast_frame orelse return error.TestExpectedToastLayout;
+    try testing.expect(toast_bounds.x > main.window_width * 0.5);
+    try testing.expect(main.window_height - (toast_bounds.y + toast_bounds.height) <= 24);
+
+    main.update(&model, .{ .toast_entered = .{ .key = enter_timer.key } }, &fx);
+    try testing.expectEqual(main.ToastPhase.visible, model.toast_phase);
+    try testing.expectEqual(@as(usize, 0), main.toastAnimations(&model, &toast_tree, 200, &animations));
     main.update(&model, .{ .dismiss_toast = .{ .key = toast_timer.key } }, &fx);
+    try testing.expect(model.toastVisible());
+    try testing.expectEqual(main.ToastPhase.exiting, model.toast_phase);
+    const exit_animations = main.toastAnimations(&model, &toast_tree, 300, &animations);
+    try testing.expectEqual(@as(usize, 5), exit_animations);
+    try testing.expectEqual(@as(?f32, 0), animations[0].to_opacity);
+    try testing.expectEqualDeep(canvas.Affine.translate(8, 4), animations[0].to_transform.?);
+    const hide_timer = fx.pendingTimerAt(2) orelse return error.TestExpectedToastHideTimer;
+    try testing.expectEqual(@as(u64, 180), hide_timer.interval_ms);
+    main.update(&model, .{ .toast_hidden = .{ .key = hide_timer.key } }, &fx);
     try testing.expect(!model.toastVisible());
     try testing.expect(!threadWithId(&model, archived_id).sending);
     try testing.expect(model.active_thread_id != archived_id);
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
+    _ = arena_state.reset(.retain_capacity);
     try testing.expectEqual(@as(usize, 1), model.topLevelThreadRows(arena_state.allocator()).len);
     const archived = model.archivedThreadRows(arena_state.allocator());
     try testing.expectEqual(@as(usize, 1), archived.len);
@@ -1094,18 +1209,70 @@ test "background completions become unread until their chat is opened" {
     var fx = main.Effects.init(testing.allocator);
     defer fx.deinit();
     fx.executor = .fake;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
 
     const background_id = model.active_thread_id;
     activeThread(&model).draft_buffer.set("Work in the background");
     main.update(&model, .send, &fx);
+    var tree = try buildTree(arena_state.allocator(), &model);
+    const working_row = findListItemContainingText(tree.root, "Work in the background") orelse return error.TestExpectedWorkingSidebarRow;
+    try testing.expectEqual(@as(usize, 2), working_row.children.len);
+    try testing.expectEqual(canvas.WidgetKind.text, working_row.children[0].kind);
+    try testing.expectEqual(@as(f32, 1), working_row.children[0].layout.grow);
+    try testing.expectEqual(canvas.WidgetKind.spinner, working_row.children[1].kind);
+
+    var layout_nodes: [360]canvas.WidgetLayoutNode = undefined;
+    const layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, main.window_width, main.window_height), &layout_nodes);
+    var row_frame: ?native_sdk.geometry.RectF = null;
+    var title_frame: ?native_sdk.geometry.RectF = null;
+    var status_frame: ?native_sdk.geometry.RectF = null;
+    for (layout.nodes) |node| {
+        if (node.widget.id == working_row.id) row_frame = node.frame;
+        if (node.widget.id == working_row.children[0].id) title_frame = node.frame;
+        if (node.widget.id == working_row.children[1].id) status_frame = node.frame;
+    }
+    const row_bounds = row_frame orelse return error.TestExpectedWorkingSidebarLayout;
+    const title_bounds = title_frame orelse return error.TestExpectedWorkingTitleLayout;
+    const status_bounds = status_frame orelse return error.TestExpectedWorkingStatusLayout;
+    const trailing_gap = row_bounds.x + row_bounds.width - (status_bounds.x + status_bounds.width);
+    try testing.expect(trailing_gap >= 0 and trailing_gap <= 16);
+    const title_center_y = title_bounds.y + title_bounds.height * 0.5;
+    const status_center_y = status_bounds.y + status_bounds.height * 0.5;
+    try testing.expect(@abs(title_center_y - status_center_y) <= 1);
+
     main.update(&model, .new_thread, &fx);
     streamLine(&model, &fx, 1000 + background_id, "data: {\"choices\":[{\"delta\":{\"content\":\"Finished\"}}]}");
     main.update(&model, .{ .response = .{ .key = 1000 + background_id, .status = 200 } }, &fx);
     try testing.expect(threadWithId(&model, background_id).unread);
     try testing.expectEqual(background_id, model.pending_notification_thread_id);
 
+    _ = arena_state.reset(.retain_capacity);
+    tree = try buildTree(arena_state.allocator(), &model);
+    const unread_row = findListItemContainingText(tree.root, "Work in the background") orelse return error.TestExpectedUnreadSidebarRow;
+    try testing.expectEqual(@as(usize, 2), unread_row.children.len);
+    try testing.expectEqual(canvas.WidgetKind.icon, unread_row.children[1].kind);
+    try testing.expectEqualStrings("circle-dot", unread_row.children[1].text);
+
+    const unread_layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, main.window_width, main.window_height), &layout_nodes);
+    title_frame = null;
+    status_frame = null;
+    for (unread_layout.nodes) |node| {
+        if (node.widget.id == unread_row.children[0].id) title_frame = node.frame;
+        if (node.widget.id == unread_row.children[1].id) status_frame = node.frame;
+    }
+    const unread_title_bounds = title_frame orelse return error.TestExpectedUnreadTitleLayout;
+    const unread_status_bounds = status_frame orelse return error.TestExpectedUnreadStatusLayout;
+    const unread_title_center_y = unread_title_bounds.y + unread_title_bounds.height * 0.5;
+    const unread_status_center_y = unread_status_bounds.y + unread_status_bounds.height * 0.5;
+    try testing.expect(@abs(unread_title_center_y - unread_status_center_y) <= 1);
+
     main.update(&model, .{ .select_thread = background_id }, &fx);
     try testing.expect(!threadWithId(&model, background_id).unread);
+    _ = arena_state.reset(.retain_capacity);
+    tree = try buildTree(arena_state.allocator(), &model);
+    const read_row = findListItemContainingText(tree.root, "Work in the background") orelse return error.TestExpectedReadSidebarRow;
+    try testing.expectEqual(@as(usize, 1), read_row.children.len);
 }
 
 test "SQLite search covers messages outside the hydrated UI window" {
@@ -1428,8 +1595,12 @@ test "the global shortcut map reaches creation navigation focus and settings" {
     const second_project = model.active_project_id;
     try testing.expect(second_project != first_project);
     const first_project_thread = model.active_thread_id;
-    main.update(&model, main.onCommand(main.cmd_new_project_thread).?, &fx);
+    main.update(&model, main.onCommand(main.cmd_new_thread).?, &fx);
     try testing.expect(model.active_thread_id != first_project_thread);
+    try testing.expectEqual(second_project, activeThread(&model).project_id);
+    const contextual_project_thread = model.active_thread_id;
+    main.update(&model, main.onCommand(main.cmd_new_project_thread).?, &fx);
+    try testing.expect(model.active_thread_id != contextual_project_thread);
     try testing.expectEqual(second_project, activeThread(&model).project_id);
     main.update(&model, main.onCommand(main.cmd_previous_project).?, &fx);
     try testing.expectEqual(first_project, model.active_project_id);
@@ -1447,8 +1618,58 @@ test "the global shortcut map reaches creation navigation focus and settings" {
     try testing.expect(!model.settings_open and !model.model_picker_open);
     main.update(&model, main.onCommand(main.cmd_shortcuts).?, &fx);
     try testing.expect(model.shortcuts_open and !model.settings_open);
+    main.update(&model, .{ .shortcut_search_edit = .{ .insert_text = "archive" } }, &fx);
+    try testing.expectEqualStrings("archive", model.shortcutSearch());
     main.update(&model, .close_shortcuts, &fx);
     try testing.expect(!model.shortcuts_open);
+    try testing.expectEqualStrings("", model.shortcutSearch());
+}
+
+test "keyboard shortcuts are searchable by action and key aliases" {
+    var model = main.initialModel("test-key");
+    defer model.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    model.shortcut_search_buffer.set("archive");
+    const archive_rows = model.shortcutRows(arena_state.allocator());
+    try testing.expectEqual(@as(usize, 3), archive_rows.len);
+    for (archive_rows) |row| try testing.expect(std.ascii.indexOfIgnoreCase(row.action, "archive") != null);
+
+    _ = arena_state.reset(.retain_capacity);
+    model.shortcut_search_buffer.set("command shift n");
+    const command_rows = model.shortcutRows(arena_state.allocator());
+    try testing.expectEqual(@as(usize, 1), command_rows.len);
+    try testing.expectEqualStrings("New project", command_rows[0].action);
+
+    model.shortcut_search_buffer.set("definitely missing");
+    try testing.expect(model.shortcutSearchEmpty());
+}
+
+test "keyboard shortcuts search precedes a keyboard-scrollable list" {
+    var model = main.initialModel("test-key");
+    defer model.deinit();
+    model.shortcuts_open = true;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const tree = try buildTree(arena_state.allocator(), &model);
+    var layout_nodes: [512]canvas.WidgetLayoutNode = undefined;
+    const layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, main.window_width, main.window_height), &layout_nodes);
+    var semantics_buffer: [512]canvas.WidgetSemanticsNode = undefined;
+    const semantics = try layout.collectSemantics(&semantics_buffer);
+
+    var search_index: ?usize = null;
+    var scroll_index: ?usize = null;
+    for (semantics, 0..) |node, index| {
+        if (std.mem.eql(u8, node.label, "Search keyboard shortcuts")) search_index = index;
+        if (std.mem.startsWith(u8, node.label, "Keyboard shortcuts list.")) scroll_index = index;
+    }
+    const search = semantics[search_index orelse return error.TestExpectedSearchField];
+    const scroll = semantics[scroll_index orelse return error.TestExpectedShortcutScroll];
+    try testing.expect(search.focusable);
+    try testing.expect(scroll.focusable);
+    try testing.expect(scroll.actions.focus and scroll.actions.increment and scroll.actions.decrement);
+    try testing.expect(search_index.? < scroll_index.?);
 }
 
 test "MCP servers persist and discovered tools become keyboard-editable composer commands" {
@@ -1665,7 +1886,10 @@ test "modal layouts fit the 680 point minimum window and long content scrolls" {
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Archived items\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Command palette\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Settings\"") != null);
-    try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"All keyboard shortcuts\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "on-input=\"shortcut_search_edit\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "placeholder=\"Search shortcuts…\" autofocus=\"true\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Keyboard shortcuts list. Use Arrow keys, Page Up, Page Down, Home, or End to scroll.\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "Page Up / Page Down to scroll") != null);
 }
 
 test "first-run onboarding is bypassed by credentials completion or dev mode" {
