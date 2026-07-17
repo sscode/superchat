@@ -234,6 +234,23 @@ pub const Message = struct {
         return message.role == .assistant;
     }
 
+    pub fn userMessageWrap(message: *const Message) bool {
+        const value = message.content();
+        return message.attachment_count > 0 or value.len > 48 or std.mem.indexOfScalar(u8, value, '\n') != null;
+    }
+
+    pub fn userBubbleMinWidth(message: *const Message) f32 {
+        if (message.userMessageWrap()) return 320;
+        // Measure with the same bundled Geist metrics used by the canvas so
+        // the 12pt insets remain optically equal on both sides of short text.
+        const text_width = canvas.estimateTextWidthForFont(
+            canvas.default_sans_font_id,
+            message.content(),
+            14,
+        );
+        return @max(@as(f32, 56), @min(@as(f32, 420), @ceil(text_width + 24)));
+    }
+
     pub fn responseModel(message: *const Message) []const u8 {
         return message.response_model_storage[0..message.response_model_len];
     }
@@ -1038,6 +1055,7 @@ pub const Model = struct {
     model_catalog_url_storage: [512]u8 = undefined,
     model_catalog_dirty_mask: u32 = 0,
     model_picker_open: bool = false,
+    model_selector_open: bool = false,
     search_open: bool = false,
     search_buffer: canvas.TextBuffer(persistence.max_search_query_bytes) = .{},
     search_results: [max_search_results]SearchEntry = [_]SearchEntry{.{}} ** max_search_results,
@@ -1891,6 +1909,10 @@ pub const Model = struct {
         return model.model_search_buffer.text();
     }
 
+    pub fn commandPaletteMode(model: *const Model) bool {
+        return !model.model_selector_open;
+    }
+
     pub fn catalogRows(model: *const Model, arena: std.mem.Allocator) []const CatalogRow {
         const rows = arena.alloc(CatalogRow, model.model_catalog_count) catch return &.{};
         for (model.model_catalog[0..model.model_catalog_count], 0..) |*entry, index| {
@@ -1929,6 +1951,7 @@ pub const Model = struct {
 
     fn openMoveThread(model: *Model) void {
         model.model_picker_open = false;
+        model.model_selector_open = false;
         model.settings_open = false;
         model.move_thread_id = model.active_thread_id;
         model.move_open = model.move_thread_id != 0;
@@ -2285,6 +2308,11 @@ pub const Model = struct {
     pub fn sending(model: *const Model) bool {
         const thread = model.activeThreadConst() orelse return false;
         return thread.sending;
+    }
+
+    pub fn waitingForResponse(model: *const Model) bool {
+        const thread = model.activeThreadConst() orelse return false;
+        return thread.sending and thread.stream_message_index == null;
     }
 
     pub fn cannotStop(model: *const Model) bool {
@@ -3395,6 +3423,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .open_search => {
             model.model_picker_open = true;
+            model.model_selector_open = false;
             model.settings_open = false;
             model.shortcuts_open = false;
             model.fork_open = false;
@@ -3439,7 +3468,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
         },
         .toggle_model_picker => {
-            model.model_picker_open = !model.model_picker_open;
+            model.model_picker_open = true;
+            model.model_selector_open = true;
             if (model.model_picker_open and model.model_catalog_count == 0) model.setModelCatalogStatus("Search OpenRouter by model or provider");
         },
         .select_model => |choice| {
@@ -3841,6 +3871,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.clear_confirm_thread_id = 0;
             model.delete_confirm_open = false;
             model.model_picker_open = true;
+            model.model_selector_open = false;
             if (model.model_catalog_count == 0) model.setModelCatalogStatus("Search OpenRouter by model or provider");
         },
         .close_overlay => {
@@ -3852,6 +3883,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.rename_open = false;
             model.archive_open = false;
             model.model_picker_open = false;
+            model.model_selector_open = false;
             model.move_open = false;
             model.move_thread_id = 0;
             model.mcp_selected_tool = std.math.maxInt(usize);

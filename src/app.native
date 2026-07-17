@@ -132,9 +132,9 @@
                 <if test="{m.isUser}">
                   <row main="end">
                     <column cross="end" gap="4" label="User message group">
-                      <bubble min-width="220" padding="14" radius="lg" label="You said">
+                      <bubble min-width="{m.userBubbleMinWidth}" padding="12" radius="xl" label="You said">
                         <column gap="8">
-                          <text wrap="true">{m.content}</text>
+                          <text wrap="{m.userMessageWrap}">{m.content}</text>
                           <if test="{m.hasAttachments}">
                             <text size="sm" foreground="text_muted" wrap="true">{m.attachmentSummary}</text>
                           </if>
@@ -164,6 +164,17 @@
                   </column>
                 </else>
               </for>
+              <if test="{waitingForResponse}">
+                <column gap="12" label="Assistant is working">
+                  <column gap="10">
+                    <text size="sm" foreground="text_muted">Working…</text>
+                    <separator />
+                  </column>
+                  <row height="20" cross="center">
+                    <spinner size="sm" />
+                  </row>
+                </column>
+              </if>
             </if>
             <else>
               <column gap="8" padding="48" cross="center">
@@ -205,9 +216,9 @@
   </row>
 
   <if test="{model_picker_open}">
-    <panel background="scrim" on-press="close_overlay" label="Command palette backdrop">
+    <panel background="scrim" on-press="close_overlay" label="Palette backdrop">
       <column main="center" cross="center">
-        <dialog width="760" height="580" label="Command palette">
+        <dialog width="760" height="580" label="Models and commands">
           <column padding="28" gap="16">
             <if test="{search_open}">
               <row gap="12" cross="center">
@@ -244,6 +255,16 @@
               </scroll>
             </if>
             <else>
+            <if test="{model_selector_open}">
+            <row gap="12" cross="center">
+              <column gap="4" grow="1">
+                <text size="heading">Choose a model</text>
+                <text size="sm" foreground="text_muted">Set the model for the next response.</text>
+              </column>
+              <button size="sm" variant="ghost" icon="x" on-press="close_overlay" label="Close model picker"></button>
+            </row>
+            </if>
+            <else>
             <row gap="12" cross="center">
               <column gap="4" grow="1">
                 <text size="heading">Go anywhere</text>
@@ -252,7 +273,13 @@
               <badge size="sm" variant="secondary">Cmd + K</badge>
               <button size="sm" variant="ghost" icon="x" on-press="close_overlay" label="Close command palette"></button>
             </row>
+            </else>
+            <if test="{model_selector_open}">
+              <search-field text="{modelSearch}" on-input="model_search_edit" placeholder="Search models or providers…" autofocus="true" label="Model search" />
+            </if>
+            <else>
             <search-field text="{modelSearch}" on-input="model_search_edit" placeholder="Search chats, projects, or models…" autofocus="true" label="Universal search" />
+            </else>
             <scroll grow="1" label="Commands, chats, projects, and models">
               <column gap="16">
                 <column padding="12" gap="8" background="surface_subtle" radius="lg">
@@ -265,6 +292,7 @@
                     <button size="sm" variant="outline" on-press="select_claude_subscription" disabled="{claudeSubscriptionDisabled}">Claude · Experimental</button>
                   </grid>
                 </column>
+                <if test="{commandPaletteMode}">
                 <column padding="12" gap="6" background="surface_subtle" radius="lg">
                   <text size="sm" foreground="text_muted"><span weight="medium">Workspace</span></text>
                   <for each="paletteWorkspaceRows" as="w">
@@ -279,6 +307,7 @@
                     </for>
                   </grid>
                 </column>
+                </if>
                 <for each="catalogRows" key="index" as="m">
                   <row gap="6">
                     <button grow="1" variant="ghost" on-press="select_catalog_model:{m.index}">{m.label} · {m.slug}</button>

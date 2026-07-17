@@ -131,6 +131,7 @@ test "send creates a typed OpenRouter fetch and preserves the user turn" {
     try testing.expect(thread.draft_buffer.isEmpty());
     try testing.expect(thread.conversation_stick_to_bottom);
     try testing.expect(thread.conversation_scroll_offset > 90_000);
+    try testing.expect(model.waitingForResponse());
 
     const request = fx.pendingFetchAt(0) orelse return error.TestExpectedFetch;
     try testing.expectEqual(std.http.Method.POST, request.method);
@@ -164,6 +165,7 @@ test "conversation follows sent and streamed turns until the reader scrolls away
     const timer = fx.pendingTimerAt(0) orelse return error.TestExpectedTimer;
     main.update(&model, .{ .stream_flush = .{ .key = timer.key } }, &fx);
     try testing.expect(thread.conversation_scroll_offset > 90_000);
+    try testing.expect(!model.waitingForResponse());
 
     main.update(&model, .{ .conversation_scrolled = .{
         .offset = 40,
@@ -579,6 +581,29 @@ test "model picker searches OpenRouter catalog and keeps favorites" {
     try testing.expect(model.model_catalog[0].favorite);
     main.update(&model, .{ .select_catalog_model = 0 }, &fx);
     try testing.expectEqualStrings("anthropic/claude-test", activeThread(&model).modelName());
+}
+
+test "composer model selector opens models without command palette content" {
+    var model = main.initialModel("test-key");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+
+    main.update(&model, .toggle_model_picker, &fx);
+    try testing.expect(model.model_picker_open);
+    try testing.expect(model.model_selector_open);
+    try testing.expect(!model.commandPaletteMode());
+
+    // The selector is an open action, not a toggle: duplicate press delivery
+    // must not close the surface again.
+    main.update(&model, .toggle_model_picker, &fx);
+    try testing.expect(model.model_picker_open);
+    try testing.expect(model.model_selector_open);
+
+    main.update(&model, .close_overlay, &fx);
+    main.update(&model, .open_model_picker, &fx);
+    try testing.expect(model.model_picker_open);
+    try testing.expect(!model.model_selector_open);
+    try testing.expect(model.commandPaletteMode());
 }
 
 test "quick model slots map Command Shift 1 through 9 to current OpenRouter slugs" {
@@ -1451,6 +1476,22 @@ test "user messages can be copied as a whole" {
     try testing.expectEqualStrings("Message copied", model.toastText());
 }
 
+test "user bubbles hug short messages and widen only for wrapped content" {
+    var model = main.initialModel("test-key");
+    try testing.expect(model.appendMessage(.user, "ok"));
+    try testing.expect(model.appendMessage(.user, "This is a deliberately longer user message that should wrap inside a readable bubble instead of becoming a narrow column."));
+
+    const short = activeThread(&model).messages[0];
+    const long = activeThread(&model).messages[1];
+    try testing.expect(!short.userMessageWrap());
+    try testing.expectEqual(@as(f32, 56), short.userBubbleMinWidth());
+    const medium = main.Message{ .content_storage = @constCast("whats your name?"), .content_len = "whats your name?".len };
+    try testing.expect(!medium.userMessageWrap());
+    try testing.expectEqual(@as(f32, 145), medium.userBubbleMinWidth());
+    try testing.expect(long.userMessageWrap());
+    try testing.expectEqual(@as(f32, 320), long.userBubbleMinWidth());
+}
+
 test "message utility actions keep a restrained hierarchy" {
     var model = main.initialModel("test-key");
     try testing.expect(model.appendMessage(.user, "A message with utility actions"));
@@ -1459,8 +1500,11 @@ test "message utility actions keep a restrained hierarchy" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const tree = try buildTree(arena_state.allocator(), &model);
+    const user_bubble = findByLabel(tree.root, "You said") orelse return error.TestExpectedUserBubble;
     const user_actions = findByLabel(tree.root, "User message actions") orelse return error.TestExpectedUserMessageActions;
     const response_actions = findByLabel(tree.root, "Response actions") orelse return error.TestExpectedResponseActions;
+    try testing.expectEqual(activeThread(&model).messages[0].userBubbleMinWidth(), user_bubble.layout.min_size.width);
+    try testing.expectEqual(native_sdk.geometry.InsetsF.all(12), user_bubble.layout.padding);
     try testing.expectEqual(@as(f32, 0.5), response_actions.opacity);
     try testing.expectEqual(@as(usize, 2), user_actions.children.len);
     try testing.expectEqual(@as(usize, 3), response_actions.children.len);
@@ -1969,7 +2013,7 @@ test "modal layouts fit the 680 point minimum window and long content scrolls" {
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"640\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"580\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Archived items\"") != null);
-    try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Command palette\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Models and commands\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Settings\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "on-input=\"shortcut_search_edit\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "placeholder=\"Search shortcuts…\" autofocus=\"true\"") != null);
