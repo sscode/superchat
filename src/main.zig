@@ -146,7 +146,7 @@ pub const RenameKind = enum { project, thread };
 pub const ConnectionState = enum { disabled, checking, connected, disconnected, connecting, unavailable, failed };
 pub const UpdateState = enum { idle, checking, current, available, failed };
 pub const AttachmentKind = enum { image, pdf, text };
-pub const PaletteAction = enum { search, new_thread, new_project_thread, move_thread, attach, tools, snippets, export_thread, export_workspace, archive, settings };
+pub const PaletteAction = enum { search, new_thread, new_project_thread, move_thread, models, attach, tools, snippets, export_thread, export_workspace, archive, settings };
 pub const ExportKind = enum { none, thread_markdown, workspace_json };
 pub const McpOperation = enum { none, discover, call };
 
@@ -183,6 +183,7 @@ pub const QuickModel = struct {
     label: []const u8,
     slug: []const u8,
     shortcut: []const u8,
+    selected: bool = false,
 };
 
 pub const CatalogModel = struct {
@@ -206,6 +207,7 @@ pub const CatalogRow = struct {
     slug: []const u8,
     favorite: bool,
     favorite_label: []const u8,
+    favorite_icon: []const u8,
 };
 
 pub const Message = struct {
@@ -591,6 +593,8 @@ pub const PaletteWorkspaceRow = struct {
     key: u64,
     title: []const u8,
     detail: []const u8,
+    icon: []const u8,
+    selected: bool = false,
 };
 
 pub const MoveProjectRow = struct {
@@ -630,6 +634,9 @@ pub const PaletteActionRow = struct {
     id: PaletteAction,
     label: []const u8,
     shortcut: []const u8,
+    icon: []const u8,
+    detail: []const u8 = "",
+    selected: bool = false,
 };
 
 pub const MessageTruncation = struct {
@@ -1266,6 +1273,8 @@ pub const Model = struct {
         "threadById",
         "active_thread_id",
         "modelOptions",
+        "quickModels",
+        "commandPaletteMode",
         "activeModelChoice",
         "archiveEmpty",
         "cannotStop",
@@ -1278,15 +1287,15 @@ pub const Model = struct {
     };
 
     pub const quickModels = [_]QuickModel{
-        .{ .number = 1, .label = "GPT-5.5", .slug = "openai/gpt-5.5", .shortcut = "Cmd + Shift + 1" },
-        .{ .number = 2, .label = "GPT-5.4 Mini", .slug = "openai/gpt-5.4-mini", .shortcut = "Cmd + Shift + 2" },
-        .{ .number = 3, .label = "Claude Sonnet 5", .slug = "anthropic/claude-sonnet-5", .shortcut = "Cmd + Shift + 3" },
-        .{ .number = 4, .label = "Claude Opus 4.8", .slug = "anthropic/claude-opus-4.8", .shortcut = "Cmd + Shift + 4" },
-        .{ .number = 5, .label = "Gemini 3.5 Flash", .slug = "google/gemini-3.5-flash", .shortcut = "Cmd + Shift + 5" },
-        .{ .number = 6, .label = "Gemini 3.1 Pro", .slug = "google/gemini-3.1-pro-preview", .shortcut = "Cmd + Shift + 6" },
-        .{ .number = 7, .label = "GLM 5.2", .slug = "z-ai/glm-5.2", .shortcut = "Cmd + Shift + 7" },
-        .{ .number = 8, .label = "Kimi K2.6", .slug = "moonshotai/kimi-k2.6", .shortcut = "Cmd + Shift + 8" },
-        .{ .number = 9, .label = "Kimi K2.7 Code", .slug = "moonshotai/kimi-k2.7-code", .shortcut = "Cmd + Shift + 9" },
+        .{ .number = 1, .label = "GPT-5.5", .slug = "openai/gpt-5.5", .shortcut = "Shift Cmd 1" },
+        .{ .number = 2, .label = "GPT-5.4 Mini", .slug = "openai/gpt-5.4-mini", .shortcut = "Shift Cmd 2" },
+        .{ .number = 3, .label = "Claude Sonnet 5", .slug = "anthropic/claude-sonnet-5", .shortcut = "Shift Cmd 3" },
+        .{ .number = 4, .label = "Claude Opus 4.8", .slug = "anthropic/claude-opus-4.8", .shortcut = "Shift Cmd 4" },
+        .{ .number = 5, .label = "Gemini 3.5 Flash", .slug = "google/gemini-3.5-flash", .shortcut = "Shift Cmd 5" },
+        .{ .number = 6, .label = "Gemini 3.1 Pro", .slug = "google/gemini-3.1-pro-preview", .shortcut = "Shift Cmd 6" },
+        .{ .number = 7, .label = "GLM 5.2", .slug = "z-ai/glm-5.2", .shortcut = "Shift Cmd 7" },
+        .{ .number = 8, .label = "Kimi K2.6", .slug = "moonshotai/kimi-k2.6", .shortcut = "Shift Cmd 8" },
+        .{ .number = 9, .label = "Kimi K2.7 Code", .slug = "moonshotai/kimi-k2.7-code", .shortcut = "Shift Cmd 9" },
     };
 
     pub const modelOptions = [_]ModelOption{
@@ -1399,22 +1408,59 @@ pub const Model = struct {
         return true;
     }
 
-    pub const paletteActionRows = [_]PaletteActionRow{
-        .{ .id = .search, .label = "Search every chat", .shortcut = "Cmd + F" },
-        .{ .id = .new_thread, .label = "New chat", .shortcut = "Cmd + N" },
-        .{ .id = .new_project_thread, .label = "New chat in project", .shortcut = "Cmd + Opt + N" },
-        .{ .id = .move_thread, .label = "Move current chat", .shortcut = "Cmd + Shift + M" },
-        .{ .id = .tools, .label = "MCP tools", .shortcut = "Cmd + Opt + T" },
-        .{ .id = .snippets, .label = "Prompt snippets", .shortcut = "Cmd + Opt + P" },
+    const allPaletteActionRows = [_]PaletteActionRow{
+        .{ .id = .new_thread, .label = "New chat", .shortcut = "Cmd N", .icon = "edit" },
+        .{ .id = .search, .label = "Search all chats", .shortcut = "Cmd F", .icon = "search" },
+        .{ .id = .models, .label = "Change model", .shortcut = "", .icon = "circle-dot" },
+        .{ .id = .new_project_thread, .label = "New chat in project", .shortcut = "Opt Cmd N", .icon = "plus" },
+        .{ .id = .move_thread, .label = "Move current chat", .shortcut = "Shift Cmd M", .icon = "external-link" },
+        .{ .id = .tools, .label = "MCP tools", .shortcut = "Opt Cmd T", .icon = "terminal" },
+        .{ .id = .snippets, .label = "Prompt snippets", .shortcut = "Opt Cmd P", .icon = "file-text" },
     };
+
+    fn paletteActionMatches(query: []const u8, action: PaletteActionRow) bool {
+        return query.len == 0 or std.ascii.indexOfIgnoreCase(action.label, query) != null;
+    }
+
+    pub fn paletteActionRows(model: *const Model, arena: std.mem.Allocator) []const PaletteActionRow {
+        const rows = arena.alloc(PaletteActionRow, allPaletteActionRows.len) catch return &.{};
+        const query = std.mem.trim(u8, model.model_search_buffer.text(), " \t\r\n");
+        const result_limit: usize = if (query.len == 0) 3 else rows.len;
+        var count: usize = 0;
+        for (allPaletteActionRows) |action| {
+            if (count == result_limit) break;
+            if (!paletteActionMatches(query, action)) continue;
+            rows[count] = action;
+            if (action.id == .models) rows[count].detail = model.selectedModelLabel();
+            rows[count].selected = count == 0;
+            count += 1;
+        }
+        return rows[0..count];
+    }
+
+    pub fn paletteActionsVisible(model: *const Model, arena: std.mem.Allocator) bool {
+        return model.paletteActionRows(arena).len > 0;
+    }
 
     pub fn paletteWorkspaceRows(model: *const Model, arena: std.mem.Allocator) []const PaletteWorkspaceRow {
         const rows = arena.alloc(PaletteWorkspaceRow, max_palette_workspace_results) catch return &.{};
         const query = std.mem.trim(u8, model.model_search_buffer.text(), " \t\r\n");
         const result_limit: usize = if (query.len == 0) 4 else rows.len;
+        var action_match_exists = false;
+        for (allPaletteActionRows) |action| {
+            if (paletteActionMatches(query, action)) {
+                action_match_exists = true;
+                break;
+            }
+        }
         var count: usize = 0;
-        for (model.threads[0..model.thread_count]) |*thread| {
-            if (count == result_limit or thread.isArchived()) break;
+        var thread_index = model.thread_count;
+        while (thread_index > 0) {
+            thread_index -= 1;
+            const thread = &model.threads[thread_index];
+            if (count == result_limit) break;
+            if (thread.isArchived()) continue;
+            if (query.len == 0 and thread.message_count == 0) continue;
             const project = model.projectByIdConst(thread.project_id) orelse continue;
             if (project.isArchived()) continue;
             if (query.len > 0 and std.ascii.indexOfIgnoreCase(thread.title(), query) == null and std.ascii.indexOfIgnoreCase(project.name(), query) == null) continue;
@@ -1422,6 +1468,8 @@ pub const Model = struct {
                 .key = (@as(u64, 1) << 32) | thread.id,
                 .title = thread.title(),
                 .detail = if (thread.project_id == chats_project_id) "Chat" else project.name(),
+                .icon = "file-text",
+                .selected = !action_match_exists and count == 0,
             };
             count += 1;
         }
@@ -1429,10 +1477,20 @@ pub const Model = struct {
             if (count == result_limit) break;
             if (project.id == chats_project_id or project.isArchived()) continue;
             if (query.len > 0 and std.ascii.indexOfIgnoreCase(project.name(), query) == null) continue;
-            rows[count] = .{ .key = project.id, .title = project.name(), .detail = "Project" };
+            rows[count] = .{
+                .key = project.id,
+                .title = project.name(),
+                .detail = "Project",
+                .icon = "folder",
+                .selected = !action_match_exists and count == 0,
+            };
             count += 1;
         };
         return rows[0..count];
+    }
+
+    pub fn paletteWorkspaceVisible(model: *const Model, arena: std.mem.Allocator) bool {
+        return model.paletteWorkspaceRows(arena).len > 0;
     }
 
     pub fn moveProjectRows(model: *const Model, arena: std.mem.Allocator) []const MoveProjectRow {
@@ -1909,14 +1967,66 @@ pub const Model = struct {
         return model.model_search_buffer.text();
     }
 
+    pub fn modelSearchEmpty(model: *const Model) bool {
+        return std.mem.trim(u8, model.model_search_buffer.text(), " \t\r\n").len == 0;
+    }
+
+    pub fn modelSearchActive(model: *const Model) bool {
+        return !model.modelSearchEmpty();
+    }
+
+    pub fn modelCatalogVisible(model: *const Model) bool {
+        return std.mem.trim(u8, model.model_search_buffer.text(), " \t\r\n").len >= 2;
+    }
+
+    pub fn modelCatalogStatus(model: *const Model) []const u8 {
+        return model.model_catalog_status_storage[0..model.model_catalog_status_len];
+    }
+
     pub fn commandPaletteMode(model: *const Model) bool {
         return !model.model_selector_open;
+    }
+
+    pub fn paletteQuickModels(model: *const Model, arena: std.mem.Allocator) []const QuickModel {
+        const rows = arena.alloc(QuickModel, quickModels.len) catch return &.{};
+        const query = std.mem.trim(u8, model.model_search_buffer.text(), " \t\r\n");
+        var count: usize = 0;
+        for (quickModels) |option| {
+            if (query.len > 0 and std.ascii.indexOfIgnoreCase(option.label, query) == null and std.ascii.indexOfIgnoreCase(option.slug, query) == null) continue;
+            rows[count] = option;
+            rows[count].selected = std.mem.eql(u8, option.slug, model.modelName());
+            count += 1;
+        }
+        return rows[0..count];
+    }
+
+    pub fn autoModelSelected(model: *const Model) bool {
+        return model.activeModelChoice() == .auto;
+    }
+
+    pub fn codexModelSelected(model: *const Model) bool {
+        return model.activeModelChoice() == .codex_subscription;
+    }
+
+    pub fn claudeModelSelected(model: *const Model) bool {
+        return model.activeModelChoice() == .claude_subscription;
+    }
+
+    pub fn paletteQuickModelsVisible(model: *const Model, arena: std.mem.Allocator) bool {
+        return model.paletteQuickModels(arena).len > 0;
     }
 
     pub fn catalogRows(model: *const Model, arena: std.mem.Allocator) []const CatalogRow {
         const rows = arena.alloc(CatalogRow, model.model_catalog_count) catch return &.{};
         for (model.model_catalog[0..model.model_catalog_count], 0..) |*entry, index| {
-            rows[index] = .{ .index = @intCast(index), .label = entry.label(), .slug = entry.slug(), .favorite = entry.favorite, .favorite_label = if (entry.favorite) "Unfavorite" else "Favorite" };
+            rows[index] = .{
+                .index = @intCast(index),
+                .label = entry.label(),
+                .slug = entry.slug(),
+                .favorite = entry.favorite,
+                .favorite_label = if (entry.favorite) "Unfavorite" else "Favorite",
+                .favorite_icon = if (entry.favorite) "check" else "plus",
+            };
         }
         return rows;
     }
@@ -3398,6 +3508,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .mcp_server_command_edit => |edit| model.mcp_server_command_buffer.apply(edit),
         .model_search_edit => |edit| {
             model.model_search_buffer.apply(edit);
+            const query = std.mem.trim(u8, model.model_search_buffer.text(), " \t\r\n");
+            model.setModelCatalogStatus(if (query.len < 2) "Type at least 2 characters to search OpenRouter" else "Searching OpenRouter…");
             fx.startTimer(.{ .key = model_search_timer, .interval_ms = 250, .on_fire = Effects.timerMsg(.model_search) });
         },
         .model_search => searchModels(model, fx),
@@ -3452,12 +3564,19 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
         },
         .palette_action => |action| {
+            if (action == .models) {
+                model.model_selector_open = true;
+                model.model_search_buffer.clear();
+                model.setModelCatalogStatus("Search OpenRouter by model or provider");
+                return;
+            }
             model.model_picker_open = false;
             switch (action) {
                 .search => update(model, .open_search, fx),
                 .new_thread => update(model, .new_thread, fx),
                 .new_project_thread => update(model, .new_project_thread, fx),
                 .move_thread => update(model, .open_move_thread, fx),
+                .models => unreachable,
                 .attach => update(model, .open_file_picker, fx),
                 .tools => update(model, .open_mcp_tools, fx),
                 .snippets => update(model, .open_snippets, fx),

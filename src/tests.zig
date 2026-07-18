@@ -604,6 +604,12 @@ test "composer model selector opens models without command palette content" {
     try testing.expect(model.model_picker_open);
     try testing.expect(!model.model_selector_open);
     try testing.expect(model.commandPaletteMode());
+
+    model.model_search_buffer.set("stale query");
+    main.update(&model, .{ .palette_action = .models }, &fx);
+    try testing.expect(model.model_picker_open);
+    try testing.expect(model.model_selector_open);
+    try testing.expect(model.modelSearchEmpty());
 }
 
 test "quick model slots map Command Shift 1 through 9 to current OpenRouter slugs" {
@@ -1926,6 +1932,20 @@ test "the command palette finds chats and projects and moves chats between them"
     try testing.expect(rows.len > 0);
     try testing.expectEqualStrings("Market notes", rows[0].title);
 
+    model.model_search_buffer.set("model");
+    const actions = model.paletteActionRows(arena_state.allocator());
+    try testing.expectEqual(@as(usize, 1), actions.len);
+    try testing.expectEqual(main.PaletteAction.models, actions[0].id);
+    try testing.expectEqualStrings("Change model", actions[0].label);
+    try testing.expectEqualStrings(model.selectedModelLabel(), actions[0].detail);
+    try testing.expect(actions[0].selected);
+
+    model.model_search_buffer.clear();
+    const suggested_actions = model.paletteActionRows(arena_state.allocator());
+    try testing.expectEqual(@as(usize, 3), suggested_actions.len);
+    try testing.expect(suggested_actions[0].selected);
+    try testing.expect(!suggested_actions[1].selected);
+
     main.update(&model, .{ .select_thread = top_level_thread }, &fx);
     main.update(&model, .open_move_thread, &fx);
     try testing.expect(model.model_picker_open and model.move_open);
@@ -2011,7 +2031,7 @@ test "modal layouts fit the 680 point minimum window and long content scrolls" {
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"700\"") == null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"680\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"640\"") != null);
-    try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"580\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "width=\"760\" height=\"540\" label=\"Models and commands\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Archived items\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Models and commands\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Settings\"") != null);

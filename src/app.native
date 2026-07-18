@@ -218,8 +218,8 @@
   <if test="{model_picker_open}">
     <panel background="scrim" on-press="close_overlay" label="Palette backdrop">
       <column main="center" cross="center">
-        <dialog width="760" height="580" label="Models and commands">
-          <column padding="28" gap="16">
+        <dialog width="760" height="540" label="Models and commands">
+          <column padding="24" gap="14">
             <if test="{search_open}">
               <row gap="12" cross="center">
                 <column gap="4" grow="1">
@@ -256,70 +256,168 @@
             </if>
             <else>
             <if test="{model_selector_open}">
-            <row gap="12" cross="center">
-              <column gap="4" grow="1">
-                <text size="heading">Choose a model</text>
-                <text size="sm" foreground="text_muted">Set the model for the next response.</text>
-              </column>
-              <button size="sm" variant="ghost" icon="x" on-press="close_overlay" label="Close model picker"></button>
-            </row>
-            </if>
-            <else>
-            <row gap="12" cross="center">
-              <column gap="4" grow="1">
-                <text size="heading">Go anywhere</text>
-                <text size="sm" foreground="text_muted">Open a conversation, run an action, or choose the next model.</text>
-              </column>
-              <badge size="sm" variant="secondary">Cmd + K</badge>
-              <button size="sm" variant="ghost" icon="x" on-press="close_overlay" label="Close command palette"></button>
-            </row>
-            </else>
-            <if test="{model_selector_open}">
+              <row gap="12" cross="center">
+                <column gap="2" grow="1">
+                  <text size="heading">Choose a model</text>
+                  <text size="sm" foreground="text_muted">Currently using {selectedModelLabel}</text>
+                </column>
+                <button size="sm" variant="ghost" icon="x" on-press="close_overlay" label="Close model picker"></button>
+              </row>
               <search-field text="{modelSearch}" on-input="model_search_edit" placeholder="Search models or providers…" autofocus="true" label="Model search" />
+              <scroll grow="1" label="Models">
+                <column gap="18" padding="4">
+                  <if test="{paletteQuickModelsVisible}">
+                    <column gap="8">
+                      <if test="{modelSearchEmpty}">
+                        <text size="sm" foreground="text_muted"><span weight="medium">Quick picks</span></text>
+                      </if>
+                      <else>
+                        <text size="sm" foreground="text_muted"><span weight="medium">Quick matches</span></text>
+                      </else>
+                      <grid columns="3" gap="8">
+                        <for each="paletteQuickModels" as="q">
+                          <if test="{q.selected}">
+                            <button size="lg" variant="secondary" selected="true" on-press="select_quick_model:{q.number}">{q.number} · {q.label}</button>
+                          </if>
+                          <else>
+                            <button size="lg" variant="outline" on-press="select_quick_model:{q.number}">{q.number} · {q.label}</button>
+                          </else>
+                        </for>
+                      </grid>
+                    </column>
+                  </if>
+                  <if test="{modelSearchEmpty}">
+                    <column gap="8">
+                      <text size="sm" foreground="text_muted"><span weight="medium">Connections and custom models</span></text>
+                      <grid columns="2" gap="8">
+                        <if test="{autoModelSelected}">
+                          <button size="lg" variant="secondary" selected="true" on-press="select_auto_model">OpenRouter Auto</button>
+                        </if>
+                        <else>
+                          <button size="lg" variant="outline" on-press="select_auto_model">OpenRouter Auto</button>
+                        </else>
+                        <if test="{codexModelSelected}">
+                          <button size="lg" variant="secondary" selected="true" on-press="select_codex_subscription">Codex · ChatGPT</button>
+                        </if>
+                        <else>
+                          <button size="lg" variant="outline" on-press="select_codex_subscription">Codex · ChatGPT</button>
+                        </else>
+                        <if test="{claudeModelSelected}">
+                          <button size="lg" variant="secondary" selected="true" on-press="select_claude_subscription" disabled="{claudeSubscriptionDisabled}">Claude · Experimental</button>
+                        </if>
+                        <else>
+                          <button size="lg" variant="outline" on-press="select_claude_subscription" disabled="{claudeSubscriptionDisabled}">Claude · Experimental</button>
+                        </else>
+                        <button size="lg" variant="outline" on-press="select_custom_model">Enter a model ID…</button>
+                      </grid>
+                    </column>
+                  </if>
+                  <if test="{modelCatalogVisible}">
+                    <column gap="6">
+                      <row gap="8" cross="center">
+                        <text size="sm" foreground="text_muted" grow="1"><span weight="medium">OpenRouter</span></text>
+                        <text size="sm" foreground="text_muted">{modelCatalogStatus}</text>
+                      </row>
+                      <for each="catalogRows" key="index" as="m">
+                        <row gap="4">
+                          <list-item size="lg" gap="8" label="{m.label}" grow="1" on-press="select_catalog_model:{m.index}">
+                            <icon name="circle-dot" foreground="text_muted" width="16" height="16" />
+                            <text grow="1">{m.label}</text>
+                            <text size="sm" foreground="text_muted">{m.slug}</text>
+                          </list-item>
+                          <button size="lg" variant="ghost" icon="{m.favorite_icon}" label="{m.favorite_label}" on-press="toggle_model_favorite:{m.index}"></button>
+                        </row>
+                      </for>
+                    </column>
+                  </if>
+                </column>
+              </scroll>
             </if>
             <else>
-            <search-field text="{modelSearch}" on-input="model_search_edit" placeholder="Search chats, projects, or models…" autofocus="true" label="Universal search" />
+              <row gap="12" cross="center">
+                <column gap="2" grow="1">
+                  <text size="heading">Go anywhere</text>
+                  <text size="sm" foreground="text_muted">Open recent work or run a command.</text>
+                </column>
+                <button size="sm" variant="ghost" icon="x" on-press="close_overlay" label="Close command palette"></button>
+              </row>
+              <search-field text="{modelSearch}" on-input="model_search_edit" placeholder="Search chats, projects, actions, or models…" autofocus="true" label="Command palette" />
+              <scroll grow="1" label="Chats, projects, actions, and models">
+                <column gap="18" padding="4">
+                  <if test="{paletteActionsVisible}">
+                    <column gap="6">
+                      <if test="{modelSearchEmpty}">
+                        <text size="sm" foreground="text_muted"><span weight="medium">Start here</span></text>
+                      </if>
+                      <else>
+                        <text size="sm" foreground="text_muted"><span weight="medium">Commands</span></text>
+                      </else>
+                      <for each="paletteActionRows" as="a">
+                        <list-item size="lg" gap="8" label="{a.label}" selected="{a.selected}" on-press="palette_action:{a.id}">
+                          <icon name="{a.icon}" foreground="text_muted" width="16" height="16" />
+                          <text grow="1">{a.label}</text>
+                          <if test="{a.shortcut}">
+                            <text size="sm" foreground="text_muted">{a.shortcut}</text>
+                          </if>
+                          <if test="{a.detail}">
+                            <text size="sm" foreground="text_muted">{a.detail}</text>
+                          </if>
+                        </list-item>
+                      </for>
+                    </column>
+                  </if>
+                  <if test="{paletteWorkspaceVisible}">
+                    <column gap="6">
+                      <if test="{modelSearchEmpty}">
+                        <text size="sm" foreground="text_muted"><span weight="medium">Recent work</span></text>
+                      </if>
+                      <else>
+                        <text size="sm" foreground="text_muted"><span weight="medium">Workspace</span></text>
+                      </else>
+                      <for each="paletteWorkspaceRows" as="w">
+                        <list-item size="lg" gap="8" label="{w.title}" selected="{w.selected}" on-press="select_palette_workspace:{w.key}">
+                          <icon name="{w.icon}" foreground="text_muted" width="16" height="16" />
+                          <text grow="1">{w.title}</text>
+                          <text size="sm" foreground="text_muted">{w.detail}</text>
+                        </list-item>
+                      </for>
+                    </column>
+                  </if>
+                  <if test="{modelSearchActive}">
+                    <if test="{paletteQuickModelsVisible}">
+                      <column gap="6">
+                        <text size="sm" foreground="text_muted"><span weight="medium">Models</span></text>
+                        <for each="paletteQuickModels" as="q">
+                          <list-item size="lg" gap="8" label="{q.label}" selected="{q.selected}" on-press="select_quick_model:{q.number}">
+                            <icon name="circle-dot" foreground="text_muted" width="16" height="16" />
+                            <text grow="1">{q.label}</text>
+                            <text size="sm" foreground="text_muted">{q.slug}</text>
+                          </list-item>
+                        </for>
+                      </column>
+                    </if>
+                    <if test="{modelCatalogVisible}">
+                      <column gap="4">
+                        <row gap="8" cross="center">
+                          <text size="sm" foreground="text_muted" grow="1"><span weight="medium">OpenRouter</span></text>
+                          <text size="sm" foreground="text_muted">{modelCatalogStatus}</text>
+                        </row>
+                        <for each="catalogRows" key="index" as="m">
+                          <row gap="4">
+                            <list-item size="lg" gap="8" label="{m.label}" grow="1" on-press="select_catalog_model:{m.index}">
+                              <icon name="circle-dot" foreground="text_muted" width="16" height="16" />
+                              <text grow="1">{m.label}</text>
+                              <text size="sm" foreground="text_muted">{m.slug}</text>
+                            </list-item>
+                            <button size="lg" variant="ghost" icon="{m.favorite_icon}" label="{m.favorite_label}" on-press="toggle_model_favorite:{m.index}"></button>
+                          </row>
+                        </for>
+                      </column>
+                    </if>
+                  </if>
+                </column>
+              </scroll>
             </else>
-            <scroll grow="1" label="Commands, chats, projects, and models">
-              <column gap="16">
-                <column padding="12" gap="8" background="surface_subtle" radius="lg">
-                  <text size="sm" foreground="text_muted"><span weight="medium">Models for the next response</span></text>
-                  <grid columns="3" gap="6">
-                    <for each="quickModels" as="q">
-                      <button size="sm" variant="outline" on-press="select_quick_model:{q.number}" label="{q.slug}">{q.number} · {q.label}</button>
-                    </for>
-                    <button size="sm" variant="outline" on-press="select_codex_subscription">Codex · ChatGPT</button>
-                    <button size="sm" variant="outline" on-press="select_claude_subscription" disabled="{claudeSubscriptionDisabled}">Claude · Experimental</button>
-                  </grid>
-                </column>
-                <if test="{commandPaletteMode}">
-                <column padding="12" gap="6" background="surface_subtle" radius="lg">
-                  <text size="sm" foreground="text_muted"><span weight="medium">Workspace</span></text>
-                  <for each="paletteWorkspaceRows" as="w">
-                    <list-item size="sm" on-press="select_palette_workspace:{w.key}">{w.title} · {w.detail}</list-item>
-                  </for>
-                </column>
-                <column padding="12" gap="8" background="surface_subtle" radius="lg">
-                  <text size="sm" foreground="text_muted"><span weight="medium">Actions</span></text>
-                  <grid columns="2" gap="6">
-                    <for each="paletteActionRows" as="a">
-                      <button size="sm" variant="ghost" on-press="palette_action:{a.id}">{a.label} · {a.shortcut}</button>
-                    </for>
-                  </grid>
-                </column>
-                </if>
-                <for each="catalogRows" key="index" as="m">
-                  <row gap="6">
-                    <button grow="1" variant="ghost" on-press="select_catalog_model:{m.index}">{m.label} · {m.slug}</button>
-                    <button size="sm" variant="ghost" on-press="toggle_model_favorite:{m.index}">{m.favorite_label}</button>
-                  </row>
-                </for>
-              </column>
-            </scroll>
-            <row gap="8" main="end">
-              <button size="sm" variant="ghost" on-press="select_custom_model">Enter model ID manually</button>
-              <button size="sm" variant="outline" on-press="select_auto_model">Use OpenRouter Auto</button>
-            </row>
             </else>
             </else>
           </column>
