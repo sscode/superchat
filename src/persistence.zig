@@ -3,6 +3,9 @@ const storage = @import("storage.zig");
 const mcp = @import("mcp.zig");
 
 pub const max_project_name_bytes = 48;
+pub const max_project_instructions_bytes = 4000;
+pub const max_project_knowledge_bytes = 48 * 1024;
+pub const max_project_file_names_bytes = 512;
 pub const max_thread_title_bytes = 80;
 pub const max_draft_bytes = 5000;
 pub const max_model_bytes = 128;
@@ -23,12 +26,21 @@ pub const ProjectRecord = struct {
     id: u32,
     name: [max_project_name_bytes]u8 = undefined,
     name_len: usize = 0,
+    instructions: [max_project_instructions_bytes]u8 = undefined,
+    instructions_len: usize = 0,
+    knowledge: [max_project_knowledge_bytes]u8 = undefined,
+    knowledge_len: usize = 0,
+    file_names: [max_project_file_names_bytes]u8 = undefined,
+    file_names_len: usize = 0,
     archived_at_ms: i64,
     position: usize,
 
     pub fn from(project: anytype, position: usize) ProjectRecord {
         var record = ProjectRecord{ .id = project.id, .archived_at_ms = project.archived_at_ms, .position = position };
         record.name_len = copyText(&record.name, project.name());
+        record.instructions_len = copyText(&record.instructions, project.instructions());
+        record.knowledge_len = copyText(&record.knowledge, project.knowledge());
+        record.file_names_len = copyText(&record.file_names, project.fileNames());
         return record;
     }
 };
@@ -223,7 +235,7 @@ pub const SearchRequest = struct {
 };
 
 pub const Command = union(enum) {
-    upsert_project: ProjectRecord,
+    upsert_project: *ProjectRecord,
     upsert_thread: *ThreadRecord,
     upsert_message: *MessageRecord,
     clear_messages: u32,
@@ -297,6 +309,10 @@ pub const Worker = struct {
 
     pub fn enqueueMessage(worker: *Worker, record: MessageRecord) bool {
         return worker.enqueueOwned(record, .upsert_message);
+    }
+
+    pub fn enqueueProject(worker: *Worker, record: ProjectRecord) bool {
+        return worker.enqueueOwned(record, .upsert_project);
     }
 
     pub fn enqueueThread(worker: *Worker, record: ThreadRecord) bool {
@@ -434,7 +450,10 @@ pub const Worker = struct {
 
     fn apply(worker: *Worker, command: Command) !void {
         switch (command) {
-            .upsert_project => |record| try worker.database.upsertProject(record.id, record.name[0..record.name_len], record.archived_at_ms, record.position),
+            .upsert_project => |record| {
+                defer worker.allocator.destroy(record);
+                try worker.database.upsertProject(record.id, record.name[0..record.name_len], record.instructions[0..record.instructions_len], record.knowledge[0..record.knowledge_len], record.file_names[0..record.file_names_len], record.archived_at_ms, record.position);
+            },
             .upsert_thread => |record| {
                 defer worker.allocator.destroy(record);
                 try worker.database.upsertThread(
@@ -513,6 +532,7 @@ pub const Worker = struct {
 
     fn deinitCommand(worker: *Worker, command: Command) void {
         switch (command) {
+            .upsert_project => |record| worker.allocator.destroy(record),
             .upsert_thread => |record| worker.allocator.destroy(record),
             .upsert_message => |record| worker.allocator.destroy(record),
             .reconcile => |record| worker.allocator.destroy(record),

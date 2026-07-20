@@ -52,8 +52,9 @@
             <stack width="28" height="28">
               <button size="sm" variant="ghost" icon="ellipsis" on-press="toggle_project_menu" disabled="{cannotManageProject}" label="Selected project actions"></button>
               <if test="{project_menu_open}">
-                <dropdown-menu anchor="below" anchor-alignment="end" anchor-offset="6" width="196" height="100" padding="4" gap="2" on-dismiss="close_project_menu" label="Project actions">
+                <dropdown-menu anchor="below" anchor-alignment="end" anchor-offset="6" width="196" height="132" padding="4" gap="2" on-dismiss="close_project_menu" label="Project actions">
                   <menu-item size="sm" icon="plus" on-press="new_project_thread">New chat in project</menu-item>
+                  <menu-item size="sm" icon="folder" on-press="open_project_context">Instructions &amp; knowledge</menu-item>
                   <menu-item size="sm" icon="edit" on-press="open_rename_project">Rename project</menu-item>
                   <separator />
                   <menu-item size="sm" icon="archive" on-press="archive_project">Archive project</menu-item>
@@ -508,6 +509,44 @@
             <row gap="8" main="end">
               <text size="sm" foreground="text_muted" grow="1">Changes apply locally to this Mac.</text>
               <button size="sm" variant="primary" on-press="save_settings" disabled="{cannotSaveSettings}">Save changes</button>
+            </row>
+          </column>
+        </dialog>
+      </column>
+    </panel>
+  </if>
+
+  <if test="{project_context_open}">
+    <panel background="scrim" on-press="close_project_context" label="Project context backdrop">
+      <column main="center" cross="center">
+        <dialog width="680" height="540" label="Project instructions and knowledge">
+          <column padding="28" gap="16">
+            <row gap="12" cross="center">
+              <column grow="1" gap="4">
+                <text size="heading">Project context</text>
+                <text size="sm" foreground="text_muted">Shared with every chat in this project.</text>
+              </column>
+              <button size="sm" variant="ghost" icon="x" on-press="close_project_context" label="Close project context"></button>
+            </row>
+            <column gap="8">
+              <text><span weight="bold">Instructions</span></text>
+              <textarea text="{projectInstructions}" on-input="project_instructions_edit" height="180" placeholder="Describe the project, preferred style, constraints, and goals…" label="Project instructions" />
+            </column>
+            <column padding="14" gap="10" background="surface_subtle" radius="lg">
+              <row gap="8" cross="center">
+                <column grow="1" gap="3">
+                  <text><span weight="bold">Shared knowledge files</span></text>
+                  <text size="sm" foreground="text_muted" wrap="true">UTF-8 text and code files are copied into this project's local knowledge context.</text>
+                </column>
+                <button size="sm" variant="outline" icon="plus" on-press="open_project_file_picker">Add files</button>
+                <if test="{projectHasKnowledge}"><button size="sm" variant="ghost" on-press="clear_project_files">Clear</button></if>
+              </row>
+              <text size="sm" foreground="text_muted" wrap="true">{projectKnowledgeFiles}</text>
+            </column>
+            <spacer grow="1" />
+            <row main="end" gap="8">
+              <button size="sm" variant="ghost" on-press="close_project_context">Cancel</button>
+              <button size="sm" variant="primary" on-press="save_project_context">Save project context</button>
             </row>
           </column>
         </dialog>

@@ -88,7 +88,7 @@ pub const Database = struct {
         errdefer database.close();
         try database.configure();
         const version = try database.schemaVersion();
-        if (version > 0 and version < 6) try database.backup(path, version);
+        if (version > 0 and version < 7) try database.backup(path, version);
         try database.migrate(version);
         return database;
     }
@@ -110,6 +110,9 @@ pub const Database = struct {
             \\CREATE TABLE IF NOT EXISTS projects (
             \\  id INTEGER PRIMARY KEY,
             \\  name TEXT NOT NULL,
+            \\  instructions TEXT NOT NULL DEFAULT '',
+            \\  knowledge TEXT NOT NULL DEFAULT '',
+            \\  file_names TEXT NOT NULL DEFAULT '',
             \\  archived_at_ms INTEGER NOT NULL DEFAULT 0,
             \\  position INTEGER NOT NULL
             \\);
@@ -178,6 +181,11 @@ pub const Database = struct {
             \\);
             \\COMMIT;
         );
+        if (previous_version > 0 and previous_version < 7) {
+            database.exec("ALTER TABLE projects ADD COLUMN instructions TEXT NOT NULL DEFAULT '';") catch {};
+            database.exec("ALTER TABLE projects ADD COLUMN knowledge TEXT NOT NULL DEFAULT '';") catch {};
+            database.exec("ALTER TABLE projects ADD COLUMN file_names TEXT NOT NULL DEFAULT '';") catch {};
+        }
         if (previous_version > 0 and previous_version < 4) {
             if (!try database.hasColumn("messages", "response_model")) try database.exec("ALTER TABLE messages ADD COLUMN response_model TEXT NOT NULL DEFAULT '';");
             if (!try database.hasColumn("messages", "latency_ms")) try database.exec("ALTER TABLE messages ADD COLUMN latency_ms INTEGER NOT NULL DEFAULT 0;");
@@ -185,7 +193,7 @@ pub const Database = struct {
             if (!try database.hasColumn("messages", "completion_tokens")) try database.exec("ALTER TABLE messages ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0;");
             if (!try database.hasColumn("messages", "cost_micros")) try database.exec("ALTER TABLE messages ADD COLUMN cost_micros INTEGER NOT NULL DEFAULT 0;");
         }
-        try database.exec("PRAGMA user_version = 6;");
+        try database.exec("PRAGMA user_version = 7;");
     }
 
     fn backup(database: *Database, path: []const u8, version: i64) Error!void {
@@ -412,16 +420,19 @@ pub const Database = struct {
         try stepDone(threads);
     }
 
-    pub fn upsertProject(database: *Database, id: u32, name: []const u8, archived_at_ms: i64, position: usize) Error!void {
+    pub fn upsertProject(database: *Database, id: u32, name: []const u8, instructions: []const u8, knowledge: []const u8, file_names: []const u8, archived_at_ms: i64, position: usize) Error!void {
         const statement = try database.prepare(
-            "INSERT INTO projects(id,name,archived_at_ms,position) VALUES(?1,?2,?3,?4) " ++
-                "ON CONFLICT(id) DO UPDATE SET name=excluded.name,archived_at_ms=excluded.archived_at_ms,position=excluded.position;",
+            "INSERT INTO projects(id,name,instructions,knowledge,file_names,archived_at_ms,position) VALUES(?1,?2,?3,?4,?5,?6,?7) " ++
+                "ON CONFLICT(id) DO UPDATE SET name=excluded.name,instructions=excluded.instructions,knowledge=excluded.knowledge,file_names=excluded.file_names,archived_at_ms=excluded.archived_at_ms,position=excluded.position;",
         );
         defer _ = c.sqlite3_finalize(statement);
         try bindInt(statement, 1, id);
         try bindText(statement, 2, name);
-        try bindInt(statement, 3, archived_at_ms);
-        try bindInt(statement, 4, position);
+        try bindText(statement, 3, instructions);
+        try bindText(statement, 4, knowledge);
+        try bindText(statement, 5, file_names);
+        try bindInt(statement, 6, archived_at_ms);
+        try bindInt(statement, 7, position);
         try stepDone(statement);
     }
 
@@ -609,13 +620,16 @@ pub const Database = struct {
         errdefer database.exec("ROLLBACK;") catch {};
         try database.exec("DELETE FROM messages; DELETE FROM threads; DELETE FROM projects; DELETE FROM workspace_meta;");
 
-        const project_statement = try database.prepare("INSERT INTO projects(id,name,archived_at_ms,position) VALUES(?1,?2,?3,?4);");
+        const project_statement = try database.prepare("INSERT INTO projects(id,name,instructions,knowledge,file_names,archived_at_ms,position) VALUES(?1,?2,?3,?4,?5,?6,?7);");
         defer _ = c.sqlite3_finalize(project_statement);
         for (model.projects[0..model.project_count], 0..) |*project, position| {
             try bindInt(project_statement, 1, project.id);
             try bindText(project_statement, 2, project.name());
-            try bindInt(project_statement, 3, project.archived_at_ms);
-            try bindInt(project_statement, 4, position);
+            try bindText(project_statement, 3, project.instructions());
+            try bindText(project_statement, 4, project.knowledge());
+            try bindText(project_statement, 5, project.fileNames());
+            try bindInt(project_statement, 6, project.archived_at_ms);
+            try bindInt(project_statement, 7, position);
             try stepDone(project_statement);
             reset(project_statement);
         }
@@ -676,7 +690,7 @@ pub const Database = struct {
         model.project_count = 0;
         model.thread_count = 0;
 
-        const projects = try database.prepare("SELECT id,name,archived_at_ms FROM projects ORDER BY position,id;");
+        const projects = try database.prepare("SELECT id,name,instructions,knowledge,file_names,archived_at_ms FROM projects ORDER BY position,id;");
         defer _ = c.sqlite3_finalize(projects);
         while (true) {
             const result = c.sqlite3_step(projects);
@@ -685,7 +699,10 @@ pub const Database = struct {
             if (!model.ensureProjectCapacity(model.project_count + 1)) return error.InvalidData;
             var project: @TypeOf(model.projects[0]) = .{ .id = intColumn(u32, projects, 0) };
             setFixed(&project.name_storage, &project.name_len, textColumn(projects, 1));
-            project.archived_at_ms = c.sqlite3_column_int64(projects, 2);
+            setFixed(&project.instructions_storage, &project.instructions_len, textColumn(projects, 2));
+            setFixed(&project.knowledge_storage, &project.knowledge_len, textColumn(projects, 3));
+            setFixed(&project.file_names_storage, &project.file_names_len, textColumn(projects, 4));
+            project.archived_at_ms = c.sqlite3_column_int64(projects, 5);
             model.projects[model.project_count] = project;
             model.project_count += 1;
         }
@@ -900,7 +917,7 @@ pub const Database = struct {
         var output: std.Io.Writer.Allocating = .init(allocator);
         defer output.deinit();
         const writer = &output.writer;
-        try writer.writeAll("{\"format\":\"superchat-workspace\",\"version\":2,\"meta\":");
+        try writer.writeAll("{\"format\":\"superchat-workspace\",\"version\":3,\"meta\":");
         const meta = try database.prepare("SELECT active_project_id,active_thread_id,next_project_id,next_thread_id,next_message_id FROM workspace_meta WHERE singleton=1;");
         defer _ = c.sqlite3_finalize(meta);
         if (c.sqlite3_step(meta) == c.SQLITE_ROW) {
@@ -930,7 +947,7 @@ pub const Database = struct {
             try writer.print(",\"favorite\":{s},\"updated_at_ms\":{d}}}", .{ if (c.sqlite3_column_int(cached_models, 2) != 0) "true" else "false", intColumn(i64, cached_models, 3) });
         }
         try writer.writeAll("],\"projects\":[");
-        const projects = try database.prepare("SELECT id,name,archived_at_ms,position FROM projects ORDER BY position,id;");
+        const projects = try database.prepare("SELECT id,name,instructions,knowledge,file_names,archived_at_ms,position FROM projects ORDER BY position,id;");
         defer _ = c.sqlite3_finalize(projects);
         first = true;
         while (true) {
@@ -941,7 +958,13 @@ pub const Database = struct {
             first = false;
             try writer.print("{{\"id\":{d},\"name\":", .{intColumn(u32, projects, 0)});
             try std.json.Stringify.value(textColumn(projects, 1), .{}, writer);
-            try writer.print(",\"archived_at_ms\":{d},\"position\":{d}}}", .{ intColumn(i64, projects, 2), intColumn(usize, projects, 3) });
+            try writer.writeAll(",\"instructions\":");
+            try std.json.Stringify.value(textColumn(projects, 2), .{}, writer);
+            try writer.writeAll(",\"knowledge\":");
+            try std.json.Stringify.value(textColumn(projects, 3), .{}, writer);
+            try writer.writeAll(",\"file_names\":");
+            try std.json.Stringify.value(textColumn(projects, 4), .{}, writer);
+            try writer.print(",\"archived_at_ms\":{d},\"position\":{d}}}", .{ intColumn(i64, projects, 5), intColumn(usize, projects, 6) });
         }
         try writer.writeAll("],\"threads\":[");
         const threads = try database.prepare("SELECT id,project_id,title,archived_at_ms,position,draft,model_choice,model_slug,active_model FROM threads ORDER BY position,id;");

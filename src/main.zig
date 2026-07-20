@@ -305,6 +305,12 @@ pub const Project = struct {
     id: u32 = 0,
     name_storage: [max_project_name_bytes]u8 = undefined,
     name_len: usize = 0,
+    instructions_storage: [persistence.max_project_instructions_bytes]u8 = undefined,
+    instructions_len: usize = 0,
+    knowledge_storage: [persistence.max_project_knowledge_bytes]u8 = undefined,
+    knowledge_len: usize = 0,
+    file_names_storage: [persistence.max_project_file_names_bytes]u8 = undefined,
+    file_names_len: usize = 0,
     archived_at_ms: i64 = 0,
 
     pub fn name(project: *const Project) []const u8 {
@@ -314,6 +320,10 @@ pub const Project = struct {
     pub fn isArchived(project: *const Project) bool {
         return project.archived_at_ms > 0;
     }
+
+    pub fn instructions(project: *const Project) []const u8 { return project.instructions_storage[0..project.instructions_len]; }
+    pub fn knowledge(project: *const Project) []const u8 { return project.knowledge_storage[0..project.knowledge_len]; }
+    pub fn fileNames(project: *const Project) []const u8 { return project.file_names_storage[0..project.file_names_len]; }
 };
 
 pub const PromptSnippet = struct {
@@ -657,6 +667,7 @@ const UpdateRelease = struct {
 const PendingAttachment = struct {
     key: u64 = 0,
     thread_id: u32 = 0,
+    project_id: u32 = 0,
     kind: AttachmentKind = .text,
     path_storage: [max_attachment_path_bytes]u8 = undefined,
     path_len: usize = 0,
@@ -912,6 +923,12 @@ pub const Msg = union(enum) {
     create_forks,
     open_rename_thread,
     open_rename_project,
+    open_project_context,
+    close_project_context,
+    project_instructions_edit: canvas.TextInputEvent,
+    save_project_context,
+    open_project_file_picker,
+    clear_project_files,
     rename_edit: canvas.TextInputEvent,
     save_rename,
     close_rename,
@@ -1053,6 +1070,7 @@ pub const Model = struct {
     api_key_storage: [max_api_key_bytes]u8 = undefined,
     api_key_len: usize = 0,
     request_storage: [max_request_bytes]u8 = undefined,
+    project_context_storage: [persistence.max_project_instructions_bytes + persistence.max_project_knowledge_bytes + 256]u8 = undefined,
     model_search_buffer: canvas.TextBuffer(80) = .{},
     model_catalog: [32]CatalogModel = undefined,
     model_catalog_count: usize = 0,
@@ -1071,6 +1089,9 @@ pub const Model = struct {
     search_loading: bool = false,
     search_request_pending: bool = false,
     settings_open: bool = false,
+    project_context_open: bool = false,
+    project_context_id: u32 = 0,
+    project_instructions_buffer: canvas.TextBuffer(persistence.max_project_instructions_bytes) = .{},
     shortcuts_open: bool = false,
     shortcut_search_buffer: canvas.TextBuffer(96) = .{},
     project_menu_open: bool = false,
@@ -1158,6 +1179,7 @@ pub const Model = struct {
     pending_attachment_count: usize = 0,
     next_attachment_read_key: u64 = attachment_read_key_base + 1,
     file_picker_requested: bool = false,
+    project_file_picker_requested: bool = false,
 
     // These are implementation state read by the derived bindings below
     // or by update/effects; they are intentionally not exposed directly
@@ -1176,6 +1198,7 @@ pub const Model = struct {
         "api_key_storage",
         "api_key_len",
         "request_storage",
+        "project_context_storage",
         "model_search_buffer",
         "model_catalog",
         "model_catalog_count",
@@ -1265,6 +1288,9 @@ pub const Model = struct {
         "pending_attachment_count",
         "next_attachment_read_key",
         "file_picker_requested",
+        "project_file_picker_requested",
+        "project_context_id",
+        "project_instructions_buffer",
         "clear_confirm_thread_id",
         "delete_kind",
         "delete_id",
@@ -1627,6 +1653,17 @@ pub const Model = struct {
     pub fn draft(model: *const Model) []const u8 {
         const thread = model.activeThreadConst() orelse return "";
         return thread.draft();
+    }
+
+    pub fn projectInstructions(model: *const Model) []const u8 { return model.project_instructions_buffer.text(); }
+    pub fn projectKnowledgeFiles(model: *const Model) []const u8 {
+        const project = model.projectByIdConst(model.project_context_id) orelse return "No shared files yet";
+        return if (project.file_names_len == 0) "No shared files yet" else project.fileNames();
+    }
+
+    pub fn projectHasKnowledge(model: *const Model) bool {
+        const project = model.projectByIdConst(model.project_context_id) orelse return false;
+        return project.knowledge_len > 0;
     }
 
     pub fn draftAttachmentRows(model: *const Model, arena: std.mem.Allocator) []const AttachmentRow {
@@ -2977,10 +3014,15 @@ pub const Model = struct {
     }
 
     fn buildRequest(model: *Model, thread: *const Thread) ?[]const u8 {
-        var api_messages: [provider_context_messages]ApiMessage = undefined;
+        var api_messages: [provider_context_messages + 1]ApiMessage = undefined;
+        var offset: usize = 0;
+        if (projectContext(model, thread)) |context| {
+            api_messages[0] = .{ .role = "system", .content = context };
+            offset = 1;
+        }
         const first = thread.message_count -| provider_context_messages;
         for (thread.messages[first..thread.message_count], 0..) |*message, index| {
-            api_messages[index] = .{
+            api_messages[index + offset] = .{
                 .role = if (message.role == .user) "user" else "assistant",
                 .content = message.content(),
             };
@@ -2988,7 +3030,7 @@ pub const Model = struct {
         var writer: std.Io.Writer = .fixed(&model.request_storage);
         std.json.Stringify.value(ApiRequest{
             .model = std.mem.trim(u8, thread.modelName(), " \t"),
-            .messages = api_messages[0..@min(thread.message_count, provider_context_messages)],
+            .messages = api_messages[0 .. @min(thread.message_count, provider_context_messages) + offset],
         }, .{}, &writer) catch return null;
         return writer.buffered();
     }
@@ -3000,9 +3042,16 @@ pub const Model = struct {
         writer.writeAll("{\"model\":") catch return null;
         std.json.Stringify.value(std.mem.trim(u8, thread.modelName(), " \t"), .{}, writer) catch return null;
         writer.writeAll(",\"messages\":[") catch return null;
+        var wrote_message = false;
+        if (projectContext(model, thread)) |context| {
+            writer.writeAll("{\"role\":\"system\",\"content\":") catch return null;
+            std.json.Stringify.value(context, .{}, writer) catch return null;
+            writer.writeByte('}') catch return null;
+            wrote_message = true;
+        }
         const first = thread.message_count -| provider_context_messages;
         for (thread.messages[first..thread.message_count], 0..) |*message, message_index| {
-            if (message_index > 0) writer.writeByte(',') catch return null;
+            if (wrote_message or message_index > 0) writer.writeByte(',') catch return null;
             writer.writeAll("{\"role\":") catch return null;
             std.json.Stringify.value(if (message.role == .user) "user" else "assistant", .{}, writer) catch return null;
             writer.writeAll(",\"content\":") catch return null;
@@ -3373,6 +3422,28 @@ fn queueAttachmentRead(model: *Model, thread: *Thread, path: []const u8, fx: *Ef
     fx.readFile(.{ .key = key, .path = path, .on_result = Effects.fileMsg(.attachment_file_result) });
 }
 
+fn queueProjectKnowledgeRead(model: *Model, project: *Project, path: []const u8, fx: *Effects) void {
+    if (path.len == 0 or path.len > max_attachment_path_bytes) return;
+    if (attachmentKindForPath(path) != .text) {
+        model.showToast("Project knowledge currently supports text and code files", fx);
+        return;
+    }
+    var count: usize = if (project.file_names_len == 0) 0 else 1;
+    for (project.fileNames()) |byte| if (byte == '\n') { count += 1; };
+    for (model.pending_attachments[0..model.pending_attachment_count]) |pending| if (pending.project_id == project.id) { count += 1; };
+    if (count >= max_attachments_per_message or model.pending_attachment_count == model.pending_attachments.len) {
+        model.showToast("A project can include up to four knowledge files", fx);
+        return;
+    }
+    const key = model.next_attachment_read_key;
+    model.next_attachment_read_key +%= 1;
+    var pending = PendingAttachment{ .key = key, .project_id = project.id, .kind = .text, .path_len = path.len };
+    @memcpy(pending.path_storage[0..path.len], path);
+    model.pending_attachments[model.pending_attachment_count] = pending;
+    model.pending_attachment_count += 1;
+    fx.readFile(.{ .key = key, .path = path, .on_result = Effects.fileMsg(.attachment_file_result) });
+}
+
 fn receiveAttachment(model: *Model, result: native_sdk.EffectFileResult, fx: *Effects) void {
     var pending_index: ?usize = null;
     for (model.pending_attachments[0..model.pending_attachment_count], 0..) |pending, index| {
@@ -3382,6 +3453,32 @@ fn receiveAttachment(model: *Model, result: native_sdk.EffectFileResult, fx: *Ef
     const pending = model.pending_attachments[index];
     model.pending_attachment_count -= 1;
     if (index != model.pending_attachment_count) model.pending_attachments[index] = model.pending_attachments[model.pending_attachment_count];
+    if (pending.project_id != 0) {
+        const project = model.projectById(pending.project_id) orelse return;
+        if (result.outcome != .ok or result.bytes.len == 0 or !std.unicode.utf8ValidateSlice(result.bytes)) {
+            model.showToast("That knowledge file could not be read as UTF-8 text", fx);
+            return;
+        }
+        const name = std.fs.path.basename(pending.path());
+        const header_len = "\n\n--- Shared file:  ---\n".len + name.len;
+        if (project.knowledge_len + header_len + result.bytes.len > project.knowledge_storage.len or
+            project.file_names_len + name.len + 1 > project.file_names_storage.len)
+        {
+            model.showToast("Project knowledge can total up to 48 KB", fx);
+            return;
+        }
+        if (project.file_names_len > 0) project.file_names_storage[project.file_names_len] = '\n';
+        project.file_names_len += @intFromBool(project.file_names_len > 0);
+        @memcpy(project.file_names_storage[project.file_names_len..][0..name.len], name);
+        project.file_names_len += name.len;
+        const header = std.fmt.bufPrint(project.knowledge_storage[project.knowledge_len..], "\n\n--- Shared file: {s} ---\n", .{name}) catch return;
+        project.knowledge_len += header.len;
+        @memcpy(project.knowledge_storage[project.knowledge_len..][0..result.bytes.len], result.bytes);
+        project.knowledge_len += result.bytes.len;
+        model.markStructureDirty();
+        model.showToast("Knowledge file added", fx);
+        return;
+    }
     const thread = model.threadById(pending.thread_id) orelse return;
     if (result.outcome != .ok) {
         thread.setStatus(switch (result.outcome) {
@@ -3476,6 +3573,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .open_file_picker => model.file_picker_requested = true,
         .files_dropped => |drop| {
+            if (model.project_context_open) {
+                const project = model.projectById(model.project_context_id) orelse return;
+                for (drop.paths) |path| queueProjectKnowledgeRead(model, project, path, fx);
+                return;
+            }
             const thread = model.activeThread() orelse return;
             for (drop.paths) |path| queueAttachmentRead(model, thread, path, fx);
         },
@@ -3666,6 +3768,37 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.project_menu_open = !model.project_menu_open;
         },
         .close_project_menu => model.project_menu_open = false,
+        .open_project_context => {
+            if (model.active_project_id == chats_project_id) return;
+            const project = model.projectByIdConst(model.active_project_id) orelse return;
+            model.project_menu_open = false;
+            model.project_context_id = project.id;
+            model.project_instructions_buffer.set(project.instructions());
+            model.project_context_open = true;
+        },
+        .close_project_context => {
+            model.project_context_open = false;
+            model.project_context_id = 0;
+            model.project_instructions_buffer.clear();
+        },
+        .project_instructions_edit => |edit| model.project_instructions_buffer.apply(edit),
+        .save_project_context => {
+            const project = model.projectById(model.project_context_id) orelse return;
+            project.instructions_len = utf8PrefixLen(model.project_instructions_buffer.text(), project.instructions_storage.len);
+            @memcpy(project.instructions_storage[0..project.instructions_len], model.project_instructions_buffer.text()[0..project.instructions_len]);
+            model.markStructureDirty();
+            model.project_context_open = false;
+            model.project_context_id = 0;
+            model.showToast("Project context saved", fx);
+        },
+        .open_project_file_picker => model.project_file_picker_requested = true,
+        .clear_project_files => {
+            const project = model.projectById(model.project_context_id) orelse return;
+            project.knowledge_len = 0;
+            project.file_names_len = 0;
+            model.markStructureDirty();
+            model.showToast("Project knowledge cleared", fx);
+        },
         .toggle_thread_menu => {
             if (model.active_thread_id == 0) return;
             model.project_menu_open = false;
@@ -4621,6 +4754,23 @@ fn isSubscriptionChoice(choice: ModelChoice) bool {
     return choice == .codex_subscription or choice == .claude_subscription;
 }
 
+fn projectContext(model: *Model, thread: *const Thread) ?[]const u8 {
+    if (thread.project_id == chats_project_id) return null;
+    const project = model.projectByIdConst(thread.project_id) orelse return null;
+    if (project.instructions_len == 0 and project.knowledge_len == 0) return null;
+    var writer: std.Io.Writer = .fixed(&model.project_context_storage);
+    writer.writeAll("Project-wide context. Follow these instructions and use the shared knowledge when relevant.\n") catch return null;
+    if (project.instructions_len > 0) {
+        writer.writeAll("\nProject instructions:\n") catch return null;
+        writer.writeAll(project.instructions()) catch return null;
+    }
+    if (project.knowledge_len > 0) {
+        writer.writeAll("\n\nShared project knowledge:") catch return null;
+        writer.writeAll(project.knowledge()) catch return null;
+    }
+    return writer.buffered();
+}
+
 fn hasContextAttachments(thread: *const Thread) bool {
     const first = thread.message_count -| provider_context_messages;
     for (thread.messages[first..thread.message_count]) |message| if (message.attachment_count > 0) return true;
@@ -4691,7 +4841,9 @@ fn buildHarnessPrompt(model: *Model, thread: *const Thread) ?[]const u8 {
     const footer = "\n\nAssistant:\n";
     const limit = native_sdk.max_effect_stdin_bytes;
     var first = thread.message_count;
-    var used = header.len + footer.len;
+    const shared = projectContext(model, thread);
+    const shared_len = if (shared) |context| utf8PrefixLen(context, @min(context.len, limit / 2)) else 0;
+    var used = header.len + footer.len + shared_len;
     var index = thread.message_count;
     while (index > 0) {
         const candidate = index - 1;
@@ -4710,6 +4862,10 @@ fn buildHarnessPrompt(model: *Model, thread: *const Thread) ?[]const u8 {
 
     var writer: std.Io.Writer = .fixed(model.request_storage[0..limit]);
     writer.writeAll(header) catch return null;
+    if (shared) |context| {
+        writer.writeAll("\n") catch return null;
+        writer.writeAll(context[0..shared_len]) catch return null;
+    }
     for (thread.messages[first..thread.message_count]) |*message| {
         const prefix = if (message.role == .user) "\n\nUser:\n" else "\n\nAssistant:\n";
         writer.writeAll(prefix) catch return null;
@@ -5276,14 +5432,16 @@ const SecureChatApp = struct {
             const drop = value.files_dropped;
             try self.chat.dispatch(runtime, drop.window_id, .{ .files_dropped = drop });
         }
-        if (self.chat.model.file_picker_requested) {
+        if (self.chat.model.file_picker_requested or self.chat.model.project_file_picker_requested) {
+            const project_picker = self.chat.model.project_file_picker_requested;
             self.chat.model.file_picker_requested = false;
+            self.chat.model.project_file_picker_requested = false;
             var paths_buffer: [native_sdk.platform.max_dialog_paths_bytes]u8 = undefined;
             const filters = [_]native_sdk.platform.FileFilter{
-                .{ .name = "Images, PDFs, and text files", .extensions = &.{ "png", "jpg", "jpeg", "webp", "gif", "pdf", "txt", "md", "json", "csv", "tsv", "xml", "yaml", "yml", "html", "css", "js", "jsx", "ts", "tsx", "zig", "py", "rb", "go", "rs", "java", "c", "h", "cpp", "hpp", "swift", "kt", "sh", "sql", "toml", "ini", "log", "rtf" } },
+                .{ .name = if (project_picker) "Text and code files" else "Images, PDFs, and text files", .extensions = if (project_picker) &.{ "txt", "md", "json", "csv", "tsv", "xml", "yaml", "yml", "html", "css", "js", "jsx", "ts", "tsx", "zig", "py", "rb", "go", "rs", "java", "c", "h", "cpp", "hpp", "swift", "kt", "sh", "sql", "toml", "ini", "log", "rtf" } else &.{ "png", "jpg", "jpeg", "webp", "gif", "pdf", "txt", "md", "json", "csv", "tsv", "xml", "yaml", "yml", "html", "css", "js", "jsx", "ts", "tsx", "zig", "py", "rb", "go", "rs", "java", "c", "h", "cpp", "hpp", "swift", "kt", "sh", "sql", "toml", "ini", "log", "rtf" } },
             };
             const selected = runtime.showOpenDialog(.{
-                .title = "Attach to Superchat",
+                .title = if (project_picker) "Add project knowledge" else "Attach to Superchat",
                 .filters = &filters,
                 .allow_multiple = true,
             }, &paths_buffer) catch null;
@@ -5564,7 +5722,7 @@ const SecureChatApp = struct {
 
         if (model.persistence_structure_dirty) {
             for (model.projects[0..model.project_count], 0..) |project, position| {
-                _ = self.persistence_worker.enqueue(.{ .upsert_project = persistence.ProjectRecord.from(&project, position) });
+                _ = self.persistence_worker.enqueueProject(persistence.ProjectRecord.from(&project, position));
             }
             for (model.threads[0..model.thread_count], 0..) |thread, position| {
                 _ = self.persistence_worker.enqueueThread(persistence.ThreadRecord.from(&thread, position));

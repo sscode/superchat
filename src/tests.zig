@@ -108,7 +108,7 @@ test "schema migrations create a recoverable pre-migration backup" {
     {
         var migrated = try main.workspace_storage.Database.open(path);
         defer migrated.close();
-        try testing.expectEqual(@as(i64, 6), try migrated.schemaVersion());
+        try testing.expectEqual(@as(i64, 7), try migrated.schemaVersion());
     }
     var backup = try std.Io.Dir.openFileAbsolute(testing.io, path ++ ".backup-v1", .{});
     backup.close(testing.io);
@@ -1024,6 +1024,15 @@ test "SQLite restores the workspace after reopening and purges expired archives"
     model.rename_buffer.clear();
     main.update(model, .{ .rename_edit = .{ .insert_text = "Persistent project" } }, &fx);
     main.update(model, .save_rename, &fx);
+    const persistent_project = projectWithId(model, persisted_project_id);
+    const instructions = "Prefer concise answers grounded in the shared sources.";
+    @memcpy(persistent_project.instructions_storage[0..instructions.len], instructions);
+    persistent_project.instructions_len = instructions.len;
+    const knowledge = "\n\n--- Shared file: brief.md ---\nThe launch market is Melbourne.";
+    @memcpy(persistent_project.knowledge_storage[0..knowledge.len], knowledge);
+    persistent_project.knowledge_len = knowledge.len;
+    @memcpy(persistent_project.file_names_storage[0.."brief.md".len], "brief.md");
+    persistent_project.file_names_len = "brief.md".len;
     main.update(model, .new_project, &fx);
     const archived_project_id = model.active_project_id;
     main.update(model, .archive_project, &fx);
@@ -1033,7 +1042,7 @@ test "SQLite restores the workspace after reopening and purges expired archives"
     {
         var database = try main.workspace_storage.Database.open(path);
         defer database.close();
-        try testing.expectEqual(@as(i64, 6), try database.schemaVersion());
+        try testing.expectEqual(@as(i64, 7), try database.schemaVersion());
         try database.save(model);
     }
 
@@ -1047,6 +1056,9 @@ test "SQLite restores the workspace after reopening and purges expired archives"
         try testing.expectEqual(persisted_project_id, restored.active_project_id);
         try testing.expectEqual(persisted_thread_id, restored.active_thread_id);
         try testing.expectEqualStrings("Persistent project", projectWithId(restored, persisted_project_id).name());
+        try testing.expectEqualStrings(instructions, projectWithId(restored, persisted_project_id).instructions());
+        try testing.expectEqualStrings(knowledge, projectWithId(restored, persisted_project_id).knowledge());
+        try testing.expectEqualStrings("brief.md", projectWithId(restored, persisted_project_id).fileNames());
         const thread = threadWithId(restored, persisted_thread_id);
         try testing.expectEqualStrings("An unfinished local draft", thread.draft());
         try testing.expectEqual(main.ModelChoice.gemini, thread.model_choice);
@@ -1181,7 +1193,7 @@ test "complete SQLite exports include full chat history and a portable workspace
     const json = try std.Io.Dir.cwd().readFileAlloc(testing.io, json_path, testing.allocator, .limited(256 * 1024));
     defer testing.allocator.free(json);
     try testing.expect(std.mem.indexOf(u8, json, "\"format\":\"superchat-workspace\"") != null);
-    try testing.expect(std.mem.indexOf(u8, json, "\"version\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"version\":3") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"snippets\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"mcp_servers\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "local-tools --stdio") != null);
@@ -2025,7 +2037,7 @@ test "modal forms can submit without a mouse" {
 
 test "action menus use compact inset rows and separate archive actions" {
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "width=\"180\" height=\"100\" padding=\"4\" gap=\"2\" on-dismiss=\"close_thread_menu\"") != null);
-    try testing.expect(std.mem.indexOf(u8, main.app_markup, "width=\"196\" height=\"100\" padding=\"4\" gap=\"2\" on-dismiss=\"close_project_menu\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "width=\"196\" height=\"132\" padding=\"4\" gap=\"2\" on-dismiss=\"close_project_menu\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "<menu-item size=\"sm\" icon=\"edit\" on-press=\"open_rename_thread\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "<separator />\n              <menu-item size=\"sm\" icon=\"archive\" on-press=\"archive_thread\"") != null);
 }

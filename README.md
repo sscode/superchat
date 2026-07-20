@@ -9,6 +9,7 @@ Superchat keeps projects, conversations, drafts, and model choices on your Mac. 
 ## What you can do
 
 - Start chats immediately or organize related conversations into optional projects.
+- Give a project shared instructions and up to four UTF-8 text/code knowledge files; every chat in that project receives the same context.
 - Use Codex through your signed-in ChatGPT account, without giving Superchat its session token.
 - Search OpenRouter's live model catalog, favorite useful results, or enter a model slug directly.
 - Stream several responses at once and move between chats while they finish.
@@ -141,9 +142,9 @@ For dynamic controls—model search results, archive items, fork model choices, 
 Superchat does not require an account or run a local database server.
 
 - Projects, chats, messages, drafts, model choices, response statistics, prompt snippets, MCP server commands, archive state, and the notification preference are stored in SQLite at `~/Library/Application Support/superchat/superchat.sqlite3`.
-- Attachment names, types, and user-selected paths are stored with the chat. File contents are not copied into SQLite. A private, randomly named temporary request file is created only when OpenRouter needs a larger multimodal payload and is removed when that request exits.
+- Message attachment names, types, and user-selected paths are stored with the chat, but their contents are not copied into SQLite. Text/code files explicitly added as project knowledge are copied into the project's local SQLite record so they remain available across chats and restarts. A private, randomly named temporary request file is created only when OpenRouter needs a larger multimodal payload and is removed when that request exits.
 - Your OpenRouter API key is stored separately in macOS Keychain. Codex and the development-only Claude harness leave authentication in each provider's own CLI credential store.
-- Requests and a bounded recent conversation context are sent only through the selected connection. Check provider privacy policies before sending sensitive information.
+- Requests, project instructions and knowledge, and a bounded recent conversation context are sent only through the selected connection. Check provider privacy policies before adding or sending sensitive information.
 - There is currently no cloud sync, telemetry service, or remote Superchat backend.
 
 Chat exports read the complete transcript from SQLite rather than only the currently visible page. Workspace backups are versioned JSON containing projects, chats, messages, attachment metadata, response statistics, prompt snippets, and MCP server commands; attached file contents remain in their original local files. Review backups before sharing them.
@@ -202,7 +203,7 @@ The intentionally small first version has a few boundaries worth knowing:
 - SQLite retains the complete transcript. The UI opens the latest 50 messages and loads earlier pages on demand; provider requests independently use a bounded recent context. Native SDK currently caps CLI-harness prompt input at 4 KiB.
 - OpenRouter includes usage accounting in the final streaming event. Superchat stores its model, token counts, cost, and elapsed time with the response; CLI connections currently show model and elapsed time because they do not expose equivalent billing data.
 - Projects and chats grow dynamically instead of stopping at prototype-era 8/24 limits. Individual responses have a 64 KiB safety ceiling.
-- A message accepts up to four attachments totaling 640 KB: PNG, JPEG, WebP, GIF, PDF, UTF-8 text, Markdown, JSON, CSV, and common source-code formats. OpenRouter receives images, PDFs, and text files; Codex receives images plus bounded text-file content; the development-only Claude adapter currently accepts text files. Saved draft attachment metadata survives a restart, but the file must be removed and reattached before sending so Superchat never re-reads a local file without a fresh user action.
+- A message accepts up to four attachments totaling 640 KB: PNG, JPEG, WebP, GIF, PDF, UTF-8 text, Markdown, JSON, CSV, and common source-code formats. A project can additionally retain up to four shared UTF-8 text/code files totaling 48 KB. OpenRouter receives images, PDFs, and text files; Codex receives images plus bounded text-file and project context; the development-only Claude adapter accepts bounded text context. Saved draft attachment metadata survives a restart, but the file must be removed and reattached before sending so Superchat never re-reads a local file without a fresh user action.
 - Tagged GitHub releases build a clean universal app, sign it with Developer ID, submit it for Apple notarization, staple the result, and publish the `.dmg` to GitHub Releases.
 - Superchat checks GitHub's latest-release endpoint at launch and from Settings. When a newer semantic version is available, a compact update control appears beside the Superchat wordmark and opens only the repository's allow-listed GitHub release page in the system browser; no update server or Cloudflare service is required.
 
