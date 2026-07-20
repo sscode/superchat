@@ -347,7 +347,7 @@ test "the empty and populated views build and lay out" {
     const boundary_bounds = boundary_frame orelse return error.TestExpectedWorkspaceListBoundaryLayout;
     const list_bounds = list_frame orelse return error.TestExpectedWorkspaceListLayout;
     try testing.expect(boundary_bounds.y >= actions_bounds.y + actions_bounds.height);
-    try testing.expect(list_bounds.y - (boundary_bounds.y + boundary_bounds.height) >= 7);
+    try testing.expect(list_bounds.y >= boundary_bounds.y + boundary_bounds.height);
     const minimum_layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, main.window_min_width, main.window_min_height), &nodes);
     try testing.expect(minimum_layout.nodes.len > 0);
 
@@ -1514,9 +1514,12 @@ test "message utility actions keep a restrained hierarchy" {
     try testing.expectEqual(@as(f32, 0.5), response_actions.opacity);
     try testing.expectEqual(@as(usize, 2), user_actions.children.len);
     try testing.expectEqual(@as(usize, 3), response_actions.children.len);
-    try testing.expectEqualStrings("Copy", response_actions.children[0].text);
-    try testing.expectEqualStrings("Retry", response_actions.children[1].text);
-    try testing.expectEqualStrings("Fork", response_actions.children[2].text);
+    try testing.expectEqualStrings("", response_actions.children[0].text);
+    try testing.expectEqualStrings("", response_actions.children[1].text);
+    try testing.expectEqualStrings("", response_actions.children[2].text);
+    try testing.expect(findByLabel(response_actions, "Copy response") != null);
+    try testing.expect(findByLabel(response_actions, "Retry response") != null);
+    try testing.expect(findByLabel(response_actions, "Fork from response") != null);
 }
 
 test "one response can fork into several model-specific chats" {
@@ -2031,7 +2034,8 @@ test "modal layouts fit the 680 point minimum window and long content scrolls" {
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"700\"") == null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"680\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "height=\"640\"") != null);
-    try testing.expect(std.mem.indexOf(u8, main.app_markup, "width=\"760\" height=\"540\" label=\"Models and commands\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "width=\"760\" height=\"500\" label=\"Models and commands\"") != null);
+    try testing.expect(std.mem.indexOf(u8, main.app_markup, "width=\"680\" height=\"520\" label=\"Keyboard shortcuts\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Archived items\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Models and commands\"") != null);
     try testing.expect(std.mem.indexOf(u8, main.app_markup, "label=\"Settings\"") != null);

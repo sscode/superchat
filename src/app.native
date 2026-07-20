@@ -18,19 +18,16 @@
         <button size="sm" variant="ghost" icon="search" on-press="open_search" label="Search every chat, Command F"></button>
       </row>
 
-      <column padding="10" gap="2" label="Pinned sidebar actions">
+      <column padding="12" gap="2" label="Pinned sidebar actions">
         <list-item size="lg" icon="edit" on-press="new_thread" disabled="{cannotAddThread}" label="New chat in the current location">New chat</list-item>
         <list-item icon="search" on-press="open_search">Search</list-item>
         <list-item icon="archive" on-press="open_archive">Archive</list-item>
       </column>
 
       <separator label="Workspace list boundary" />
-      <column height="7">
-        <panel height="1" background="surface_subtle" border-color="surface_subtle" radius="sm"></panel>
-      </column>
 
       <scroll grow="1" label="Chats and projects">
-        <column padding="10" gap="2">
+        <column padding="12" gap="2">
           <row padding="8" gap="4" cross="center">
             <text size="sm" foreground="text_muted" grow="1"><span weight="medium">Chats</span></text>
             <button size="sm" variant="ghost" icon="plus" on-press="new_top_level_thread" disabled="{cannotAddThread}" label="New top-level chat"></button>
@@ -123,7 +120,7 @@
 
       <scroll grow="1" value="{conversationScrollOffset}" on-scroll="conversation_scrolled" label="Conversation">
         <row main="center">
-          <column width="680" padding="32" gap="44">
+          <column width="680" padding="36" gap="36">
             <if test="{canLoadOlder}">
               <row main="center"><button size="sm" variant="ghost" on-press="load_older">Load earlier messages</button></row>
             </if>
@@ -156,10 +153,10 @@
                       </column>
                     </if>
                     <markdown source="{m.content}" />
-                    <row gap="0" label="Response actions">
-                      <button size="sm" variant="ghost" foreground="text_muted" icon="copy" on-press="copy_message:{m.id}">Copy</button>
-                      <button size="sm" variant="ghost" foreground="text_muted" icon="refresh-cw" on-press="retry_message:{m.id}">Retry</button>
-                      <button size="sm" variant="ghost" foreground="text_muted" icon="git-branch" on-press="open_fork:{m.id}">Fork</button>
+                    <row gap="2" label="Response actions">
+                      <button size="sm" variant="ghost" foreground="text_muted" icon="copy" on-press="copy_message:{m.id}" label="Copy response"></button>
+                      <button size="sm" variant="ghost" foreground="text_muted" icon="refresh-cw" on-press="retry_message:{m.id}" label="Retry response"></button>
+                      <button size="sm" variant="ghost" foreground="text_muted" icon="git-branch" on-press="open_fork:{m.id}" label="Fork from response"></button>
                     </row>
                   </column>
                 </else>
@@ -187,11 +184,11 @@
       </scroll>
 
       <row main="center" background="background">
-        <column width="640" padding="16" gap="8">
+        <column width="680" padding="16" gap="8">
           <for each="draftAttachmentRows" key="index" as="a">
             <button size="sm" variant="outline" icon="x" on-press="remove_attachment:{a.index}" label="Remove {a.name}">{a.detail} · {a.name}</button>
           </for>
-          <input-group key="{composerKey}" height="112" label="Message">
+          <input-group key="{composerKey}" height="96" label="Message">
             <textarea text="{draft}" on-input="draft_edit" on-submit="composer_newline" autofocus="true" placeholder="Ask any model, or drop images and files…" label="Message" />
             <input-group-actions gap="8">
               <button size="sm" variant="ghost" icon="plus" on-press="open_file_picker" label="Attach images or files, Command U"></button>
@@ -218,8 +215,8 @@
   <if test="{model_picker_open}">
     <panel background="scrim" on-press="close_overlay" label="Palette backdrop">
       <column main="center" cross="center">
-        <dialog width="760" height="540" label="Models and commands">
-          <column padding="24" gap="14">
+        <dialog width="760" height="500" label="Models and commands">
+          <column padding="24" gap="12">
             <if test="{search_open}">
               <row gap="12" cross="center">
                 <column gap="4" grow="1">
@@ -265,7 +262,7 @@
               </row>
               <search-field text="{modelSearch}" on-input="model_search_edit" placeholder="Search models or providers…" autofocus="true" label="Model search" />
               <scroll grow="1" label="Models">
-                <column gap="18" padding="4">
+                <column gap="14" padding="4">
                   <if test="{paletteQuickModelsVisible}">
                     <column gap="8">
                       <if test="{modelSearchEmpty}">
@@ -343,7 +340,7 @@
               </row>
               <search-field text="{modelSearch}" on-input="model_search_edit" placeholder="Search chats, projects, actions, or models…" autofocus="true" label="Command palette" />
               <scroll grow="1" label="Chats, projects, actions, and models">
-                <column gap="18" padding="4">
+                <column gap="14" padding="4">
                   <if test="{paletteActionsVisible}">
                     <column gap="6">
                       <if test="{modelSearchEmpty}">
@@ -521,8 +518,8 @@
   <if test="{shortcuts_open}">
     <panel background="scrim" on-press="close_shortcuts" label="Keyboard shortcuts backdrop">
       <column main="center" cross="center">
-        <dialog width="720" height="560" label="Keyboard shortcuts">
-          <column padding="28" gap="16">
+        <dialog width="680" height="520" label="Keyboard shortcuts">
+          <column padding="24" gap="14">
             <row gap="12" cross="center">
               <column grow="1" gap="4">
                 <row gap="8" cross="center">
@@ -538,9 +535,9 @@
             </row>
             <search-field size="sm" text="{shortcutSearch}" on-input="shortcut_search_edit" placeholder="Search shortcuts…" autofocus="true" label="Search keyboard shortcuts" />
             <scroll grow="1" label="Keyboard shortcuts list. Use Arrow keys, Page Up, Page Down, Home, or End to scroll.">
-              <column padding="12" gap="4" background="surface_subtle" radius="lg">
+              <column padding="8" gap="2" background="surface_subtle" radius="lg">
                 <for each="shortcutRows" as="h">
-                  <row padding="10" gap="16" cross="center">
+                  <row padding="8" gap="16" cross="center">
                     <text grow="1">{h.action}</text>
                     <badge size="sm" variant="secondary">{h.keys}</badge>
                   </row>
