@@ -50,8 +50,8 @@ issues, logs, and release notes.
    ```
 
 4. Confirm the local DMG is universal, its checksum verifies, and its app
-   bundle contains `Licenses`, `THIRD_PARTY_NOTICES.md`, `PRIVACY.md`, and
-   `SOURCE.txt`.
+   bundle contains `Licenses`, `NOTICE`, `THIRD_PARTY_NOTICES.md`, `PRIVACY.md`,
+   and `SOURCE.txt`.
 5. Commit with DCO sign-off and create a signed tag matching the package
    version, such as `v0.2.0`.
 6. Push the commit and tag. The release workflow builds from the tag, signs and
