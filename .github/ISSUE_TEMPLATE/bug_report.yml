@@ -1,0 +1,62 @@
+name: Bug report
+description: Report a reproducible problem in Superchat
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include API keys, provider tokens, private prompts, databases, or sensitive attachments.
+        Report security vulnerabilities privately through the Security tab.
+  - type: input
+    id: version
+    attributes:
+      label: Superchat version
+      placeholder: 0.1.3
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and Mac architecture
+      placeholder: macOS 26.0, Apple Silicon
+    validations:
+      required: true
+  - type: dropdown
+    id: connection
+    attributes:
+      label: Connection
+      options:
+        - OpenRouter
+        - Codex
+        - Local MCP
+        - Not connection-related
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: Tell us exactly what you did and what happened.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add a cropped, staged screenshot if it is safe to publish.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues.
+          required: true
+        - label: I removed private data and credentials.
+          required: true

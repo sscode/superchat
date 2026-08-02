@@ -1,0 +1,19 @@
+{
+  "name": "superchat",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "version": "0.1.3",
+  "scripts": {
+    "postinstall": "node scripts/patch-native-sdk.mjs",
+    "dev": "SUPERCHAT_DEV_MODE=1 native dev",
+    "dev:worktree": "SUPERCHAT_DEV_MODE=1 SUPERCHAT_DEV_PROFILE=auto native dev",
+    "dev:onboarding": "SUPERCHAT_FORCE_ONBOARDING=1 native dev",
+    "check": "node scripts/check-version.mjs && native check --strict",
+    "test": "native test --yes",
+    "build": "native build --yes",
+    "package:macos": "bash scripts/package-macos.sh"
+  },
+  "devDependencies": {
+    "@native-sdk/cli": "^0.5.1"
+  }
+}

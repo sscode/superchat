@@ -1,0 +1,8 @@
+.{
+    .name = .superchat,
+    .fingerprint = 0xb80da4911cf0f533,
+    .version = "0.1.3",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{ .native_sdk = .{ .path = "node_modules/@native-sdk/cli" } },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "assets", "app.zon" },
+}
